@@ -347,6 +347,8 @@ private:
   void traverseUpdateSceneExtent(size_t indexNode, const glm::mat4x4& mParent);
 
   void initSheenLUT();
+  void initDenoiser();
+  void updateDenoiserBuffers();
 
   LightDefinition createConstantEnvironmentLight() const;
   LightDefinition createSphericalEnvironmentLight(); // This initalizes m_picEnv and m_texEnv.
@@ -587,6 +589,16 @@ private:
   int          m_bdptDisplayMode       = 2;       // 0 = eye paths only, 1 = light paths only, 2 = eye + light paths blended.
   bool         m_gpuBlend              = false;   // When true, eye+light path blending is done on the GPU before copying to host.
   float4*      m_d_bufferBlend         = nullptr; // Device-side composited output buffer (GPU blend mode only).
+
+  // OptiX denoiser.
+  OptixDenoiser      m_denoiser            = nullptr;
+  OptixDenoiserSizes m_denoiserSizes       = {};
+  CUdeviceptr        m_d_denoiserState     = 0;
+  CUdeviceptr        m_d_denoiserScratch   = 0;
+  CUdeviceptr        m_d_hdrIntensity      = 0; // Single float, log-average luminance for HDR exposure.
+  CUdeviceptr        m_d_bufferDenoised    = 0; // Denoised output (same layout as bufferAccum: float4 per pixel).
+  bool               m_denoiserEnabled     = false;
+  float              m_denoiserBlendFactor = 0.0f; // 0 = fully denoised, 1 = fully noisy input.
 
   size_t m_indexCamera   = 0; // The currently selected camera. The GUI only offers to switch cameras if there are more than one.
   size_t m_indexVariant  = 0; // The currently selected material variant.

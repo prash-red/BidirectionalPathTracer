@@ -327,6 +327,7 @@ Application::Application(GLFWwindow* window,
   initOpenGL(); // OpenGL must be initialized before OptiX because that determines the OpenGL-CUDA interop mode and generates resources.
   initOptiX();
   initSheenLUT();
+  initDenoiser();
 
   try
   {
@@ -1069,6 +1070,74 @@ OptixResult Application::initOptiXFunctionTable()
 }
 
 
+void Application::initDenoiser()
+{
+  OptixDenoiserOptions options = {};
+  options.guideAlbedo  = 0; // No albedo guide (beauty-only mode).
+  options.guideNormal  = 0; // No normal guide.
+  options.denoiseAlpha = OPTIX_DENOISER_ALPHA_MODE_COPY;
+
+  OptixResult res = m_api.optixDenoiserCreate(
+    m_optixContext,
+    OPTIX_DENOISER_MODEL_KIND_HDR,
+    &options,
+    &m_denoiser);
+
+  if (res != OPTIX_SUCCESS)
+  {
+    std::cerr << "WARNING: initDenoiser() optixDenoiserCreate failed: " << res << " — denoiser disabled.\n";
+    m_denoiser = nullptr;
+    return;
+  }
+
+  CUDA_CHECK( cudaMalloc(reinterpret_cast<void**>(&m_d_hdrIntensity), sizeof(float)) );
+
+  std::cout << "OptiX HDR denoiser initialized.\n";
+}
+
+
+void Application::updateDenoiserBuffers()
+{
+  if (!m_denoiser)
+  {
+    return;
+  }
+
+  const unsigned int w = static_cast<unsigned int>(m_resolution.x);
+  const unsigned int h = static_cast<unsigned int>(m_resolution.y);
+  const size_t numPixels = size_t(w) * size_t(h);
+
+  OPTIX_CHECK( m_api.optixDenoiserComputeMemoryResources(m_denoiser, w, h, &m_denoiserSizes) );
+
+  if (m_d_denoiserState != 0)
+  {
+    CUDA_CHECK( cudaFree(reinterpret_cast<void*>(m_d_denoiserState)) );
+    m_d_denoiserState = 0;
+  }
+  if (m_d_denoiserScratch != 0)
+  {
+    CUDA_CHECK( cudaFree(reinterpret_cast<void*>(m_d_denoiserScratch)) );
+    m_d_denoiserScratch = 0;
+  }
+  if (m_d_bufferDenoised != 0)
+  {
+    CUDA_CHECK( cudaFree(reinterpret_cast<void*>(m_d_bufferDenoised)) );
+    m_d_bufferDenoised = 0;
+  }
+
+  CUDA_CHECK( cudaMalloc(reinterpret_cast<void**>(&m_d_denoiserState),   m_denoiserSizes.stateSizeInBytes) );
+  CUDA_CHECK( cudaMalloc(reinterpret_cast<void**>(&m_d_denoiserScratch), m_denoiserSizes.withoutOverlapScratchSizeInBytes) );
+  CUDA_CHECK( cudaMalloc(reinterpret_cast<void**>(&m_d_bufferDenoised),  numPixels * sizeof(float4)) );
+
+  OPTIX_CHECK( m_api.optixDenoiserSetup(
+    m_denoiser,
+    m_cudaStream,
+    w, h,
+    m_d_denoiserState,   m_denoiserSizes.stateSizeInBytes,
+    m_d_denoiserScratch, m_denoiserSizes.withoutOverlapScratchSizeInBytes) );
+}
+
+
 void Application::initCUDA()
 {
   utils::getSystemInformation();
@@ -1236,6 +1305,8 @@ void Application::updateBuffers()
     CU_CHECK( cuGraphicsGLRegisterImage(&m_cudaGraphicsResource, m_hdrTexture, GL_TEXTURE_2D, CU_GRAPHICS_REGISTER_FLAGS_SURFACE_LDST) ); // surface object read/write.
     break;
   }
+
+  updateDenoiserBuffers();
 }
 
 
@@ -1407,29 +1478,81 @@ bool Application::render()
       ++m_iterationLightPath;
 
       scaleLightPath = 1.0f / (static_cast<float>(m_iterationLightPath) * 100.0f);
-
-      // INTEROP_OFF GPU blend: composite into m_d_bufferBlend, copied to host in update().
-      if (m_gpuBlend && m_d_bufferBlend != nullptr && m_interop == INTEROP_OFF)
-      {
-        device_blend_buffers(m_cudaStream,
-                             m_d_bufferBlend,
-                             m_launchParameters.bufferAccum,
-                             m_launchParameters.bufferAccumLightPath,
-                             scaleLightPath,
-                             m_resolution.x * m_resolution.y);
-        CUDA_CHECK( cudaDeviceSynchronize() );
-      }
     }
 
-    // INTEROP_IMG: composite bufferAccum (eye path average) + scaled bufferAccumLightPath into the
-    // display surface. The eye path writes to bufferAccum (not the surface), so the progressive
-    // average is never contaminated by the light path contribution.
+    // Denoiser: run on the accumulated eye path buffer and write to m_d_bufferDenoised.
+    // Runs after all eye/light path launches so the accumulation is complete for this frame.
+    if (m_denoiserEnabled && m_denoiser && m_d_denoiserState != 0 && m_launchParameters.bufferAccum != nullptr)
+    {
+      const unsigned int w = static_cast<unsigned int>(m_resolution.x);
+      const unsigned int h = static_cast<unsigned int>(m_resolution.y);
+
+      OptixImage2D beautyInput        = {};
+      beautyInput.data                = reinterpret_cast<CUdeviceptr>(m_launchParameters.bufferAccum);
+      beautyInput.width               = w;
+      beautyInput.height              = h;
+      beautyInput.rowStrideInBytes    = w * static_cast<unsigned int>(sizeof(float4));
+      beautyInput.pixelStrideInBytes  = static_cast<unsigned int>(sizeof(float4));
+      beautyInput.format              = OPTIX_PIXEL_FORMAT_FLOAT4;
+
+      OPTIX_CHECK( m_api.optixDenoiserComputeIntensity(
+        m_denoiser, m_cudaStream,
+        &beautyInput,
+        m_d_hdrIntensity,
+        m_d_denoiserScratch, m_denoiserSizes.withoutOverlapScratchSizeInBytes) );
+
+      OptixDenoiserGuideLayer guideLayer = {}; // No albedo/normal guides in HDR beauty-only mode.
+
+      OptixImage2D denoisedOutput       = beautyInput;
+      denoisedOutput.data               = m_d_bufferDenoised;
+
+      OptixDenoiserLayer layer = {};
+      layer.input  = beautyInput;
+      layer.output = denoisedOutput;
+      layer.type   = OPTIX_DENOISER_AOV_TYPE_BEAUTY;
+
+      OptixDenoiserParams denoiserParams              = {};
+      denoiserParams.hdrIntensity                     = m_d_hdrIntensity;
+      denoiserParams.blendFactor                      = m_denoiserBlendFactor;
+      denoiserParams.temporalModeUsePreviousLayers    = 0;
+
+      OPTIX_CHECK( m_api.optixDenoiserInvoke(
+        m_denoiser, m_cudaStream,
+        &denoiserParams,
+        m_d_denoiserState,   m_denoiserSizes.stateSizeInBytes,
+        &guideLayer,
+        &layer, 1,
+        0, 0, // No tiling offset.
+        m_d_denoiserScratch, m_denoiserSizes.withoutOverlapScratchSizeInBytes) );
+
+      CUDA_CHECK( cudaDeviceSynchronize() );
+    }
+
+    // Select the eye path source for display: denoised buffer when denoiser is active, raw accumulation otherwise.
+    const float4* eyeForDisplay = (m_denoiserEnabled && m_d_bufferDenoised != 0)
+                                  ? reinterpret_cast<const float4*>(m_d_bufferDenoised)
+                                  : m_launchParameters.bufferAccum;
+
+    // INTEROP_OFF GPU blend: use the (potentially denoised) eye buffer.
+    if (m_gpuBlend && m_d_bufferBlend != nullptr && m_interop == INTEROP_OFF
+        && m_sbtLightPath.raygenRecord && m_launchParameters.bufferAccumLightPath != nullptr)
+    {
+      device_blend_buffers(m_cudaStream,
+                           m_d_bufferBlend,
+                           eyeForDisplay,
+                           m_launchParameters.bufferAccumLightPath,
+                           scaleLightPath,
+                           m_resolution.x * m_resolution.y);
+      CUDA_CHECK( cudaDeviceSynchronize() );
+    }
+
+    // INTEROP_IMG: composite (denoised) eye path + scaled light path into the display surface.
     // scaleLightPath == 0 when BDPT is inactive, making this a pure copy of the eye path.
-    if (m_interop == INTEROP_IMG && m_launchParameters.surface != 0 && m_launchParameters.bufferAccum != nullptr)
+    if (m_interop == INTEROP_IMG && m_launchParameters.surface != 0 && eyeForDisplay != nullptr)
     {
       device_blend_to_surface(m_cudaStream,
                               static_cast<cudaSurfaceObject_t>(m_launchParameters.surface),
-                              m_launchParameters.bufferAccum,
+                              eyeForDisplay,
                               m_launchParameters.bufferAccumLightPath,
                               scaleLightPath,
                               m_resolution.x, m_resolution.y);
@@ -1838,6 +1961,32 @@ void Application::guiWindow()
         m_mouseSpeedRatio = 10000.0f;
       }
       m_trackball.setSpeedRatio(m_mouseSpeedRatio);
+    }
+  }
+
+  if (ImGui::CollapsingHeader("Denoiser"))
+  {
+    if (m_denoiser == nullptr)
+    {
+      ImGui::TextDisabled("Denoiser unavailable (creation failed).");
+    }
+    else
+    {
+      ImGui::Checkbox("Enable", &m_denoiserEnabled);
+      if (ImGui::IsItemHovered())
+      {
+        ImGui::SetTooltip("Apply the OptiX HDR AI denoiser each frame.\n"
+                          "Reads the accumulated eye path buffer and writes a clean result.\n"
+                          "Has no effect on the path tracing accumulation itself.");
+      }
+      if (m_denoiserEnabled)
+      {
+        ImGui::DragFloat("Blend", &m_denoiserBlendFactor, 0.005f, 0.0f, 1.0f, "%.3f");
+        if (ImGui::IsItemHovered())
+        {
+          ImGui::SetTooltip("0 = fully denoised output.\n1 = fully noisy raw accumulation.\nValues in between linearly blend the two.");
+        }
+      }
     }
   }
 
@@ -4917,6 +5066,13 @@ void Application::cleanup()
   }
   m_modules.clear();
 
+  // Denoiser must be destroyed before the OptiX context.
+  if (m_denoiser)
+  {
+    OPTIX_CHECK( m_api.optixDenoiserDestroy(m_denoiser) );
+    m_denoiser = nullptr;
+  }
+
   if (m_optixContext)
   {
     OPTIX_CHECK( m_api.optixDeviceContextDestroy(m_optixContext) );
@@ -4950,6 +5106,26 @@ void Application::cleanup()
   {
     CUDA_CHECK( cudaFree(reinterpret_cast<void*>(m_sbtLightPath.raygenRecord)) );
     m_sbtLightPath.raygenRecord = 0;
+  }
+  if (m_d_denoiserState != 0)
+  {
+    CUDA_CHECK( cudaFree(reinterpret_cast<void*>(m_d_denoiserState)) );
+    m_d_denoiserState = 0;
+  }
+  if (m_d_denoiserScratch != 0)
+  {
+    CUDA_CHECK( cudaFree(reinterpret_cast<void*>(m_d_denoiserScratch)) );
+    m_d_denoiserScratch = 0;
+  }
+  if (m_d_hdrIntensity != 0)
+  {
+    CUDA_CHECK( cudaFree(reinterpret_cast<void*>(m_d_hdrIntensity)) );
+    m_d_hdrIntensity = 0;
+  }
+  if (m_d_bufferDenoised != 0)
+  {
+    CUDA_CHECK( cudaFree(reinterpret_cast<void*>(m_d_bufferDenoised)) );
+    m_d_bufferDenoised = 0;
   }
 
   // BDPT: Free the light path accumulation buffer, GPU blend output, and host mirror.
@@ -6486,7 +6662,10 @@ void Application::update()
         }
         else
         {
-          CUDA_CHECK( cudaMemcpy((void*) m_bufferHost, m_launchParameters.bufferAccum, numPixels * sizeof(float4), cudaMemcpyDeviceToHost) );
+          const void* srcBuffer = (m_denoiserEnabled && m_d_bufferDenoised != 0)
+                                  ? reinterpret_cast<const void*>(m_d_bufferDenoised)
+                                  : reinterpret_cast<const void*>(m_launchParameters.bufferAccum);
+          CUDA_CHECK( cudaMemcpy((void*) m_bufferHost, srcBuffer, numPixels * sizeof(float4), cudaMemcpyDeviceToHost) );
 
           if (m_bdptDisplayMode == 2 && haveLightPath)
           {
@@ -6529,7 +6708,9 @@ void Application::update()
         CUDA_MEMCPY3D params = {};
 
         params.srcMemoryType = CU_MEMORYTYPE_DEVICE;
-        params.srcDevice     = reinterpret_cast<CUdeviceptr>(m_launchParameters.bufferAccum);
+        params.srcDevice     = (m_denoiserEnabled && m_d_bufferDenoised != 0)
+                               ? m_d_bufferDenoised
+                               : reinterpret_cast<CUdeviceptr>(m_launchParameters.bufferAccum);
         params.srcPitch      = m_resolution.x * sizeof(float4); // RGBA32F
         params.srcHeight     = m_resolution.y;
 
