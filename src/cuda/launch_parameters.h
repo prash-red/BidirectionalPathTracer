@@ -37,6 +37,38 @@
 
 #include "light_definition.h"
 
+// Device buffers used by the NRC path-termination and self-training loop.
+// All float* and unsigned int* are device pointers.
+// When enabled == 0, all pointers may be nullptr and no NRC code executes.
+struct NrcLaunchBuffers
+{
+  // ---- Shared render-query buffers -------------------------------------------
+  // Written by raygen at the NRC-termination vertex; composited on the host.
+  float*        renderThroughput;      // [3 × numPixels]  throughput at vertex K
+  float*        renderPrefix;          // [3 × numPixels]  accumulated direct radiance up to K
+  float*        renderOutput;          // [3 × numPixels]  filled by nrc.query() on host
+  unsigned int* renderValid;           // [numPixels] 0 / 1
+
+  // ---- Forward NRC buffers -------------------------------------------------
+  float*        renderFeatures;        // [NRC_INPUT_DIM × numPixels] column-major (14-dim)
+  float*        trainNextFeatures;     // [NRC_INPUT_DIM × numPixels] suffix vertex features
+  float*        trainSuffixScaled;     // [3 × numPixels]  = throughputAtK * (emit+direct at K+1)
+  float*        trainSuffixThroughput; // [3 × numPixels]  = throughput at K+1
+  float*        trainThroughputAtK;    // [3 × numPixels]  throughput at vertex K
+  unsigned int* trainNextValid;        // [numPixels] 0 / 1
+
+  // ---- Scene AABB ------------------------------------------------------------
+  float3 aabbMin;
+  float3 aabbMax;
+
+  // ---- Area-spread termination (Mueller et al. 2021, Section 3.4) -----------
+  float spreadC;              // Default 0.01. Trades variance vs. bias/speed.
+  int   terminationDepth;     // Fallback max depth if spread threshold not met.
+
+  // ---- Mode flags -----------------------------------------------------------
+  int enabled;    // 0 = NRC off, 1 = NRC active.
+};
+
 struct LaunchParameters
 {
   // 8 byte alignment
@@ -82,6 +114,8 @@ struct LaunchParameters
   float3 cameraU;
   float3 cameraV;
   float3 cameraW;
+
+  NrcLaunchBuffers nrc; // Neural Radiance Cache buffers and configuration.
 };
 
 #endif // LAUNCH_PARAMETERS_H

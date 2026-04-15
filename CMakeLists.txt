@@ -55,6 +55,15 @@ message(STATUS "PROJECT_NAME = " "${PROJECT_NAME}")
 find_package(CUDAToolkit 12.0 REQUIRED)
 
 # ====================================================================================
+# Build fastgltf early before CUDA architecture setup
+# ====================================================================================
+set(LOCAL_3RDPARTY "${CMAKE_CURRENT_SOURCE_DIR}/3rdparty")
+set(FASTGLTF_ENABLE_TESTS OFF CACHE BOOL "" FORCE)
+set(FASTGLTF_ENABLE_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(FASTGLTF_ENABLE_DOCS OFF CACHE BOOL "" FORCE)
+add_subdirectory(${LOCAL_3RDPARTY}/fastgltf EXCLUDE_FROM_ALL)
+
+# ====================================================================================
 # Set CMAKE_CUDA_ARCHITECTURES and LIB_CUDA_ARCHITECTURE.
 # CMAKE_CUDA_ARCHITECTURES is the default value for CUDA_ARCHITECTURES property of target,
 # which in turn is the list of architectures to generate device code for.
@@ -115,16 +124,29 @@ endif()
 # ${CMAKE_CURRENT_SOURCE_DIR}/..    is <root>/apps
 # ${CMAKE_CURRENT_SOURCE_DIR}/../.. is <root>
 #
-# If the CMake build folder of this standalone solution is set to the same folder used for 
+# If the CMake build folder of this standalone solution is set to the same folder used for
 # all other OptiX_Apps examples, the executable and the OptiX device modules inside the
 # GLTF_renderer_core folder will automatically appear in the same destination.
 # Mind that the GLTF_renderer executable also expects the sheen_lut.hdr file next to the executable.
 
-set(LOCAL_3RDPARTY "${CMAKE_CURRENT_SOURCE_DIR}/3rdparty")
+# LOCAL_3RDPARTY already set earlier when building fastgltf
 message(STATUS "LOCAL_3RDPARTY = " "${LOCAL_3RDPARTY}")
 
 list(APPEND CMAKE_MODULE_PATH "${LOCAL_3RDPARTY}/CMake")
 message(STATUS "CMAKE_MODULE_PATH = " "${CMAKE_MODULE_PATH}")
+
+# tiny-cuda-nn ################################################################
+# Matches the integration pattern used in NVlabs/instant-ngp.
+
+option(GLTF_RENDERER_BUILD_WITH_RTC "Enable tiny-cuda-nn runtime compilation via NVRTC" ON)
+
+set(TCNN_BUILD_BENCHMARK OFF)
+set(TCNN_BUILD_EXAMPLES OFF)
+set(TCNN_BUILD_WITH_RTC ${GLTF_RENDERER_BUILD_WITH_RTC})
+set(TCNN_ALLOW_CUBLAS_CUSOLVER OFF)
+add_subdirectory(${LOCAL_3RDPARTY}/tiny-cuda-nn)
+# Inherit the CUDA architectures that tiny-cuda-nn resolved (same as instant-ngp).
+set(CMAKE_CUDA_ARCHITECTURES ${TCNN_CUDA_ARCHITECTURES})
 
 # Platform ####################################################################
 
@@ -181,7 +203,7 @@ endif()
 find_package(OpenGL REQUIRED)
 find_package(GLFW REQUIRED)
 find_package(GLEW REQUIRED)
-find_package(FastGLTF REQUIRED)
+# FastGLTF is built as a subdirectory, so no find_package needed
 find_package(simdjson REQUIRED HINTS /home/linuxbrew/.linuxbrew/lib/cmake/simdjson)
 find_package(STB REQUIRED)
 find_package(GLM REQUIRED)
@@ -233,114 +255,122 @@ endif()
 # GLTF Renderer: imgui
 
 set(IMGUI
-  imgui/imconfig.h
-  imgui/imgui.cpp
-  imgui/imgui.h
-  imgui/imgui_demo.cpp
-  imgui/imgui_draw.cpp
-  imgui/imgui_impl_glfw.cpp
-  imgui/imgui_impl_glfw.h
-  imgui/imgui_impl_opengl3.cpp
-  imgui/imgui_impl_opengl3.h
-  imgui/imgui_impl_opengl3_loader.h
-  imgui/imgui_internal.h
-  imgui/imgui_tables.cpp
-  imgui/imgui_widgets.cpp
-  imgui/imstb_rectpack.h
-  imgui/imstb_textedit.h
-  imgui/imstb_truetype.h
+        src/imgui/imconfig.h
+        src/imgui/imgui.cpp
+        src/imgui/imgui.h
+        src/imgui/imgui_demo.cpp
+        src/imgui/imgui_draw.cpp
+        src/imgui/imgui_impl_glfw.cpp
+        src/imgui/imgui_impl_glfw.h
+        src/imgui/imgui_impl_opengl3.cpp
+        src/imgui/imgui_impl_opengl3.h
+        src/imgui/imgui_impl_opengl3_loader.h
+        src/imgui/imgui_internal.h
+        src/imgui/imgui_tables.cpp
+        src/imgui/imgui_widgets.cpp
+        src/imgui/imstb_rectpack.h
+        src/imgui/imstb_textedit.h
+        src/imgui/imstb_truetype.h
 )
 
 # GLTF Renderer: headers
 
 set(HEADERS_HOST
-  Animation.h
-  Application.h
-  Arena.h
-  Camera.h
-  CheckMacros.h
-  ConversionArguments.h
-  DeviceBuffer.h
-  HostBuffer.h
-  HostKernels.h
-  Logger.h
-  Light.h
-  Mesh.h
-  MyAssert.h
-  Node.h
-  Options.h
-  Picture.h
-  Record.h
-  SceneExtent.h
-  Skin.h
-  Texture.h
-  Trackball.h
-  Utils.h
-  Utils.cpp
+  src/Animation.h
+  src/Application.h
+  src/Arena.h
+  src/Camera.h
+  src/CheckMacros.h
+  src/ConversionArguments.h
+  src/DeviceBuffer.h
+  src/HostBuffer.h
+  src/HostKernels.h
+  src/Logger.h
+  src/Light.h
+  src/Mesh.h
+  src/MyAssert.h
+  src/Node.h
+  src/Options.h
+  src/Picture.h
+  src/Record.h
+  src/SceneExtent.h
+  src/Skin.h
+  src/Texture.h
+  src/Trackball.h
+  src/Utils.h
+  src/Utils.cpp
 )
 
 # GLTF Renderer: source
 
 set(SOURCES_HOST
-  Animation.cpp
-  Application.cpp
-  Arena.cpp
-  Camera.cpp
-  main.cpp
-  Mesh.cpp
-  Options.cpp
-  Picture.cpp
-  Texture.cpp
-  Trackball.cpp
+  src/Animation.cpp
+  src/Application.cpp
+  src/Arena.cpp
+  src/Camera.cpp
+  src/main.cpp
+  src/Mesh.cpp
+  src/Options.cpp
+  src/Picture.cpp
+  src/Texture.cpp
+  src/Trackball.cpp
 )
 
 # GLTF Renderer: CUDA headers
 
 set(HEADERS_CUDA
-  ${CMAKE_CURRENT_SOURCE_DIR}/DeviceBuffer.h
-  ${CMAKE_CURRENT_SOURCE_DIR}/Mesh.h
-  ${CMAKE_CURRENT_SOURCE_DIR}/MyAssert.h
-  ${CMAKE_CURRENT_SOURCE_DIR}/cuda/vector_math.h
-  ${CMAKE_CURRENT_SOURCE_DIR}/cuda/geometry_data.h
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/DeviceBuffer.h
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/Mesh.h
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/MyAssert.h
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/cuda/vector_math.h
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/cuda/geometry_data.h
+        src/cuda/Nrc.cu
+        src/cuda/Nrc.h
+        src/cuda/NrcConfig.h
 )
 
 # GLTF Renderer: CUDA kernels
 
 set(SOURCES_CUDA
-  ${CMAKE_CURRENT_SOURCE_DIR}/cuda/kernel_blend.cu
-  ${CMAKE_CURRENT_SOURCE_DIR}/cuda/kernel_morphing.cu
-  ${CMAKE_CURRENT_SOURCE_DIR}/cuda/kernel_skinning.cu
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/cuda/kernel_blend.cu
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/cuda/kernel_morphing.cu
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/cuda/kernel_skinning.cu
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/cuda/kernel_nrc.cu
+        src/cuda/Nrc.cu
+        src/cuda/Nrc.h
+        src/cuda/NrcHost.cu
+        src/cuda/NrcHost.h
 )
 
 # GLTF Renderer: OptiX specific headers
 
 set(HEADERS_OPTIX
-  ${CMAKE_CURRENT_SOURCE_DIR}/cuda/bxdf_common.h
-  ${CMAKE_CURRENT_SOURCE_DIR}/cuda/config.h
-  ${CMAKE_CURRENT_SOURCE_DIR}/cuda/geometry_data.h
-  ${CMAKE_CURRENT_SOURCE_DIR}/cuda/hit_group_data.h
-  ${CMAKE_CURRENT_SOURCE_DIR}/cuda/launch_parameters.h
-  ${CMAKE_CURRENT_SOURCE_DIR}/cuda/light_definition.h
-  ${CMAKE_CURRENT_SOURCE_DIR}/cuda/function_indices.h
-  ${CMAKE_CURRENT_SOURCE_DIR}/cuda/material_data.h
-  ${CMAKE_CURRENT_SOURCE_DIR}/cuda/per_ray_data.h
-  ${CMAKE_CURRENT_SOURCE_DIR}/cuda/random.h
-  ${CMAKE_CURRENT_SOURCE_DIR}/cuda/shader_common.h
-  ${CMAKE_CURRENT_SOURCE_DIR}/cuda/transform.h
-  ${CMAKE_CURRENT_SOURCE_DIR}/cuda/vector_math.h
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/cuda/bxdf_common.h
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/cuda/config.h
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/cuda/geometry_data.h
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/cuda/hit_group_data.h
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/cuda/launch_parameters.h
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/cuda/light_definition.h
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/cuda/function_indices.h
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/cuda/material_data.h
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/cuda/per_ray_data.h
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/cuda/random.h
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/cuda/shader_common.h
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/cuda/transform.h
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/cuda/vector_math.h
 )
 
 # GLTF Renderer: OptiX specific kernels
 
 set(SOURCES_OPTIX
-  ${CMAKE_CURRENT_SOURCE_DIR}/cuda/exception.cu
-  ${CMAKE_CURRENT_SOURCE_DIR}/cuda/hit.cu
-  ${CMAKE_CURRENT_SOURCE_DIR}/cuda/miss.cu
-  ${CMAKE_CURRENT_SOURCE_DIR}/cuda/raygen.cu
-  ${CMAKE_CURRENT_SOURCE_DIR}/cuda/light_sample.cu
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/cuda/exception.cu
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/cuda/hit.cu
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/cuda/miss.cu
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/cuda/raygen.cu
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/cuda/light_sample.cu
 )
 
-source_group("imgui" FILES ${IMGUI})
+source_group("src/imgui" FILES ${IMGUI})
 source_group("host"  FILES ${HEADERS_HOST} ${SOURCES_HOST})
 source_group("cuda"  FILES ${HEADERS_CUDA} ${SOURCES_CUDA})
 source_group("optix" FILES ${HEADERS_OPTIX} ${SOURCES_OPTIX})
@@ -395,9 +425,11 @@ target_compile_options(${OPTIX_LIB} PRIVATE
   # $<$<AND:$<CONFIG:Debug>,$<COMPILE_LANGUAGE:CUDA>>:-G>          # WARNING! Debug device code is abysmally slow.
 )
 
+get_target_property(TCNN_INCLUDE_DIRECTORIES tiny-cuda-nn INCLUDE_DIRECTORIES)
 target_include_directories(${OPTIX_LIB} PRIVATE
-  "${CMAKE_CURRENT_SOURCE_DIR}"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src"
   "${OPTIX_INCLUDE_DIR}"
+  ${TCNN_INCLUDE_DIRECTORIES}
 )
 
 # ================================================
@@ -435,12 +467,11 @@ target_compile_options(${PROJECT_NAME} PRIVATE
 endif()
 
 target_include_directories(${PROJECT_NAME} PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
   ${OPTIX_INCLUDE_DIR}
   ${CUDAToolkit_INCLUDE_DIRS}
   ${GLEW_INCLUDE_DIRS}
   ${GLFW_INCLUDE_DIR}
-  ${FASTGLTF_INCLUDE_DIR}
   ${STB_INCLUDE_DIR}
   ${GLM_INCLUDE_DIR}
   ${IL_INCLUDE_DIR}
@@ -457,12 +488,13 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
   OpenGL::GL
   ${GLEW_LIBRARIES}
   ${GLFW_LIBRARIES}
-  ${FASTGLTF_LIBRARY}
+  fastgltf          # Built as subdirectory
   simdjson::simdjson
   ${IL_LIBRARIES}
   ${ILU_LIBRARIES}
   ${ILUT_LIBRARIES}
-  
+  tiny-cuda-nn
+
   # Optionally link against different libraries for release and debug configurations.
   # optimized ${LIBRARIES_OPTIMIZED}
   # debug ${LIBRARIES_DEBUG}

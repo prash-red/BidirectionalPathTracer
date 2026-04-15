@@ -30,6 +30,7 @@
 #include <Mesh.h>
 
 #include "vector_math.h"
+#include "CheckMacros.h"
 
 
 // All matrix transforms here work on row-major matrices, means transposed glm::mat4 data!
@@ -374,6 +375,7 @@ __host__ void device_skinning(cudaStream_t cudaStream,
         d_weights0,
         d_srcPositions,
         d_dstPositions);
+      CUDA_CHECK(cudaGetLastError());
       break;
 
     case 1: // kernel_skinning_1() is positions, joints0, weights0, joints1, weights1
@@ -386,6 +388,7 @@ __host__ void device_skinning(cudaStream_t cudaStream,
         d_weights1,
         d_srcPositions,
         d_dstPositions);
+      CUDA_CHECK(cudaGetLastError());
       break;
 
     case 2: // kernel_skinning_2() is positions + normals, joints0, weights0
@@ -399,6 +402,7 @@ __host__ void device_skinning(cudaStream_t cudaStream,
         d_srcNormals,
         d_dstPositions,
         d_dstNormals);
+      CUDA_CHECK(cudaGetLastError());
       break;
 
     case 3: // kernel_skinning_3() is positions + normals, joints0, weights0 and joints1, weights1
@@ -414,6 +418,7 @@ __host__ void device_skinning(cudaStream_t cudaStream,
         d_srcNormals,
         d_dstPositions,
         d_dstNormals);
+      CUDA_CHECK(cudaGetLastError());
       break;
 
     case 4: // kernel_skinning_4() is positions + normals + tangents, joints0, weights0
@@ -429,6 +434,7 @@ __host__ void device_skinning(cudaStream_t cudaStream,
         d_dstPositions,
         d_dstTangents,
         d_dstNormals);
+      CUDA_CHECK(cudaGetLastError());
       break;
 
     case 5: // kernel_skinning_5() is positions + normals + tangents, joints0, weights0 and joints1, weights1
@@ -446,6 +452,7 @@ __host__ void device_skinning(cudaStream_t cudaStream,
         d_dstPositions,
         d_dstTangents,
         d_dstNormals);
+      CUDA_CHECK(cudaGetLastError());
       break;
   }
 }

@@ -33,6 +33,7 @@
 #include "HostKernels.h"
 #include "Utils.h"
 #include "ConversionArguments.h"
+#include "cuda/NrcHost.h"
 
 // STB
 #define STB_IMAGE_IMPLEMENTATION
@@ -328,6 +329,7 @@ Application::Application(GLFWwindow* window,
   initOptiX();
   initSheenLUT();
   initDenoiser();
+  initNRC();
 
   try
   {
@@ -1095,6 +1097,19 @@ void Application::initDenoiser()
   std::cout << "OptiX HDR denoiser initialized.\n";
 }
 
+void Application::initNRC() {
+  m_nrcSystem  = nrcCreate(m_cudaStream);
+  m_nrcEnabled = true;
+
+  // Force single-sample-per-frame: NRC buffers are written once per optixLaunch.
+  // With m_launches > 1, successive sub-frames would overwrite each other's NRC data.
+  m_launches = 1;
+
+  m_launchParameters.nrc.enabled          = 1;
+  m_launchParameters.nrc.spreadC          = 0.01f; // Mueller et al. 2021 Section 3.4.
+  m_launchParameters.nrc.terminationDepth = 5;     // Fallback max depth if spread threshold not met.
+}
+
 
 void Application::updateDenoiserBuffers()
 {
@@ -1307,6 +1322,33 @@ void Application::updateBuffers()
   }
 
   updateDenoiserBuffers();
+
+  // NRC buffer allocation: reallocate whenever resolution changes.
+  if (m_nrcEnabled && m_nrcSystem)
+  {
+    constexpr uint32_t NRC_GRAN = 256u; // tcnn BATCH_SIZE_GRANULARITY
+    const uint32_t numPixels    = static_cast<uint32_t>(numElementsResolution);
+    m_nrcBatchSize = (numPixels + NRC_GRAN - 1u) / NRC_GRAN * NRC_GRAN;
+
+    nrcAllocBuffers(m_nrcSystem, m_nrcBatchSize);
+
+    // Mirror device pointers into LaunchParameters for device-side access.
+    NrcLaunchBuffers& nrcBuf         = m_launchParameters.nrc;
+
+    // Shared buffers (both cache types).
+    nrcBuf.renderThroughput          = nrcRenderThroughput(m_nrcSystem);
+    nrcBuf.renderPrefix              = nrcRenderPrefix(m_nrcSystem);
+    nrcBuf.renderOutput              = nrcRenderOutput(m_nrcSystem);
+    nrcBuf.renderValid               = nrcRenderValid(m_nrcSystem);
+
+    // Forward NRC buffers.
+    nrcBuf.renderFeatures            = nrcRenderFeatures(m_nrcSystem);
+    nrcBuf.trainNextFeatures         = nrcTrainNextFeatures(m_nrcSystem);
+    nrcBuf.trainSuffixScaled         = nrcTrainSuffixScaled(m_nrcSystem);
+    nrcBuf.trainSuffixThroughput     = nrcTrainSuffThroughput(m_nrcSystem);
+    nrcBuf.trainThroughputAtK        = nrcTrainThroughputAtK(m_nrcSystem);
+    nrcBuf.trainNextValid            = nrcTrainNextValid(m_nrcSystem);
+  }
 }
 
 
@@ -1477,7 +1519,24 @@ bool Application::render()
       CUDA_CHECK( cudaDeviceSynchronize() );
       ++m_iterationLightPath;
 
+
       scaleLightPath = 1.0f / (static_cast<float>(m_iterationLightPath) * 100.0f);
+    }
+
+    // NRC dispatch: inference → accumulate → build targets → train → update EMA.
+    // Runs once per render() call (after all eye-path sub-frame launches).
+    // Requires m_launches == 1 so the NRC buffers hold data from exactly one launch.
+    if (m_nrcEnabled && m_nrcSystem && m_launchParameters.bufferAccum != nullptr)
+    {
+      // Use the iteration value the raygen ran with (before the += m_launches increment above).
+      const unsigned int nrcIteration = m_launchParameters.iteration - static_cast<unsigned int>(m_launches);
+      nrcDispatch(m_nrcSystem,
+                  m_cudaStream,
+                  m_launchParameters.bufferAccum,
+                  m_resolution.x * m_resolution.y,
+                  m_nrcBatchSize,
+                  nrcIteration,
+                  static_cast<NrcDebugMode>(m_nrcDebugMode));
     }
 
     // Denoiser: run on the accumulated eye path buffer and write to m_d_bufferDenoised.
@@ -1987,6 +2046,29 @@ void Application::guiWindow()
           ImGui::SetTooltip("0 = fully denoised output.\n1 = fully noisy raw accumulation.\nValues in between linearly blend the two.");
         }
       }
+    }
+  }
+
+  if (m_nrcEnabled && ImGui::CollapsingHeader("Neural Radiance Cache"))
+  {
+    const char* debugItems[] = {
+      "Composited (normal)",
+      "Cache only  (raw NRC output)",
+      "Termination mask",
+      "Indirect contribution",
+    };
+    if (ImGui::Combo("Visualization", &m_nrcDebugMode, debugItems, 4))
+    {
+      m_launchParameters.iteration = 0;
+    }
+    if (ImGui::IsItemHovered())
+    {
+      ImGui::SetTooltip(
+        "Composited  : normal render with NRC filling terminated paths.\n"
+        "Cache only  : raw network output (what the NRC has learned).\n"
+        "Mask        : white = pixels where NRC termination fired.\n"
+        "Indirect    : throughput * NRC output (indirect-light contribution only)."
+      );
     }
   }
 
@@ -4213,9 +4295,10 @@ void Application::initAnimations()
 
       // Determine start and end time of the inputs.
       // gltf 2.0 specs: "Animation sampler's input accessor MUST have its min and max properties defined."
-      const auto* minimum = std::get_if< FASTGLTF_STD_PMR_NS::vector<double> >(&m_asset.accessors[indexInputAccessor].min);
-      MY_ASSERT(minimum != nullptr && minimum->size() == 1);
-      animationSampler.timeMin = static_cast<float>(minimum->front());
+      const auto& minimum = m_asset.accessors[indexInputAccessor].min;
+      MY_ASSERT(minimum.has_value() && minimum->size() == 1);
+      MY_ASSERT(minimum->isType<double>());
+      animationSampler.timeMin = static_cast<float>(minimum->get<double>(0));
 
       // Track the minimum time of all samplers in this animation.
       if (animationSampler.timeMin < animation.timeMin)
@@ -4223,9 +4306,10 @@ void Application::initAnimations()
         animation.timeMin = animationSampler.timeMin;
       }
 
-      const auto* maximum = std::get_if< FASTGLTF_STD_PMR_NS::vector<double> >(&m_asset.accessors[indexInputAccessor].max);
-      MY_ASSERT(maximum != nullptr && minimum->size() == 1);
-      animationSampler.timeMax = static_cast<float>(maximum->front());
+      const auto& maximum = m_asset.accessors[indexInputAccessor].max;
+      MY_ASSERT(maximum.has_value() && maximum->size() == 1);
+      MY_ASSERT(maximum->isType<double>());
+      animationSampler.timeMax = static_cast<float>(maximum->get<double>(0));
 
       // Track the maximum time of all samplers in this animation.
       if (animation.timeMax < animationSampler.timeMax)
@@ -6511,6 +6595,15 @@ void Application::updateLaunchParameters()
     const glm::vec3 center = m_sceneExtent.getCenter();
     m_launchParameters.sceneSphereCenter = make_float3(center.x, center.y, center.z);
     m_launchParameters.sceneSphereRadius = m_sceneExtent.getDiameter() * 0.5f;
+
+    // Update NRC AABB for world-space position normalization in feature packing.
+    if (m_nrcEnabled)
+    {
+      const glm::vec3 mn = m_sceneExtent.getMin();
+      const glm::vec3 mx = m_sceneExtent.getMax();
+      m_launchParameters.nrc.aabbMin = make_float3(mn.x, mn.y, mn.z);
+      m_launchParameters.nrc.aabbMax = make_float3(mx.x, mx.y, mx.z);
+    }
   }
 
   m_launchParameters.iteration = 0u; // Restart accumulation.

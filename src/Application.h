@@ -113,6 +113,9 @@
 #include "cuda/geometry_data.h"
 #include "cuda/material_data.h"
 
+// NrcHost.h is included for NrcDebugMode enum and the NrcSystem opaque handle.
+// The full NrcSystem definition stays in NrcHost.cu to avoid pulling in tcnn headers.
+#include "cuda/NrcHost.h"
 
 #define APP_EXIT_SUCCESS          0
 
@@ -348,6 +351,9 @@ private:
 
   void initSheenLUT();
   void initDenoiser();
+
+  void initNRC();
+
   void updateDenoiserBuffers();
 
   LightDefinition createConstantEnvironmentLight() const;
@@ -620,6 +626,13 @@ private:
   // A vector which contains the asynchronously launched iteration values, filled inside the renderer() function.
   // Defining once here to not resize it on every render call but only when changing the launches value inside the GUI.
   std::vector<unsigned int> m_iterations;
+
+  // Neural Radiance Cache (Mueller et al. 2021).
+  // NrcSystem is defined in NrcHost.cu (CUDA) to avoid pulling tcnn device headers here.
+  NrcSystem*   m_nrcSystem     = nullptr;
+  bool         m_nrcEnabled    = false;
+  uint32_t     m_nrcBatchSize  = 0; // numPixels rounded to tcnn BATCH_SIZE_GRANULARITY (256).
+  int          m_nrcDebugMode  = 0; // 0=normal, 1=cache-only, 2=mask, 3=indirect
 };
 
 #endif // APPLICATION_H

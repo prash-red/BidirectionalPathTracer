@@ -35,6 +35,7 @@
 #include "random.h"
 #include "shader_common.h"
 #include "vector_math.h"
+#include "nrc_features.h"
 
 
 extern "C" {
@@ -113,16 +114,25 @@ __forceinline__ __device__ void sampleVolumeScattering(const float2 xi, const fl
 
 // Called by raygen.
 // @return radiance
-__forceinline__ __device__ float3 integrator(PerRayData& prd)
+__forceinline__ __device__ float3 integrator(PerRayData& prd, const uint2 theLaunchIndex)
 {
   // The integrator starts with black radiance and full path throughput.
-  prd.radiance   = make_float3(0.0f);
-  prd.pdf        = 0.0f;
-  prd.throughput = make_float3(1.0f);
-  prd.occlusion  = 1.0f;
-  prd.sigma_t    = make_float3(0.0f); // Extinction coefficient: sigma_a + sigma_s.
-  //prd.walk       = 0;                 // Number of random walk steps taken through volume scattering. 
-  prd.typeEvent  = BSDF_EVENT_ABSORB; // Initialize for exit. (Otherwise miss programs do not work.)
+  prd.radiance      = make_float3(0.0f);
+  prd.pdf           = 0.0f;
+  prd.throughput    = make_float3(1.0f);
+  prd.occlusion     = 1.0f;
+  prd.sigma_t       = make_float3(0.0f); // Extinction coefficient: sigma_a + sigma_s.
+  //prd.walk          = 0;               // Number of random walk steps taken through volume scattering.
+  prd.typeEvent     = BSDF_EVENT_ABSORB; // Initialize for exit. (Otherwise miss programs do not work.)
+  prd.nrcTerminated = false;
+
+  // NRC area-spread tracking (Mueller et al. 2021, Section 3.4).
+  // All local to the integrator; no need to store in PRD.
+  const float3 nrcX0    = prd.pos;  // x0: camera origin for a0 computation
+  float        nrcA0    = 0.0f;     // Reference spread: dist(x0,x1)^2 / (4π |cos θ1|)
+  float        nrcSpread = 0.0f;    // Cumulative sqrt-sum; area spread a(x1..xn) = nrcSpread^2
+  float3       nrcPosPrev = prd.pos; // Previous vertex position
+  float        nrcPdfPrev = 0.0f;    // BSDF pdf for direction toward current vertex (from prev hit)
   
   // Nested material handling. 
   prd.idxStack   = 0;
@@ -147,37 +157,39 @@ __forceinline__ __device__ float3 integrator(PerRayData& prd)
     prd.distance = RT_DEFAULT_MAX; // Shoot the next ray with maximum length.
     prd.flags    = 0;
 
-    // FIXME Not implementing volume scattering.
-    // Special cases for volume scattering!
-    //if (0 < prd.idxStack) // Inside a volume?
-    //{
-    //  // Note that this only supports homogeneous volumes so far! 
-    //  // No change in sigma_s along the random walk here.
-    //  const float3 sigma_s = make_float3(prd.stack[prd.idxStack].scattering_bias);
+    {
+      // FIXME Not implementing volume scattering.
+      // Special cases for volume scattering!
+      //if (0 < prd.idxStack) // Inside a volume?
+      //{
+      //  // Note that this only supports homogeneous volumes so far!
+      //  // No change in sigma_s along the random walk here.
+      //  const float3 sigma_s = make_float3(prd.stack[prd.idxStack].scattering_bias);
 
-    //  if (isNotNull(sigma_s)) // We're inside a volume and it has volume scattering?
-    //  {
-    //    // Indicate that we're inside a random walk. This changes the behavior of the radiance ray miss programs.
-    //    prd.flags |= FLAG_VOLUME_SCATTERING;
+      //  if (isNotNull(sigma_s)) // We're inside a volume and it has volume scattering?
+      //  {
+      //    // Indicate that we're inside a random walk. This changes the behavior of the radiance ray miss programs.
+      //    prd.flags |= FLAG_VOLUME_SCATTERING;
 
-    //    // Random walk through scattering volume, sampling the distance.
-    //    // Note that the entry and exit of the volume is done according to the BSDF sampling.
-    //    // Means glass with volume scattering will still do the proper refractions.
-    //    // When the number of random walk steps has been exceeded, the next ray is shot with distance RT_DEFAULT_MAX
-    //    // to hit something. If that results in a transmission the scattering volume is left.
-    //    // If not, this continues until the maximum path length has been exceeded.
-    //    if (prd.walk < sysData.walkLength)
-    //    {
-    //      const float3 albedo = safe_div(sigma_s, prd.sigma_t);
-    //      const float2 xi     = rng2(prd.seed);
-    //      
-    //      const float s = sampleDensity(albedo, prd.throughput, prd.sigma_t, xi.x, prd.pdfVolume);
+      //    // Random walk through scattering volume, sampling the distance.
+      //    // Note that the entry and exit of the volume is done according to the BSDF sampling.
+      //    // Means glass with volume scattering will still do the proper refractions.
+      //    // When the number of random walk steps has been exceeded, the next ray is shot with distance RT_DEFAULT_MAX
+      //    // to hit something. If that results in a transmission the scattering volume is left.
+      //    // If not, this continues until the maximum path length has been exceeded.
+      //    if (prd.walk < sysData.walkLength)
+      //    {
+      //      const float3 albedo = safe_div(sigma_s, prd.sigma_t);
+      //      const float2 xi     = rng2(prd.seed);
+      //
+      //      const float s = sampleDensity(albedo, prd.throughput, prd.sigma_t, xi.x, prd.pdfVolume);
 
-    //      // Prevent logf(0.0f) by sampling the inverse range (0.0f, 1.0f].
-    //      prd.distance = -logf(1.0f - xi.y) / s;
-    //    }
-    //  }
-    //}
+      //      // Prevent logf(0.0f) by sampling the inverse range (0.0f, 1.0f].
+      //      prd.distance = -logf(1.0f - xi.y) / s;
+      //    }
+      //  }
+      //}
+    }
 
     // Note that the primary rays and volume scattering miss cases do not offset the ray t_min by sysData.sceneEpsilon.
     optixTrace(theLaunchParameters.handle,
@@ -190,17 +202,126 @@ __forceinline__ __device__ float3 integrator(PerRayData& prd)
                TYPE_RAY_RADIANCE, NUM_RAY_TYPES, TYPE_RAY_RADIANCE,
                payload.x, payload.y);
 
+    // NRC area-spread path termination (Mueller et al. 2021, Section 3.4).
+    // Update the area spread for this segment, then check whether to cache-terminate the path.
+    if (theLaunchParameters.nrc.enabled && (prd.flags & FLAG_HIT))
+    {
+      if (depth == 0)
+      {
+        // Reference spread a0 = ||x0 - x1||^2 / (4π |cos θ1|).
+        // x0 = nrcX0 (camera origin), x1 = prd.pos (first hit), cos θ1 = dot(nrcN, wo).
+        const float3 d01    = prd.pos - nrcX0;
+        const float  distSq = dot(d01, d01);
+        const float  cosT1  = fmaxf(dot(prd.nrcN, prd.wo), 1e-6f);
+        nrcA0 = distSq / (4.0f * M_PIf * cosT1);
+      }
+      else // depth >= 1: accumulate one spread term for segment x_{depth-1} → x_depth
+      {
+        const float3 d      = prd.pos - nrcPosPrev;
+        const float  distSq = dot(d, d);
+        const float  cosT   = fmaxf(fabsf(dot(prd.nrcN, prd.wo)), 1e-6f);
+        nrcSpread += sqrtf(distSq / (fmaxf(nrcPdfPrev, 1e-6f) * cosT));
+      }
+      // Update previous-vertex tracking for the next segment (all hit types, including specular).
+      nrcPosPrev = prd.pos;
+      nrcPdfPrev = prd.pdf;
+    }
+
+    // Terminate and query the cache if the area spread threshold is met (or the fallback max depth
+    // is reached) at a diffuse/glossy vertex.
+    if (theLaunchParameters.nrc.enabled &&
+        depth >= 1 &&
+        nrcA0 > 0.0f &&
+        (nrcSpread * nrcSpread > theLaunchParameters.nrc.spreadC * nrcA0 ||
+         depth >= theLaunchParameters.nrc.terminationDepth) &&
+        (prd.flags & FLAG_HIT) &&
+        (prd.typeEvent & (BSDF_EVENT_DIFFUSE | BSDF_EVENT_GLOSSY)))
+    {
+      const unsigned int pixelIdx = theLaunchParameters.resolution.x * theLaunchIndex.y + theLaunchIndex.x;
+      const NrcLaunchBuffers& nrc = theLaunchParameters.nrc;
+
+      // renderThroughput = T_{K+1} (throughput after BSDF scatter at K).
+      const float3 tpK1 = prd.throughput;
+      nrc.renderThroughput[3 * pixelIdx + 0] = tpK1.x;
+      nrc.renderThroughput[3 * pixelIdx + 1] = tpK1.y;
+      nrc.renderThroughput[3 * pixelIdx + 2] = tpK1.z;
+
+      // renderPrefix = accumulated direct radiance up to and including vertex K.
+      const float3 prefix = prd.radiance;
+      nrc.renderPrefix[3 * pixelIdx + 0] = prefix.x;
+      nrc.renderPrefix[3 * pixelIdx + 1] = prefix.y;
+      nrc.renderPrefix[3 * pixelIdx + 2] = prefix.z;
+
+      nrc.renderValid[pixelIdx] = 1u;
+
+      // Forward NRC render query: full 14-dim features.
+      nrcPackFeatures(nrc.renderFeatures, pixelIdx,
+                      prd.pos, prd.nrcN, prd.wo,
+                      prd.nrcRoughness, prd.nrcBaseColor, prd.nrcSpecColor,
+                      nrc.aabbMin, nrc.aabbMax);
+
+      // trainThroughputAtK used by target-build kernel.
+      nrc.trainThroughputAtK[3 * pixelIdx + 0] = tpK1.x;
+      nrc.trainThroughputAtK[3 * pixelIdx + 1] = tpK1.y;
+      nrc.trainThroughputAtK[3 * pixelIdx + 2] = tpK1.z;
+
+      // Suffix trace: one extra bounce to collect NRC training targets.
+      const float3 radiusBefore = prd.radiance;
+
+      prd.wo       = -prd.wi;
+      prd.distance = RT_DEFAULT_MAX;
+      prd.flags    = 0;
+
+      optixTrace(theLaunchParameters.handle,
+                 prd.pos, prd.wi,
+                 theLaunchParameters.sceneEpsilon, prd.distance, 0.0f,
+                 OptixVisibilityMask(0xFF),
+                 OPTIX_RAY_FLAG_CULL_BACK_FACING_TRIANGLES,
+                 TYPE_RAY_RADIANCE, NUM_RAY_TYPES, TYPE_RAY_RADIANCE,
+                 payload.x, payload.y);
+
+      const float3 suffixDelta = prd.radiance - radiusBefore;
+      nrc.trainSuffixScaled[3 * pixelIdx + 0] = suffixDelta.x;
+      nrc.trainSuffixScaled[3 * pixelIdx + 1] = suffixDelta.y;
+      nrc.trainSuffixScaled[3 * pixelIdx + 2] = suffixDelta.z;
+
+      const bool suffixHit = (prd.flags & FLAG_HIT) &&
+                             (prd.typeEvent & (BSDF_EVENT_DIFFUSE | BSDF_EVENT_GLOSSY));
+      if (suffixHit)
+      {
+        nrcPackFeatures(nrc.trainNextFeatures, pixelIdx,
+                        prd.pos, prd.nrcN, prd.wo,
+                        prd.nrcRoughness, prd.nrcBaseColor, prd.nrcSpecColor,
+                        nrc.aabbMin, nrc.aabbMax);
+        const float3 tpK2 = prd.throughput;
+        nrc.trainSuffixThroughput[3 * pixelIdx + 0] = tpK2.x;
+        nrc.trainSuffixThroughput[3 * pixelIdx + 1] = tpK2.y;
+        nrc.trainSuffixThroughput[3 * pixelIdx + 2] = tpK2.z;
+        nrc.trainNextValid[pixelIdx] = 1u;
+      }
+      else
+      {
+        nrc.trainSuffixThroughput[3 * pixelIdx + 0] = 0.0f;
+        nrc.trainSuffixThroughput[3 * pixelIdx + 1] = 0.0f;
+        nrc.trainSuffixThroughput[3 * pixelIdx + 2] = 0.0f;
+        nrc.trainNextValid[pixelIdx] = 0u;
+      }
+
+      prd.nrcTerminated = true;
+      break; // NRC handles the rest; skip further path tracing.
+    }
+
     // Path termination by miss shader or sample() routines.
     if ((prd.typeEvent == BSDF_EVENT_ABSORB) || isNull(prd.throughput))
     {
-      if (theLaunchParameters.showEnvironment == 0 && // If the environment should not be shown in primary rays and 
-          depth == 0 &&                               // it's a primary ray and 
-          (prd.flags & FLAG_HIT) == 0)                // it did not hit anything then 
+      if (theLaunchParameters.showEnvironment == 0 && // If the environment should not be shown in primary rays and
+          depth == 0 &&                               // it's a primary ray and
+          (prd.flags & FLAG_HIT) == 0)                // it did not hit anything then
       {
         prd.radiance = make_float3(0.0f);             // return black instead of the miss program result.
       }
       break; // Path termination.
-    } 
+    }
 
     // Unbiased Russian Roulette path termination.
     if (theLaunchParameters.pathLengths.x <= depth) // Start termination after a minimum number of bounces.
@@ -273,7 +394,7 @@ extern "C" __global__ void __raygen__path_tracer()
     prd.wi  = theLaunchParameters.cameraW; // W is normalized for orthographic cameras.
   }
 
-  float3 radiance = integrator(prd);
+  float3 radiance = integrator(prd, theLaunchIndex);
 
 #if USE_DEBUG_EXCEPTIONS // DEBUG Highlight numerical errors.
   if (isnan(radiance.x) || isnan(radiance.y) || isnan(radiance.z))
@@ -295,18 +416,22 @@ extern "C" __global__ void __raygen__path_tracer()
 
   if (theLaunchParameters.picking.x < 0.0f) // Rendering.
   {
-    const unsigned int index = theLaunchParameters.resolution.x * theLaunchIndex.y + theLaunchIndex.x; // Linear image pixel index.
-
-    if (0 < theLaunchParameters.iteration)
+    // NRC-terminated pixels are composited by the host-side accumulate kernel; skip here.
+    if (!prd.nrcTerminated)
     {
-      const float t = 1.0f / static_cast<float>(theLaunchParameters.iteration + 1);
+      const unsigned int index = theLaunchParameters.resolution.x * theLaunchIndex.y + theLaunchIndex.x;
 
-      const float3 colorAccum = make_float3(theLaunchParameters.bufferAccum[index]);
+      if (0 < theLaunchParameters.iteration)
+      {
+        const float t = 1.0f / static_cast<float>(theLaunchParameters.iteration + 1);
 
-      radiance = lerp(colorAccum, radiance, t);
+        const float3 colorAccum = make_float3(theLaunchParameters.bufferAccum[index]);
+
+        radiance = lerp(colorAccum, radiance, t);
+      }
+
+      theLaunchParameters.bufferAccum[index] = make_float4(radiance, 1.0f);
     }
-
-    theLaunchParameters.bufferAccum[index] = make_float4(radiance, 1.0f);
   }
   else // Picking.
   {
@@ -374,7 +499,7 @@ __forceinline__ __device__ bool sampleEmitterRay(PerRayData& prd, float3& origin
 
 // BDPT: Traces a path starting from a light source.
 // Connections to the camera are performed inside chRadiance() when FLAG_LIGHT_PATH is set.
-__forceinline__ __device__ void lightPathIntegrator(PerRayData& prd)
+__forceinline__ __device__ void lightPathIntegrator(PerRayData& prd, const uint2 theLaunchIndex)
 {
   prd.radiance   = make_float3(0.0f);
   prd.pdf        = 0.0f;
@@ -462,7 +587,7 @@ extern "C" __global__ void __raygen__light_path_tracer()
   prd.seed = tea<4>(theLaunchParameters.resolution.x * theLaunchIndex.y + theLaunchIndex.x,
                     theLaunchParameters.iteration + 0x12345678u);
 
-  lightPathIntegrator(prd);
+  lightPathIntegrator(prd, theLaunchIndex);
 }
 
 
@@ -511,7 +636,7 @@ extern "C" __global__ void __raygen__path_tracer_surface()
     prd.wi  = theLaunchParameters.cameraW; // W is normalized for orthographic cameras.
   }
 
-  float3 radiance = integrator(prd);
+  float3 radiance = integrator(prd, theLaunchIndex);
 
 #if USE_DEBUG_EXCEPTIONS // DEBUG Highlight numerical errors.
   if (isnan(radiance.x) || isnan(radiance.y) || isnan(radiance.z))
@@ -533,32 +658,36 @@ extern "C" __global__ void __raygen__path_tracer_surface()
 
   if (theLaunchParameters.picking.x < 0.0f) // Rendering.
   {
-    if (0 < theLaunchParameters.iteration)
+    // NRC-terminated pixels are composited by the host-side accumulate kernel; skip here.
+    if (!prd.nrcTerminated)
     {
-      const float t = 1.0f / static_cast<float>(theLaunchParameters.iteration + 1);
+      if (0 < theLaunchParameters.iteration)
+      {
+        const float t = 1.0f / static_cast<float>(theLaunchParameters.iteration + 1);
 
-      if (theLaunchParameters.bufferAccum != nullptr) // BDPT mode: progressive average in flat buffer.
+        if (theLaunchParameters.bufferAccum != nullptr) // BDPT mode: progressive average in flat buffer.
+        {
+          const unsigned int index = theLaunchParameters.resolution.x * theLaunchIndex.y + theLaunchIndex.x;
+          const float3 colorAccum = make_float3(theLaunchParameters.bufferAccum[index]);
+          radiance = lerp(colorAccum, radiance, t);
+        }
+        else // Standard surface mode: read previous average directly from the display surface.
+        {
+          float4 colorAccum;
+          surf2Dread(&colorAccum, theLaunchParameters.surface, theLaunchIndex.x * sizeof(float4), theLaunchIndex.y, cudaBoundaryModeZero);
+          radiance = lerp(make_float3(colorAccum), radiance, t);
+        }
+      }
+
+      if (theLaunchParameters.bufferAccum != nullptr) // BDPT mode: write to flat buffer; surface is written by device_blend_to_surface.
       {
         const unsigned int index = theLaunchParameters.resolution.x * theLaunchIndex.y + theLaunchIndex.x;
-        const float3 colorAccum = make_float3(theLaunchParameters.bufferAccum[index]);
-        radiance = lerp(colorAccum, radiance, t);
+        theLaunchParameters.bufferAccum[index] = make_float4(radiance, 1.0f);
       }
-      else // Standard surface mode: read previous average directly from the display surface.
+      else
       {
-        float4 colorAccum;
-        surf2Dread(&colorAccum, theLaunchParameters.surface, theLaunchIndex.x * sizeof(float4), theLaunchIndex.y, cudaBoundaryModeZero);
-        radiance = lerp(make_float3(colorAccum), radiance, t);
+        surf2Dwrite(make_float4(radiance, 1.0f), theLaunchParameters.surface, theLaunchIndex.x * sizeof(float4), theLaunchIndex.y);
       }
-    }
-
-    if (theLaunchParameters.bufferAccum != nullptr) // BDPT mode: write to flat buffer; surface is written by device_blend_to_surface.
-    {
-      const unsigned int index = theLaunchParameters.resolution.x * theLaunchIndex.y + theLaunchIndex.x;
-      theLaunchParameters.bufferAccum[index] = make_float4(radiance, 1.0f);
-    }
-    else
-    {
-      surf2Dwrite(make_float4(radiance, 1.0f), theLaunchParameters.surface, theLaunchIndex.x * sizeof(float4), theLaunchIndex.y);
     }
   }
   else // Picking.

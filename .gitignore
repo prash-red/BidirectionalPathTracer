@@ -68,6 +68,7 @@ vcpkg_installed/
 3rdparty/fastgltf/
 3rdparty/glm/
 3rdparty/stb/
+3rdparty/tiny-cuda-nn/
 
 # debug information files
 *.dwo

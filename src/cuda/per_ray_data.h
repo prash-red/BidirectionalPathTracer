@@ -132,6 +132,17 @@ struct PerRayData
   // BDPT light path counters (only used when FLAG_LIGHT_PATH is set).
   int lightSpecularCount;       // Number of specular bounces so far on the light path.
   int lightDiffuseAfterSpecular; // Number of diffuse bounces after the first specular bounce.
+
+  // NRC: surface state at the last hit, written by chRadiance when nrc.enabled.
+  // The raygen reads these when depth == nrc.terminationDepth to pack the feature vector.
+  float3 nrcN;          // shading normal (flipped to ray side)
+  float  nrcRoughness;  // linear roughness in [0,1]
+  float3 nrcBaseColor;  // diffuse base color
+  float3 nrcSpecColor;  // dielectric specular color (F0 proxy)
+
+  // Set by integrator() when this pixel's path was NRC-terminated.
+  // The raygen skips writing bufferAccum; the host-side accumulate kernel handles it.
+  bool nrcTerminated;
 };
 
 

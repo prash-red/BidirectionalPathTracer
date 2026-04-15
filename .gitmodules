@@ -1,0 +1,12 @@
+[submodule "3rdparty/tiny-cuda-nn"]
+	path = 3rdparty/tiny-cuda-nn
+	url = https://github.com/NVlabs/tiny-cuda-nn
+[submodule "3rdparty/fastgltf"]
+	path = 3rdparty/fastgltf
+	url = https://github.com/spnda/fastgltf.git
+[submodule "3rdparty/glm"]
+	path = 3rdparty/glm
+	url = https://github.com/g-truc/glm.git
+[submodule "3rdparty/stb"]
+	path = 3rdparty/stb
+	url = https://github.com/nothings/stb.git

@@ -56,13 +56,13 @@ __forceinline__ __device__ void lcg(unsigned int& previous)
 }
 
 // Return a random sample in the range [0, 1) with a simple Linear Congruential Generator.
-__forceinline__ __device__ float rng(unsigned int& previous)
-{
-  previous = previous * 1664525u + 1013904223u;
-  
-  //return float(previous & 0x00FFFFFF) / float(0x01000000u); // Use the lower 24 bits.
-  return float(previous >> 8) / float(0x01000000u); // Use the upper 24 bits
-}
+// __forceinline__ __device__ float rng(unsigned int& previous)
+// {
+//   previous = previous * 1664525u + 1013904223u;
+//
+//   //return float(previous & 0x00FFFFFF) / float(0x01000000u); // Use the lower 24 bits.
+//   return float(previous >> 8) / float(0x01000000u); // Use the upper 24 bits
+// }
 
 
 // Convenience function
@@ -116,4 +116,50 @@ __forceinline__ __device__ float4 rng4(unsigned int& previous)
   s.w = float(previous >> 8) / float(0x01000000u);
 
   return s;
+}
+
+
+// PCG random number generator (better statistical properties than LCG)
+// http://www.pcg-random.org/
+__forceinline__ __device__ unsigned int pcg(unsigned int& state)
+{
+  const unsigned int old = state;
+  state = old * 747796405u + 2891336453u;
+  const unsigned int word = ((old >> ((old >> 28u) + 4u)) ^ old) * 277803737u;
+  return (word >> 22u) ^ word;
+}
+
+__forceinline__ __device__ float rng(unsigned int& state)
+{
+  return float(pcg(state) >> 8) * (1.0f / float(1u << 24));
+}
+
+// PCG float in range [0, 1)
+__forceinline__ __device__ float pcg_float(unsigned int& state)
+{
+  return float(pcg(state) >> 8) * (1.0f / float(1u << 24));
+}
+
+// Box-Muller transform for Gaussian noise using PCG
+__forceinline__ __device__ float pcg_gaussian(unsigned int& state)
+{
+  const float u1 = fmaxf(fminf(pcg_float(state), 1.0f - 1e-6f), 1e-6f);
+  const float u2 = pcg_float(state);
+  return sqrtf(-2.0f * logf(u1)) * cosf(2.0f * 3.14159265358979f * u2);
+}
+
+// Convenience functions for PCG
+__forceinline__ __device__ float2 pcg2(unsigned int& state)
+{
+  return make_float2(pcg_float(state), pcg_float(state));
+}
+
+__forceinline__ __device__ float3 pcg3(unsigned int& state)
+{
+  return make_float3(pcg_float(state), pcg_float(state), pcg_float(state));
+}
+
+__forceinline__ __device__ float4 pcg4(unsigned int& state)
+{
+  return make_float4(pcg_float(state), pcg_float(state), pcg_float(state), pcg_float(state));
 }

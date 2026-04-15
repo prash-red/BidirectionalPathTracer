@@ -2,6 +2,8 @@
 // #include <surface_functions.h>
 #include <vector_types.h>
 
+#include "CheckMacros.h"
+
 
 // Composite the eye path progressive average (bufferAccum) and the scaled light path
 // running sum (bufferAccumLightPath) into a single output buffer entirely on the GPU.
@@ -42,6 +44,7 @@ __host__ void device_blend_buffers(
   const int     gridSize  = (numPixels + blockSize - 1) / blockSize;
 
   kernel_blend_buffers<<<gridSize, blockSize, 0, cudaStream>>>(dst, eye, lightPath, scaleLightPath, numPixels);
+  CUDA_CHECK(cudaGetLastError());
 }
 
 
@@ -90,6 +93,7 @@ __host__ void device_blend_surface(
                      (height + blockDim.y - 1) / blockDim.y);
 
   kernel_blend_surface<<<gridDim, blockDim, 0, cudaStream>>>(surface, lightPath, scaleLightPath, width, height);
+  CUDA_CHECK(cudaGetLastError());
 }
 
 
@@ -142,4 +146,5 @@ __host__ void device_blend_to_surface(
                      (height + blockDim.y - 1) / blockDim.y);
 
   kernel_blend_to_surface<<<gridDim, blockDim, 0, cudaStream>>>(surface, eye, lightPath, scaleLightPath, width, height);
+  CUDA_CHECK(cudaGetLastError());
 }

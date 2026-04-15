@@ -101,6 +101,9 @@ namespace dev {
       return (aabb[0] + aabb[1]) * 0.5f;
     }
 
+    glm::vec3 getMin() const { return aabb[0]; }
+    glm::vec3 getMax() const { return aabb[1]; }
+
     // true if update() was called at least once and volume > 0
     bool isValid() const
     {

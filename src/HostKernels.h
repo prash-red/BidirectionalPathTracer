@@ -70,5 +70,41 @@ extern __host__ void device_blend_to_surface(cudaStream_t        cudaStream,
                                              int                 width,
                                              int                 height);
 
+// NRC: fused accumulate + build targets (single kernel launch).
+// 1. Progressive-average NRC-terminated pixels into bufferAccum (where renderValid[i]==1)
+// 2. Build per-pixel training targets from suffix data (all pixels)
+extern __host__ void device_nrc_accumulate_and_build_targets(
+    cudaStream_t        cudaStream,
+    float4*             bufferAccum,
+    const float*        renderPrefix,
+    const float*        renderThroughput,
+    const float*        renderOutput,
+    const unsigned int* renderValid,
+    float*              trainTargets,
+    const float*        trainSuffixScaled,
+    const float*        trainSuffixThroughput,
+    const float*        nrcNext,
+    const float*        trainThroughputAtK,
+    const unsigned int* trainNextValid,
+    int                 numPixels,
+    unsigned int        iteration);
+
+// NRC: fused debug + build targets (single kernel launch).
+// Like accumulate_and_build_targets but with debug visualization instead.
+extern __host__ void device_nrc_debug_and_build_targets(
+    cudaStream_t        cudaStream,
+    float4*             bufferAccum,
+    const float*        renderOutput,
+    const float*        renderThroughput,
+    const unsigned int* renderValid,
+    float*              trainTargets,
+    const float*        trainSuffixScaled,
+    const float*        trainSuffixThroughput,
+    const float*        nrcNext,
+    const float*        trainThroughputAtK,
+    const unsigned int* trainNextValid,
+    int                 numPixels,
+    unsigned int        iteration,
+    int                 debugMode);
 
 #endif // HOST_KERNELS_H

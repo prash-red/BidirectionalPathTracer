@@ -30,6 +30,7 @@
 #include <Mesh.h>
 
 #include "vector_math.h"
+#include "CheckMacros.h"
 
 __global__ void kernel_morphing_float2(
   const float* weights,
@@ -162,7 +163,7 @@ __host__ void device_morphing(cudaStream_t cudaStream,
                  1); // == (1 + 0) / threadsPerBlock.z);
 
   // "Attributes present in the base mesh primitive but not included in a given morph target MUST retain their original values for the morph target.
-  // Client implementations SHOULD support at least three attributes — POSITION, NORMAL, and TANGENT — for morphing. 
+  // Client implementations SHOULD support at least three attributes ï¿½ POSITION, NORMAL, and TANGENT ï¿½ for morphing. 
   // Client implementations MAY optionally support morphed TEXCOORD_n and/or COLOR_n attributes.
   // Note that the W component for handedness is omitted when targeting TANGENT data since handedness cannot be displaced."
 
@@ -173,10 +174,11 @@ __host__ void device_morphing(cudaStream_t cudaStream,
     kernel_morphing_float3<<<numBlocks, threadsPerBlock, 0, cudaStream>>>(
       d_weights,
       numAttributes,
-      devicePrim.numTargets, 
+      devicePrim.numTargets,
       reinterpret_cast<const float3**>(targets),
       reinterpret_cast<const float3*>(devicePrim.positions.d_ptr),
       reinterpret_cast<float3*>(devicePrim.positionsMorphed.d_ptr));
+    CUDA_CHECK(cudaGetLastError());
 
     targets += devicePrim.numTargets * sizeof(CUdeviceptr);
   }
@@ -186,10 +188,11 @@ __host__ void device_morphing(cudaStream_t cudaStream,
     kernel_morphing_tangent<<<numBlocks, threadsPerBlock, 0, cudaStream>>>(
       d_weights,
       numAttributes,
-      devicePrim.numTargets, 
+      devicePrim.numTargets,
       reinterpret_cast<const float3**>(targets),
       reinterpret_cast<const float4*>(devicePrim.tangents.d_ptr),
       reinterpret_cast<float4*>(devicePrim.tangentsMorphed.d_ptr));
+    CUDA_CHECK(cudaGetLastError());
 
     targets += devicePrim.numTargets * sizeof(CUdeviceptr);
   }
@@ -199,10 +202,11 @@ __host__ void device_morphing(cudaStream_t cudaStream,
     kernel_morphing_normal<<<numBlocks, threadsPerBlock, 0, cudaStream>>>(
       d_weights,
       numAttributes,
-      devicePrim.numTargets, 
+      devicePrim.numTargets,
       reinterpret_cast<const float3**>(targets),
       reinterpret_cast<const float3*>(devicePrim.normals.d_ptr),
       reinterpret_cast<float3*>(devicePrim.normalsMorphed.d_ptr));
+    CUDA_CHECK(cudaGetLastError());
 
     targets += devicePrim.numTargets * sizeof(CUdeviceptr);
   }
@@ -212,10 +216,11 @@ __host__ void device_morphing(cudaStream_t cudaStream,
     kernel_morphing_float4<<<numBlocks, threadsPerBlock, 0, cudaStream>>>(
       d_weights,
       numAttributes,
-      devicePrim.numTargets, 
+      devicePrim.numTargets,
       reinterpret_cast<const float4**>(targets),
       reinterpret_cast<const float4*>(devicePrim.normals.d_ptr),
       reinterpret_cast<float4*>(devicePrim.normalsMorphed.d_ptr));
+    CUDA_CHECK(cudaGetLastError());
 
     targets += devicePrim.numTargets * sizeof(CUdeviceptr);
   }
@@ -227,10 +232,11 @@ __host__ void device_morphing(cudaStream_t cudaStream,
       kernel_morphing_float2<<<numBlocks, threadsPerBlock, 0, cudaStream>>>(
         d_weights,
         numAttributes,
-        devicePrim.numTargets, 
+        devicePrim.numTargets,
         reinterpret_cast<const float2**>(targets),
         reinterpret_cast<const float2*>(devicePrim.texcoords[j].d_ptr),
         reinterpret_cast<float2*>(devicePrim.texcoordsMorphed[j].d_ptr));
+      CUDA_CHECK(cudaGetLastError());
 
       targets += devicePrim.numTargets * sizeof(CUdeviceptr);
     }

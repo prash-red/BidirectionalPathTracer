@@ -1503,6 +1503,16 @@ __forceinline__ __device__ void chRadiance()
                      ? state.clearcoat * ior_fresnel(1.5f / state.ior1, fabsf(dot(thePrd->wo, state.Nc)))
                      : 0.0f;
 
+  // NRC: snapshot surface state so the raygen can pack the NRC feature vector at depth == terminationDepth.
+  // Overwritten at every bounce; the raygen only reads after the trace at terminationDepth.
+  if (theLaunchParameters.nrc.enabled)
+  {
+    thePrd->nrcN         = state.N;
+    thePrd->nrcRoughness = sqrtf(fmaxf(state.roughness.y, 0.0f)); // linear from squared
+    thePrd->nrcBaseColor = state.baseColor;
+    thePrd->nrcSpecColor = state.specularColor;
+  }
+
   // FIXME Implement arbitrary mesh lights. This only handles geometry emission on implicit hits.
   // Unfortunately many emission textures in glTF models are applied to the whole models 
   // with only little emissive regions and the rest of the texture being black.
