@@ -1440,6 +1440,19 @@ bool Application::render()
     }
   }
 
+  m_launchParameters.nrc.nrcDebugMode = m_nrcEnabled ? m_nrcDebugMode : 0;
+
+  // In debug mode the raygen skips non-NRC-terminated pixels, so bufferAccum must be zeroed
+  // on every accumulation restart (not just on mode change) to clear stale path-traced values
+  // or ghosted geometry from a previous camera orientation.
+  if (m_nrcEnabled && m_nrcDebugMode != 0 &&
+      m_launchParameters.iteration == 0 &&
+      m_launchParameters.bufferAccum != nullptr)
+  {
+    const int numPixels = m_launchParameters.resolution.x * m_launchParameters.resolution.y;
+    CUDA_CHECK( cudaMemset(reinterpret_cast<void*>(m_launchParameters.bufferAccum), 0, numPixels * sizeof(float4)) );
+  }
+
   // Update all launch parameters on the device.
   CUDA_CHECK( cudaMemcpyAsync(reinterpret_cast<void*>(m_d_launchParameters), &m_launchParameters, sizeof(LaunchParameters), cudaMemcpyHostToDevice, m_cudaStream) );
 
@@ -1525,6 +1538,10 @@ bool Application::render()
 
       scaleLightPath = 1.0f / (static_cast<float>(m_iterationLightPath) * 100.0f);
     }
+    // Suppress BDPT light path compositing in NRC debug mode: the visualization (mask, cache-only,
+    // indirect) must not be contaminated by scene-colored light path contributions.
+    if (m_nrcEnabled && m_nrcDebugMode != 0)
+      scaleLightPath = 0.0f;
 
     // NRC dispatch: inference → accumulate → build targets → train → update EMA.
     // Runs once per render() call (after all eye-path sub-frame launches).
@@ -2063,6 +2080,13 @@ void Application::guiWindow()
     if (ImGui::Combo("Visualization", &m_nrcDebugMode, debugItems, 4))
     {
       m_launchParameters.iteration = 0;
+      // Zero bufferAccum so non-NRC-terminated pixels start black in debug mode, and
+      // debug-mode values don't corrupt the progressive average on return to normal.
+      if (m_launchParameters.bufferAccum != nullptr)
+      {
+        const int numPixels = m_launchParameters.resolution.x * m_launchParameters.resolution.y;
+        CUDA_CHECK( cudaMemset(reinterpret_cast<void*>(m_launchParameters.bufferAccum), 0, numPixels * sizeof(float4)) );
+      }
     }
     if (ImGui::IsItemHovered())
     {
@@ -6916,7 +6940,7 @@ void Application::update()
                                   : reinterpret_cast<const void*>(m_launchParameters.bufferAccum);
           CUDA_CHECK( cudaMemcpy((void*) m_bufferHost, srcBuffer, numPixels * sizeof(float4), cudaMemcpyDeviceToHost) );
 
-          if (m_bdptDisplayMode == 2 && haveLightPath)
+          if (m_bdptDisplayMode == 2 && haveLightPath && !(m_nrcEnabled && m_nrcDebugMode != 0))
           {
             // Blend eye + light path contributions.
             const float scaleLightPath = 1.0f / (static_cast<float>(m_iterationLightPath) * 100.0f);

@@ -387,7 +387,7 @@ extern "C" __global__ void __raygen__path_tracer()
   }
   else // if orthographic camera
   {
-    // Primary rays start on a camera plane at the camera postion and all directions are parallel.
+    // Primary rays start on a camera plane at the camera position and all directions are parallel.
     prd.pos = theLaunchParameters.cameraP + 
               theLaunchParameters.cameraU * ndc.x +
               theLaunchParameters.cameraV * ndc.y;
@@ -417,7 +417,9 @@ extern "C" __global__ void __raygen__path_tracer()
   if (theLaunchParameters.picking.x < 0.0f) // Rendering.
   {
     // NRC-terminated pixels are composited by the host-side accumulate kernel; skip here.
-    if (!prd.nrcTerminated)
+    // In NRC debug modes the debug kernel owns bufferAccum; non-terminated pixels must not
+    // write path-traced color, or they corrupt the visualization.
+    if (!prd.nrcTerminated && theLaunchParameters.nrc.nrcDebugMode == 0)
     {
       const unsigned int index = theLaunchParameters.resolution.x * theLaunchIndex.y + theLaunchIndex.x;
 
@@ -691,7 +693,8 @@ extern "C" __global__ void __raygen__path_tracer_surface()
   if (theLaunchParameters.picking.x < 0.0f) // Rendering.
   {
     // NRC-terminated pixels are composited by the host-side accumulate kernel; skip here.
-    if (!prd.nrcTerminated)
+    // && theLaunchParameters.nrc.nrcDebugMode == 0
+    if (!prd.nrcTerminated && theLaunchParameters.nrc.nrcDebugMode == 0)
     {
       if (0 < theLaunchParameters.iteration)
       {

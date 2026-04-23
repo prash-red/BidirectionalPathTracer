@@ -66,7 +66,8 @@ struct NrcLaunchBuffers
   int   terminationDepth;     // Fallback max depth if spread threshold not met.
 
   // ---- Mode flags -----------------------------------------------------------
-  int enabled;    // 0 = NRC off, 1 = NRC active.
+  int enabled;       // 0 = NRC off, 1 = NRC active.
+  int nrcDebugMode;  // 0=normal, 1=cache-only, 2=mask, 3=indirect (matches NrcDebugMode enum).
 };
 
 struct LaunchParameters
