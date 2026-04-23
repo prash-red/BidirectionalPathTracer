@@ -85,6 +85,7 @@
 
 #include <chrono>
 #include <memory>
+#include <map>
 #include <set>
 #include <string>
 #include <vector>
@@ -188,13 +189,15 @@ enum ProgramGroupId
   PGID_HIT_SHADOW_SPHERES,
 
   // Direct Callables (light sampling)
-  // Area lights: 
+  // Area lights:
   PGID_LIGHT_ENV_CONSTANT,
   PGID_LIGHT_ENV_SPHERE,
   // Singular lights:
   PGID_LIGHT_POINT,
   PGID_LIGHT_SPOT,
   PGID_LIGHT_DIRECTIONAL,
+  // Emissive mesh area light:
+  PGID_LIGHT_MESH,
 
   // BDPT: Light path raygen program.
   PGID_LIGHT_PATH_RAYGENERATION,
@@ -313,6 +316,8 @@ private:
   void initMaterials();
   void initMeshes();
   void initLights(const bool first);
+  void initMeshLights();
+  void freeMeshLights();
   void initCameras();
   void initAnimations();
   void initSceneExtent();
@@ -553,6 +558,9 @@ private:
 
   std::vector<LightDefinition> m_lightDefinitions;
   CUdeviceptr m_d_lightDefinitions = 0;
+
+  std::vector<CUdeviceptr>                  m_meshLightBuffers;
+  std::map<std::pair<size_t, size_t>, int>  m_meshLightLookup;
   
   // Data which is kept intact for faster animations:
   size_t m_indexInstance = 0; // Global index into m_instances which is tracked in traverseNode() when just updating the instances.

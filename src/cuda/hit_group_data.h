@@ -40,6 +40,7 @@ struct HitGroupData
 {
   GeometryData geometryData;
   MaterialData materialData;
+  int lightDefinitionIndex; // Index into lightDefinitions[]; -1 if not a mesh light
 };
 
 #endif // HIT_GROUP_DATA_h

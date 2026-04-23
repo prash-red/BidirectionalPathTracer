@@ -476,6 +476,38 @@ __forceinline__ __device__ bool sampleEmitterRay(PerRayData& prd, float3& origin
     // emission is the average env radiance; scale by 4*pi*r^2 to get total power, then /selectionPdf.
     prd.throughput = light.emission * float(numLights);
   }
+  else if (light.typeLight == TYPE_LIGHT_MESH)
+  {
+    const float3* positions = reinterpret_cast<const float3*>(light.cdfU);
+    const float*  cdf       = reinterpret_cast<const float*> (light.cdfV);
+    const int     N         = static_cast<int>(light.width);
+
+    if (N <= 0 || light.area <= 0.0f)
+      return false;
+
+    // Sample a triangle by area CDF.
+    const unsigned int triIdx = binarySearchCDF(cdf, static_cast<unsigned int>(N), rng(prd.seed));
+
+    const float3 v0 = positions[3 * triIdx + 0];
+    const float3 v1 = positions[3 * triIdx + 1];
+    const float3 v2 = positions[3 * triIdx + 2];
+
+    // Uniform barycentric sample (Turk 1990).
+    const float su = sqrtf(rng(prd.seed));
+    const float b0 = 1.0f - su;
+    const float b1 = su * (1.0f - rng(prd.seed));
+    const float b2 = su - b1;
+    origin = b0 * v0 + b1 * v1 + b2 * v2;
+
+    // Face normal as hemisphere axis.
+    const float3 normal = normalize(cross(v1 - v0, v2 - v0));
+
+    // Cosine-weighted direction from front face; cosTheta cancels with pdf_dir = cosTheta/pi.
+    unitSquareToCosineHemisphere(make_float2(rng(prd.seed), rng(prd.seed)), normal, direction, dirPdf);
+
+    // Throughput: L_e / (p_pos * p_dir) / selectionPdf = L_e * area * pi * numLights
+    prd.throughput = light.emission * (light.area * M_PIf * float(numLights));
+  }
   else if (light.typeLight >= TYPE_LIGHT_POINT) // Point or spot light.
   {
     // Light position is stored as the translation column of the light matrix.

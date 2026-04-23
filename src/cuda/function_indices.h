@@ -49,6 +49,8 @@ enum TypeLight
   TYPE_LIGHT_POINT,
   TYPE_LIGHT_SPOT,
   TYPE_LIGHT_DIRECTIONAL,
+  // Emissive mesh area light.
+  TYPE_LIGHT_MESH,
 
   NUM_LIGHT_TYPES
 };

@@ -385,6 +385,8 @@ void Application::initRenderer(const bool first)
   updateScene(true       /*rebuild*/);
   buildInstanceAccel(true/*rebuild*/);
 
+  initMeshLights();
+
   if (first)
   {
     initPipeline();
@@ -1361,6 +1363,7 @@ void Application::updateRenderGraph()
   {
     updateScene(true);        // Rebuild the m_instances vector from instances reachable by the current scene.
     buildInstanceAccel(true); // Rebuild the top-level IAS.
+    initMeshLights();
     updateSBT();              // Rebuild the hit records according to the m_instances of the current scene.
     updateLaunchParameters(); // This sets the root m_ias and restarts the accumulation.
  
@@ -4173,6 +4176,137 @@ void Application::initCameras()
 }
 
 
+void Application::freeMeshLights()
+{
+  for (CUdeviceptr ptr : m_meshLightBuffers)
+  {
+    CUDA_CHECK( cudaFree(reinterpret_cast<void*>(ptr)) );
+  }
+  m_meshLightBuffers.clear();
+  m_meshLightLookup.clear();
+}
+
+
+void Application::initMeshLights()
+{
+  freeMeshLights();
+
+  m_lightDefinitions.erase(
+    std::remove_if(m_lightDefinitions.begin(), m_lightDefinitions.end(),
+                   [](const LightDefinition& ld) { return ld.typeLight == TYPE_LIGHT_MESH; }),
+    m_lightDefinitions.end());
+
+  for (size_t instanceIdx = 0; instanceIdx < m_instances.size(); ++instanceIdx)
+  {
+    const dev::Instance&   instance   = m_instances[instanceIdx];
+    const dev::DeviceMesh& deviceMesh = m_deviceMeshes[instance.indexDeviceMesh];
+    const dev::HostMesh&   hostMesh   = m_hostMeshes[deviceMesh.key.idxHostMesh];
+
+    for (size_t primIdx = 0; primIdx < hostMesh.primitives.size(); ++primIdx)
+    {
+      const dev::HostPrimitive& hostPrim = hostMesh.primitives[primIdx];
+
+      if (hostPrim.getPrimitiveType() != dev::PrimitiveType::Triangles)
+        continue;
+      if (hostPrim.currentMaterial < 0)
+        continue;
+
+      const MaterialData& mat = m_materials[hostPrim.currentMaterial];
+
+      const float3& ef = mat.emissiveFactor;
+      if (ef.x == 0.0f && ef.y == 0.0f && ef.z == 0.0f)
+        continue;
+      if (mat.emissiveTexture.object != 0)
+        continue;
+
+      const unsigned int* indexData    = reinterpret_cast<const unsigned int*>(hostPrim.indices.h_ptr);
+      const float3*       posData      = reinterpret_cast<const float3*>(hostPrim.positions.h_ptr);
+      const size_t        numTriangles = hostPrim.indices.count / 3;
+
+      if (numTriangles == 0)
+        continue;
+
+      std::vector<float3> worldPositions(3 * numTriangles);
+      std::vector<float>  cdf(numTriangles + 1, 0.0f);
+
+      const glm::mat4x4& xform = instance.transform;
+
+      for (size_t t = 0; t < numTriangles; ++t)
+      {
+        const unsigned int i0 = indexData[3 * t + 0];
+        const unsigned int i1 = indexData[3 * t + 1];
+        const unsigned int i2 = indexData[3 * t + 2];
+
+        const glm::vec4 p0w = xform * glm::vec4(posData[i0].x, posData[i0].y, posData[i0].z, 1.0f);
+        const glm::vec4 p1w = xform * glm::vec4(posData[i1].x, posData[i1].y, posData[i1].z, 1.0f);
+        const glm::vec4 p2w = xform * glm::vec4(posData[i2].x, posData[i2].y, posData[i2].z, 1.0f);
+
+        worldPositions[3 * t + 0] = make_float3(p0w.x, p0w.y, p0w.z);
+        worldPositions[3 * t + 1] = make_float3(p1w.x, p1w.y, p1w.z);
+        worldPositions[3 * t + 2] = make_float3(p2w.x, p2w.y, p2w.z);
+
+        const float3 e0      = worldPositions[3 * t + 1] - worldPositions[3 * t + 0];
+        const float3 e1      = worldPositions[3 * t + 2] - worldPositions[3 * t + 0];
+        const float3 cr      = cross(e0, e1);
+        const float  triArea = 0.5f * sqrtf(dot(cr, cr));
+        cdf[t + 1] = cdf[t] + triArea;
+      }
+
+      const float totalArea = cdf[numTriangles];
+      if (totalArea <= 0.0f)
+        continue;
+
+      const float invTotal = 1.0f / totalArea;
+      for (size_t t = 1; t <= numTriangles; ++t)
+        cdf[t] *= invTotal;
+      cdf[numTriangles] = 1.0f;
+
+      CUdeviceptr d_positions = 0;
+      const size_t posBytes = worldPositions.size() * sizeof(float3);
+      CUDA_CHECK( cudaMalloc(reinterpret_cast<void**>(&d_positions), posBytes) );
+      CUDA_CHECK( cudaMemcpy(reinterpret_cast<void*>(d_positions), worldPositions.data(), posBytes, cudaMemcpyHostToDevice) );
+      m_meshLightBuffers.push_back(d_positions);
+
+      CUdeviceptr d_cdf = 0;
+      const size_t cdfBytes = cdf.size() * sizeof(float);
+      CUDA_CHECK( cudaMalloc(reinterpret_cast<void**>(&d_cdf), cdfBytes) );
+      CUDA_CHECK( cudaMemcpy(reinterpret_cast<void*>(d_cdf), cdf.data(), cdfBytes, cudaMemcpyHostToDevice) );
+      m_meshLightBuffers.push_back(d_cdf);
+
+      LightDefinition ld = {};
+      ld.typeLight = TYPE_LIGHT_MESH;
+      ld.cdfU      = d_positions;
+      ld.cdfV      = d_cdf;
+      ld.width     = static_cast<unsigned int>(numTriangles);
+      ld.height    = 0;
+      ld.emission  = mat.emissiveFactor * mat.emissiveStrength;
+      ld.area      = totalArea;
+
+      const int lightDefIdx = static_cast<int>(m_lightDefinitions.size());
+      m_lightDefinitions.push_back(ld);
+      m_meshLightLookup[{instanceIdx, primIdx}] = lightDefIdx;
+    }
+  }
+
+  if (m_d_lightDefinitions != 0)
+  {
+    CUDA_CHECK( cudaFree(reinterpret_cast<void*>(m_d_lightDefinitions)) );
+    m_d_lightDefinitions = 0;
+  }
+  if (!m_lightDefinitions.empty())
+  {
+    CUDA_CHECK( cudaMalloc(reinterpret_cast<void**>(&m_d_lightDefinitions),
+                           m_lightDefinitions.size() * sizeof(LightDefinition)) );
+    CUDA_CHECK( cudaMemcpy(reinterpret_cast<void*>(m_d_lightDefinitions),
+                           m_lightDefinitions.data(),
+                           m_lightDefinitions.size() * sizeof(LightDefinition),
+                           cudaMemcpyHostToDevice) );
+  }
+
+  m_isDirtyLights = false;
+}
+
+
 void Application::initLights(const bool first)
 {
   m_lights.clear();
@@ -5250,6 +5384,8 @@ void Application::cleanup()
     m_d_iasAABB = 0;
   }
 
+  freeMeshLights();
+
   if (m_d_lightDefinitions != 0)
   {
     CUDA_CHECK( cudaFree(reinterpret_cast<void*>(m_d_lightDefinitions)) );
@@ -5848,6 +5984,12 @@ void Application::initPipeline()
   pgd->callables.moduleDC            = m_modules[MODULE_ID_LIGHT_SAMPLE];
   pgd->callables.entryFunctionNameDC = "__direct_callable__light_directional";
 
+  pgd = &programGroupDescriptions[PGID_LIGHT_MESH];
+  pgd->kind  = OPTIX_PROGRAM_GROUP_KIND_CALLABLES;
+  pgd->flags = OPTIX_PROGRAM_GROUP_FLAGS_NONE;
+  pgd->callables.moduleDC            = m_modules[MODULE_ID_LIGHT_SAMPLE];
+  pgd->callables.entryFunctionNameDC = "__direct_callable__sampleMeshLight";
+
   // Create the program groups.
 
   m_programGroups.resize(programGroupDescriptions.size());
@@ -5959,16 +6101,23 @@ void Application::initSBT()
 
     std::vector<dev::HitGroupRecord> hitGroupRecords;
 
-    for (const dev::Instance& instance : m_instances)
+    for (size_t instanceIdx = 0; instanceIdx < m_instances.size(); ++instanceIdx)
     {
+      const dev::Instance& instance = m_instances[instanceIdx];
       //std::cout << "Instance " << instance.indexDeviceMesh << std::endl;
 
       const dev::DeviceMesh& deviceMesh = m_deviceMeshes[instance.indexDeviceMesh];
 
-      for (const dev::DevicePrimitive& devicePrim : deviceMesh.primitives)
+      for (size_t primIdx = 0; primIdx < deviceMesh.primitives.size(); ++primIdx)
       {
+        const dev::DevicePrimitive& devicePrim = deviceMesh.primitives[primIdx];
         // Geometry and material.
         dev::HitGroupRecord rec = {};
+
+        {
+          auto it = m_meshLightLookup.find({instanceIdx, primIdx});
+          rec.data.lightDefinitionIndex = (it != m_meshLightLookup.end()) ? it->second : -1;
+        }
 
         //std::cout << "\tDevice Primitive " << devicePrim.name << ", type " << devicePrim.getPrimitiveType() << std::endl;
 
@@ -6091,10 +6240,10 @@ void Application::initSBT()
     //
     const size_t call_record_size = sizeof(dev::EmptyRecord);
 
-    // Callables are the range [PGID_LIGHT_ENV_CONSTANT, PGID_LIGHT_DIRECTIONAL] (5 entries).
+    // Callables are the range [PGID_LIGHT_ENV_CONSTANT, PGID_LIGHT_MESH] (6 entries).
     // PGID_LIGHT_PATH_RAYGENERATION comes after and is a raygen, not a callable.
     const int numCallables = PGID_LIGHT_PATH_RAYGENERATION - PGID_LIGHT_ENV_CONSTANT;
-    MY_ASSERT(numCallables == 5);
+    MY_ASSERT(numCallables == 6);
 
     CUDA_CHECK( cudaMalloc(reinterpret_cast<void**>(&m_sbt.callablesRecordBase), call_record_size * numCallables) );
 
@@ -6105,6 +6254,7 @@ void Application::initSBT()
     OPTIX_CHECK( m_api.optixSbtRecordPackHeader(m_programGroups[PGID_LIGHT_POINT],        &call_sbt[2]) );
     OPTIX_CHECK( m_api.optixSbtRecordPackHeader(m_programGroups[PGID_LIGHT_SPOT],         &call_sbt[3]) );
     OPTIX_CHECK( m_api.optixSbtRecordPackHeader(m_programGroups[PGID_LIGHT_DIRECTIONAL],  &call_sbt[4]) );
+    OPTIX_CHECK( m_api.optixSbtRecordPackHeader(m_programGroups[PGID_LIGHT_MESH],         &call_sbt[5]) );
 
     CUDA_CHECK( cudaMemcpy(reinterpret_cast<void*>(m_sbt.callablesRecordBase), call_sbt, call_record_size * numCallables, cudaMemcpyHostToDevice) );
     
@@ -6137,13 +6287,19 @@ void Application::updateSBT()
 
   std::vector<dev::HitGroupRecord> hitGroupRecords;
 
-  for (const dev::Instance& instance : m_instances)
+  for (size_t instanceIdx = 0; instanceIdx < m_instances.size(); ++instanceIdx)
   {
+    const dev::Instance& instance = m_instances[instanceIdx];
     const dev::DeviceMesh& deviceMesh = m_deviceMeshes[instance.indexDeviceMesh];
 
-    for (const dev::DevicePrimitive& devicePrim : deviceMesh.primitives)
+    for (size_t primIdx = 0; primIdx < deviceMesh.primitives.size(); ++primIdx)
     {
+      const dev::DevicePrimitive& devicePrim = deviceMesh.primitives[primIdx];
       dev::HitGroupRecord rec = {};
+      {
+        auto it = m_meshLightLookup.find({instanceIdx, primIdx});
+        rec.data.lightDefinitionIndex = (it != m_meshLightLookup.end()) ? it->second : -1;
+      }
       const bool isTriangles = (devicePrim.getPrimitiveType() == dev::PrimitiveType::Triangles);
 
       if (isTriangles)

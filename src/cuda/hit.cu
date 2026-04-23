@@ -1522,7 +1522,30 @@ __forceinline__ __device__ void chRadiance()
   // 
   // This implements a diffuse EDF for implicit light hits.
   // (I disagree with the KHR_materials_clearcoat extension.)
-  thePrd->radiance += throughput * state.emission; 
+  //
+
+  // Basic Implementation of area mesh lights
+  if (thePrd->pdf > 0.0f
+      && hitGroupData->lightDefinitionIndex >= 0
+      && theLaunchParameters.directLighting
+      && 0 < theLaunchParameters.numLights)
+  {
+    const LightDefinition& meshLight =
+        theLaunchParameters.lightDefinitions[hitGroupData->lightDefinitionIndex];
+    const float3 rayDir = optixGetWorldRayDirection();
+    const float  dist   = optixGetRayTmax();
+    const float  cosL   = dot(-normalize(rayDir), state.Ng);
+    if (cosL > 0.0f)
+    {
+      const float lightPdf = (dist * dist) / (cosL * meshLight.area);
+      const float weight   = balanceHeuristic(thePrd->pdf, lightPdf);
+      thePrd->radiance += throughput * state.emission * weight;
+    }
+  }
+  else
+  {
+    thePrd->radiance += throughput * state.emission;
+  }
 
   // Start fresh with the next BSDF sample.
   // The pdf of the previous event was needed for the emission calculation above.
@@ -1886,7 +1909,9 @@ __forceinline__ __device__ void chRadiance()
   if (isVisible)
   {
     // Only do multiple-importance sampling for area lights, not singular lights.
-    const float weightMIS = (light.typeLight <= TYPE_LIGHT_ENV_SPHERE) ? balanceHeuristic(lightSample.pdf, pdf) : 1.0f;
+    const float weightMIS = (light.typeLight <= TYPE_LIGHT_ENV_SPHERE ||
+                             light.typeLight == TYPE_LIGHT_MESH)
+                            ? balanceHeuristic(lightSample.pdf, pdf) : 1.0f;
 
     // The sampled emission needs to be scaled by the inverse probability to have selected this light,
     // Selecting one of many lights means the inverse of 1.0f / numLights.

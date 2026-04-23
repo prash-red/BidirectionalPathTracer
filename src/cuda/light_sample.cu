@@ -224,3 +224,65 @@ extern "C" __device__ LightSample __direct_callable__light_directional(const Lig
   return lightSample;
 }
 
+
+extern "C" __device__ LightSample __direct_callable__sampleMeshLight(const LightDefinition& light, PerRayData* prd)
+{
+  LightSample lightSample;
+  lightSample.pdf = 0.0f; // default: invalid sample
+
+  const float3* positions = reinterpret_cast<const float3*>(light.cdfU); // world-space, 3N entries
+  const float*  cdf       = reinterpret_cast<const float*> (light.cdfV); // N+1 entries
+  const int     N         = static_cast<int>(light.width);                // triangle count
+
+  if (N <= 0 || light.area <= 0.0f)
+    return lightSample;
+
+  // Pick a triangle by sampling the normalized area CDF.
+  const float        u0     = rng(prd->seed);
+  const unsigned int triIdx = binarySearchCDF(cdf, static_cast<unsigned int>(N), u0);
+
+  // Uniform sample on the chosen triangle (Turk 1990).
+  const float u1 = rng(prd->seed);
+  const float u2 = rng(prd->seed);
+  const float su = sqrtf(u1);
+  const float b0 = 1.0f - su;
+  const float b1 = su * (1.0f - u2);
+  const float b2 = su * u2;
+
+  const float3 v0 = positions[3 * triIdx + 0];
+  const float3 v1 = positions[3 * triIdx + 1];
+  const float3 v2 = positions[3 * triIdx + 2];
+
+  const float3 p_world = b0 * v0 + b1 * v1 + b2 * v2;
+
+  // Face normal from world-space edges (positions already in world space).
+  const float3 e0 = v1 - v0;
+  const float3 e1 = v2 - v0;
+  const float3 cr = cross(e0, e1);
+
+  if (dot(cr, cr) <= DENOMINATOR_EPSILON)
+    return lightSample; // Degenerate triangle; skip.
+
+  const float3 n_world = normalize(cr);
+
+  const float3 toLight = p_world - prd->pos;
+  const float  dist2   = dot(toLight, toLight);
+
+  if (dist2 <= DENOMINATOR_EPSILON)
+    return lightSample; // Shading point on light surface; avoid division by zero.
+
+  const float  dist = sqrtf(dist2);
+  const float3 dir  = toLight / dist;
+
+  const float cosTheta = dot(-dir, n_world);
+  if (cosTheta <= 0.0f)
+    return lightSample; // Back-facing sample; caller checks pdf <= 0.
+
+  // Solid-angle PDF: (1 / total_area) * dist^2 / cosTheta
+  lightSample.direction         = dir;
+  lightSample.distance          = dist;
+  lightSample.pdf               = dist2 / (cosTheta * light.area);
+  lightSample.radiance_over_pdf = light.emission / lightSample.pdf;
+  return lightSample;
+}
+
