@@ -50,12 +50,20 @@ struct NrcLaunchBuffers
   unsigned int* renderValid;           // [numPixels] 0 / 1
 
   // ---- Forward NRC buffers -------------------------------------------------
-  float*        renderFeatures;        // [NRC_INPUT_DIM × numPixels] column-major (14-dim)
-  float*        trainNextFeatures;     // [NRC_INPUT_DIM × numPixels] suffix vertex features
-  float*        trainSuffixScaled;     // [3 × numPixels]  = throughputAtK * (emit+direct at K+1)
-  float*        trainSuffixThroughput; // [3 × numPixels]  = throughput at K+1
-  float*        trainThroughputAtK;    // [3 × numPixels]  throughput at vertex K
-  unsigned int* trainNextValid;        // [numPixels] 0 / 1
+  float*        renderFeatures;        // [NRC_INPUT_DIM × numPixels] pixel-indexed (14-dim)
+  float*        trainNextFeatures;     // [NRC_INPUT_DIM × batchSize] slot-indexed: suffix terminal features
+  float*        trainSuffixScaled;     // [3 × batchSize]  slot-indexed: sum of T_{K+j}*Le_{K+j} over suffix
+  float*        trainSuffixThroughput; // [3 × batchSize]  slot-indexed: throughput at last suffix vertex
+  float*        trainThroughputAtK;    // [3 × batchSize]  slot-indexed: T_{K+1} at termination vertex
+  unsigned int* trainNextValid;        // [batchSize] 0 / 1  (slot-indexed)
+
+  // ---- Compact training batch (Option B: stream compaction via atomicAdd) ----
+  // raygen writes training pixels into a compact slot array; only slot-indexed
+  // buffers (trainFeatures, trainThroughputAtK, trainSuffixScaled,
+  // trainSuffixThroughput, trainNextFeatures, trainNextValid) use slot addressing.
+  unsigned int* trainCount;        // [1] atomic counter: number of training slots used this frame
+  unsigned int* trainPixelIndices; // [batchSize] pixel index for each training slot (unused by kernels, diagnostic)
+  float*        trainFeatures;     // [NRC_INPUT_DIM × batchSize] compact slot-indexed train features
 
   // ---- Scene AABB ------------------------------------------------------------
   float3 aabbMin;

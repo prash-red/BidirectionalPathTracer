@@ -1350,6 +1350,10 @@ void Application::updateBuffers()
     nrcBuf.trainSuffixThroughput     = nrcTrainSuffThroughput(m_nrcSystem);
     nrcBuf.trainThroughputAtK        = nrcTrainThroughputAtK(m_nrcSystem);
     nrcBuf.trainNextValid            = nrcTrainNextValid(m_nrcSystem);
+
+    nrcBuf.trainCount                = nrcTrainCount(m_nrcSystem);
+    nrcBuf.trainPixelIndices         = nrcTrainPixelIndices(m_nrcSystem);
+    nrcBuf.trainFeatures             = nrcTrainFeatures(m_nrcSystem);
   }
 }
 
@@ -1557,6 +1561,12 @@ bool Application::render()
                   m_nrcBatchSize,
                   nrcIteration,
                   static_cast<NrcDebugMode>(m_nrcDebugMode));
+
+      // Update loss history for GUI display.
+      m_nrcLastLoss                           = nrcGetLastLoss(m_nrcSystem);
+      m_nrcLastTrainCount                     = static_cast<int>(nrcGetLastTrainCount(m_nrcSystem));
+      m_nrcLossHistory[m_nrcLossHistoryIdx]   = m_nrcLastLoss;
+      m_nrcLossHistoryIdx                     = (m_nrcLossHistoryIdx + 1) % NRC_LOSS_HISTORY;
     }
 
     // Denoiser: run on the accumulated eye path buffer and write to m_d_bufferDenoised.
@@ -2097,6 +2107,35 @@ void Application::guiWindow()
         "Indirect    : throughput * NRC output (indirect-light contribution only)."
       );
     }
+
+    ImGui::Separator();
+
+    // Training loss sparkline + readouts.
+    // Find the min/max of the history window for auto-scaling.
+    float lossMin = m_nrcLossHistory[0];
+    float lossMax = m_nrcLossHistory[0];
+    for (int i = 1; i < NRC_LOSS_HISTORY; ++i)
+    {
+      if (m_nrcLossHistory[i] < lossMin) lossMin = m_nrcLossHistory[i];
+      if (m_nrcLossHistory[i] > lossMax) lossMax = m_nrcLossHistory[i];
+    }
+    // Keep a small margin above zero so a flat-zero line still renders.
+    if (lossMax < 1e-6f) lossMax = 1e-6f;
+
+    char lossOverlay[32];
+    snprintf(lossOverlay, sizeof(lossOverlay), "%.4f", m_nrcLastLoss);
+    ImGui::PlotLines("##NrcLoss",
+                     m_nrcLossHistory,
+                     NRC_LOSS_HISTORY,
+                     m_nrcLossHistoryIdx,   // start offset so the plot scrolls left
+                     lossOverlay,
+                     0.0f, lossMax * 1.1f,
+                     ImVec2(0.0f, 48.0f));
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("Relative-L2 training loss (last %d frames).\nCurrent: %.6f", NRC_LOSS_HISTORY, m_nrcLastLoss);
+
+    ImGui::Text("Loss:    %.4f", m_nrcLastLoss);
+    ImGui::Text("Samples: %d / frame", m_nrcLastTrainCount);
   }
 
   if (ImGui::CollapsingHeader("Tonemapper"))

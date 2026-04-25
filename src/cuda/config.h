@@ -58,4 +58,10 @@
 // 1 == All debug features enabled. Code generated with full debug info. (Really only for debugging, big performance hit!)
 #define USE_DEBUG_EXCEPTIONS 0
 
+// Neural Radiance Cache training hyperparameters (Mueller et al. 2021).
+// Changing these values requires only a device program rebuild.
+#define NRC_TRAIN_FRACTION 0.03f // Fraction of NRC-terminated pixels that trace a multi-vertex training suffix.
+#define NRC_SUFFIX_STEPS   3    // Extra bounces per training suffix path.
+#define NRC_UNBIASED_RATE  16   // 1-in-N training paths skip the cache bootstrap (pure MC, prevents drift).
+
 #endif // CONFIG_H

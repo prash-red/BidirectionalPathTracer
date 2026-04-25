@@ -227,6 +227,22 @@ __forceinline__ __device__ float3 integrator(PerRayData& prd, const uint2 theLau
       nrcPdfPrev = prd.pdf;
     }
 
+    // NRC_DEBUG_CACHE_ONLY: query the NRC at the first hit point from the camera.
+    // The first-hit position is deterministic (same surface point every frame for a static scene),
+    // so the NRC output is stable across frames — no Monte Carlo query-point variance.
+    if (theLaunchParameters.nrc.nrcDebugMode == 1 && depth == 0 && (prd.flags & FLAG_HIT))
+    {
+      const unsigned int pixelIdx = theLaunchParameters.resolution.x * theLaunchIndex.y + theLaunchIndex.x;
+      const NrcLaunchBuffers& nrc = theLaunchParameters.nrc;
+      nrcPackFeatures(nrc.renderFeatures, pixelIdx,
+                      prd.pos, prd.nrcN, prd.wo,
+                      prd.nrcRoughness, prd.nrcBaseColor, prd.nrcSpecColor,
+                      nrc.aabbMin, nrc.aabbMax);
+      nrc.renderValid[pixelIdx] = 1u;
+      prd.nrcTerminated = true;
+      break;
+    }
+
     // Terminate and query the cache if the area spread threshold is met (or the fallback max depth
     // is reached) at a diffuse/glossy vertex.
     if (theLaunchParameters.nrc.enabled &&
@@ -240,13 +256,15 @@ __forceinline__ __device__ float3 integrator(PerRayData& prd, const uint2 theLau
       const unsigned int pixelIdx = theLaunchParameters.resolution.x * theLaunchIndex.y + theLaunchIndex.x;
       const NrcLaunchBuffers& nrc = theLaunchParameters.nrc;
 
-      // renderThroughput = T_{K+1} (throughput after BSDF scatter at K).
+      // ---- Render data (all NRC-terminated pixels) ----
+
+      // T_{K+1}: throughput after BSDF scatter at the termination vertex K.
       const float3 tpK1 = prd.throughput;
       nrc.renderThroughput[3 * pixelIdx + 0] = tpK1.x;
       nrc.renderThroughput[3 * pixelIdx + 1] = tpK1.y;
       nrc.renderThroughput[3 * pixelIdx + 2] = tpK1.z;
 
-      // renderPrefix = accumulated direct radiance up to and including vertex K.
+      // Accumulated direct radiance up to and including vertex K.
       const float3 prefix = prd.radiance;
       nrc.renderPrefix[3 * pixelIdx + 0] = prefix.x;
       nrc.renderPrefix[3 * pixelIdx + 1] = prefix.y;
@@ -254,57 +272,104 @@ __forceinline__ __device__ float3 integrator(PerRayData& prd, const uint2 theLau
 
       nrc.renderValid[pixelIdx] = 1u;
 
-      // Forward NRC render query: full 14-dim features.
+      // Pixel-indexed render features (used by the full-batch inference pass).
       nrcPackFeatures(nrc.renderFeatures, pixelIdx,
                       prd.pos, prd.nrcN, prd.wo,
                       prd.nrcRoughness, prd.nrcBaseColor, prd.nrcSpecColor,
                       nrc.aabbMin, nrc.aabbMax);
 
-      // trainThroughputAtK used by target-build kernel.
-      nrc.trainThroughputAtK[3 * pixelIdx + 0] = tpK1.x;
-      nrc.trainThroughputAtK[3 * pixelIdx + 1] = tpK1.y;
-      nrc.trainThroughputAtK[3 * pixelIdx + 2] = tpK1.z;
+      // ---- Training suffix (~3% of NRC-terminated pixels) ----
+      // Each training pixel atomically claims a slot in the compact training buffer,
+      // then traces NRC_SUFFIX_STEPS extra bounces to build a self-training target.
 
-      // Suffix trace: one extra bounce to collect NRC training targets.
-      const float3 radiusBefore = prd.radiance;
-
-      prd.wo       = -prd.wi;
-      prd.distance = RT_DEFAULT_MAX;
-      prd.flags    = 0;
-
-      optixTrace(theLaunchParameters.handle,
-                 prd.pos, prd.wi,
-                 theLaunchParameters.sceneEpsilon, prd.distance, 0.0f,
-                 OptixVisibilityMask(0xFF),
-                 OPTIX_RAY_FLAG_CULL_BACK_FACING_TRIANGLES,
-                 TYPE_RAY_RADIANCE, NUM_RAY_TYPES, TYPE_RAY_RADIANCE,
-                 payload.x, payload.y);
-
-      const float3 suffixDelta = prd.radiance - radiusBefore;
-      nrc.trainSuffixScaled[3 * pixelIdx + 0] = suffixDelta.x;
-      nrc.trainSuffixScaled[3 * pixelIdx + 1] = suffixDelta.y;
-      nrc.trainSuffixScaled[3 * pixelIdx + 2] = suffixDelta.z;
-
-      const bool suffixHit = (prd.flags & FLAG_HIT) &&
-                             (prd.typeEvent & (BSDF_EVENT_DIFFUSE | BSDF_EVENT_GLOSSY));
-      if (suffixHit)
+      if (rng(prd.seed) < NRC_TRAIN_FRACTION)
       {
-        nrcPackFeatures(nrc.trainNextFeatures, pixelIdx,
+        // 1/NRC_UNBIASED_RATE training paths skip the cache bootstrap entirely,
+        // injecting a pure MC estimate to prevent self-training drift.
+        const bool isUnbiased = (rng(prd.seed) * NRC_UNBIASED_RATE < 1.0f);
+
+        // Claim a compact slot via atomic increment. The slot count is bounded by
+        // batchSize (NRC_TRAIN_FRACTION << 1 so overflow is astronomically rare,
+        // but we guard explicitly to prevent out-of-bounds writes).
+        const unsigned int slot = atomicAdd(nrc.trainCount, 1u);
+        if (slot >= static_cast<unsigned int>(theLaunchParameters.resolution.x *
+                                              theLaunchParameters.resolution.y))
+        {
+          prd.nrcTerminated = true;
+          break;
+        }
+
+        nrc.trainPixelIndices[slot] = pixelIdx;
+
+        // Slot-indexed compact train features at vertex K.
+        nrcPackFeatures(nrc.trainFeatures, slot,
                         prd.pos, prd.nrcN, prd.wo,
                         prd.nrcRoughness, prd.nrcBaseColor, prd.nrcSpecColor,
                         nrc.aabbMin, nrc.aabbMax);
-        const float3 tpK2 = prd.throughput;
-        nrc.trainSuffixThroughput[3 * pixelIdx + 0] = tpK2.x;
-        nrc.trainSuffixThroughput[3 * pixelIdx + 1] = tpK2.y;
-        nrc.trainSuffixThroughput[3 * pixelIdx + 2] = tpK2.z;
-        nrc.trainNextValid[pixelIdx] = 1u;
-      }
-      else
-      {
-        nrc.trainSuffixThroughput[3 * pixelIdx + 0] = 0.0f;
-        nrc.trainSuffixThroughput[3 * pixelIdx + 1] = 0.0f;
-        nrc.trainSuffixThroughput[3 * pixelIdx + 2] = 0.0f;
-        nrc.trainNextValid[pixelIdx] = 0u;
+
+        // T_{K+1} stored at slot for the target-build kernel.
+        nrc.trainThroughputAtK[3 * slot + 0] = tpK1.x;
+        nrc.trainThroughputAtK[3 * slot + 1] = tpK1.y;
+        nrc.trainThroughputAtK[3 * slot + 2] = tpK1.z;
+
+        // Multi-vertex suffix trace (NRC_SUFFIX_STEPS bounces).
+        // prd.radiance accumulates T_{K+j} * Le_{K+j} at each hit naturally via
+        // the hit shader's NEE contribution, so the delta after N steps equals
+        // sum_{j=1}^{N} T_{K+j} * Le_{K+j} — the N-step direct radiance accumulation.
+        const float3 radianceBefore  = prd.radiance;
+        bool         finalSuffixHit  = false;
+
+        for (int s = 0; s < NRC_SUFFIX_STEPS; ++s)
+        {
+          prd.wo       = -prd.wi;
+          prd.distance = RT_DEFAULT_MAX;
+          prd.flags    = 0;
+
+          optixTrace(theLaunchParameters.handle,
+                     prd.pos, prd.wi,
+                     theLaunchParameters.sceneEpsilon, prd.distance, 0.0f,
+                     OptixVisibilityMask(0xFF),
+                     OPTIX_RAY_FLAG_CULL_BACK_FACING_TRIANGLES,
+                     TYPE_RAY_RADIANCE, NUM_RAY_TYPES, TYPE_RAY_RADIANCE,
+                     payload.x, payload.y);
+
+          // Natural path termination within the suffix (miss or absorption).
+          if ((prd.typeEvent == BSDF_EVENT_ABSORB) || isNull(prd.throughput))
+            break;
+
+          finalSuffixHit = (prd.flags & FLAG_HIT) &&
+                           (prd.typeEvent & (BSDF_EVENT_DIFFUSE | BSDF_EVENT_GLOSSY));
+        }
+
+        // Accumulated direct radiance from all suffix bounces, slot-indexed.
+        const float3 suffixDelta = prd.radiance - radianceBefore;
+        nrc.trainSuffixScaled[3 * slot + 0] = suffixDelta.x;
+        nrc.trainSuffixScaled[3 * slot + 1] = suffixDelta.y;
+        nrc.trainSuffixScaled[3 * slot + 2] = suffixDelta.z;
+
+        // Bootstrap: features + throughput at the last suffix vertex for the
+        // EMA inference that completes the self-training target. Skipped for
+        // unbiased paths (pure MC injection) and when the suffix ended without
+        // landing on a cacheable (diffuse/glossy) surface.
+        if (finalSuffixHit && !isUnbiased)
+        {
+          nrcPackFeatures(nrc.trainNextFeatures, slot,
+                          prd.pos, prd.nrcN, prd.wo,
+                          prd.nrcRoughness, prd.nrcBaseColor, prd.nrcSpecColor,
+                          nrc.aabbMin, nrc.aabbMax);
+          const float3 tpFinal = prd.throughput;
+          nrc.trainSuffixThroughput[3 * slot + 0] = tpFinal.x;
+          nrc.trainSuffixThroughput[3 * slot + 1] = tpFinal.y;
+          nrc.trainSuffixThroughput[3 * slot + 2] = tpFinal.z;
+          nrc.trainNextValid[slot] = 1u;
+        }
+        else
+        {
+          nrc.trainSuffixThroughput[3 * slot + 0] = 0.0f;
+          nrc.trainSuffixThroughput[3 * slot + 1] = 0.0f;
+          nrc.trainSuffixThroughput[3 * slot + 2] = 0.0f;
+          nrc.trainNextValid[slot] = 0u;
+        }
       }
 
       prd.nrcTerminated = true;

@@ -56,6 +56,17 @@ float*        nrcTrainSuffThroughput(const NrcSystem* sys);
 float*        nrcTrainThroughputAtK (const NrcSystem* sys);
 unsigned int* nrcTrainNextValid     (const NrcSystem* sys);
 
+// ---- Compact training batch accessors ------------------------------------
+unsigned int* nrcTrainCount        (const NrcSystem* sys);
+unsigned int* nrcTrainPixelIndices (const NrcSystem* sys);
+float*        nrcTrainFeatures     (const NrcSystem* sys);
+
+// ---- Per-frame diagnostics -----------------------------------------------
+// Call after nrcDispatch() to read the loss and training sample count
+// from the most recently completed training step.
+float        nrcGetLastLoss       (const NrcSystem* sys);
+unsigned int nrcGetLastTrainCount (const NrcSystem* sys);
+
 // ============================================================================
 // Per-frame dispatch
 // ============================================================================

@@ -637,10 +637,19 @@ private:
 
   // Neural Radiance Cache (Mueller et al. 2021).
   // NrcSystem is defined in NrcHost.cu (CUDA) to avoid pulling tcnn device headers here.
-  NrcSystem*   m_nrcSystem     = nullptr;
-  bool         m_nrcEnabled    = false;
-  uint32_t     m_nrcBatchSize  = 0; // numPixels rounded to tcnn BATCH_SIZE_GRANULARITY (256).
-  int          m_nrcDebugMode  = 0; // 0=normal, 1=cache-only, 2=mask, 3=indirect
+  NrcSystem*   m_nrcSystem          = nullptr;
+  bool         m_nrcEnabled         = false;
+  uint32_t     m_nrcBatchSize       = 0;    // numPixels rounded to tcnn BATCH_SIZE_GRANULARITY (256).
+  int          m_nrcDebugMode       = 0;    // 0=normal, 1=cache-only, 2=mask, 3=indirect
+
+  // Per-frame loss and training count, updated after each nrcDispatch.
+  float        m_nrcLastLoss        = 0.0f;
+  int          m_nrcLastTrainCount  = 0;
+
+  // Circular buffer of recent per-frame losses for the GUI sparkline.
+  static constexpr int NRC_LOSS_HISTORY = 128;
+  float        m_nrcLossHistory[NRC_LOSS_HISTORY] = {};
+  int          m_nrcLossHistoryIdx  = 0;
 };
 
 #endif // APPLICATION_H
