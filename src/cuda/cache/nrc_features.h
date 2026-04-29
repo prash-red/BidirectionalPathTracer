@@ -26,8 +26,9 @@
 #include <stdint.h>
 #include <math_constants.h>
 
-#define NRC_INPUT_DIM  14
-#define NRC_OUTPUT_DIM  3
+#define NRC_INPUT_DIM   14
+#define NRC_OUTPUT_DIM   3
+#define BDRC_INPUT_DIM   3   // BDRC caches take position only (x,y,z normalized)
 
 __device__ __forceinline__ void nrcPackFeatures(
     float*       buf,
@@ -73,6 +74,24 @@ __device__ __forceinline__ void nrcPackFeatures(
     d[11] = specularColor.x;
     d[12] = specularColor.y;
     d[13] = specularColor.z;
+}
+
+__device__ __forceinline__ void bdrcPackFeatures(
+    float*       buf,
+    uint32_t     pixelIdx,
+    const float3 pos,
+    const float3 aabbMin,
+    const float3 aabbMax)
+{
+    float* d = buf + pixelIdx * BDRC_INPUT_DIM;
+
+    // [0,1,2] world-space position normalized to scene AABB
+    const float rx = aabbMax.x - aabbMin.x;
+    const float ry = aabbMax.y - aabbMin.y;
+    const float rz = aabbMax.z - aabbMin.z;
+    d[0] = fminf(fmaxf((pos.x - aabbMin.x) / (rx > 0.f ? rx : 1.f), 0.f), 1.f);
+    d[1] = fminf(fmaxf((pos.y - aabbMin.y) / (ry > 0.f ? ry : 1.f), 0.f), 1.f);
+    d[2] = fminf(fmaxf((pos.z - aabbMin.z) / (rz > 0.f ? rz : 1.f), 0.f), 1.f);
 }
 
 #endif // NRC_FEATURES_H

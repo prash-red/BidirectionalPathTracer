@@ -35,8 +35,7 @@
 #include "random.h"
 #include "shader_common.h"
 #include "vector_math.h"
-#include "nrc_features.h"
-
+#include "cache/nrc_features.h"
 
 extern "C" {
   __constant__ LaunchParameters theLaunchParameters;
@@ -112,6 +111,368 @@ __forceinline__ __device__ void sampleVolumeScattering(const float2 xi, const fl
 #endif // FIXME Not implementing volume scattering.
 
 
+//
+// Formula: p_e_sa   = |W|² / (4 * |U| * |V| * cos³(θ_camera))
+//
+__device__ __forceinline__ float bdrcPerspectivePeSa(
+    const float3 surfacePos,
+    const float3 surfaceN,
+    const float3 cameraP,
+    const float3 cameraU,
+    const float3 cameraV,
+    const float3 cameraW,
+    float        fallbackPeArea,
+    int          cameraType)
+{
+    if (cameraType != 1)
+        return fallbackPeArea;  // orthographic: use flat approximation
+
+    // Vector from surface to camera
+    const float3 r_to_cam = cameraP - surfacePos;
+    const float  distSq   = dot(r_to_cam, r_to_cam);
+    if (distSq < 1e-12f) return 0.f;
+    const float  dist      = sqrtf(distSq);
+    const float3 d_to_cam  = r_to_cam / dist;  // unit direction toward camera
+
+    // Surface must face the camera
+    const float cos_surface = dot(d_to_cam, surfaceN);
+    if (cos_surface <= 0.f) return 0.f;
+
+    // Camera forward (normalized) and cos(θ) at camera
+    const float  f_sq    = dot(cameraW, cameraW);
+    const float  f       = sqrtf(f_sq);
+    const float3 cam_fwd = cameraW / f;
+    const float  cos_cam = dot(-d_to_cam, cam_fwd);  // angle between surface dir and forward
+    if (cos_cam <= 1e-4f) return 0.f;   // behind or near-perpendicular
+
+    // NDC frustum check: recover (u, v) ∈ [-1, 1]² for the direction to surface
+    // From ray generation: ray_dir = normalize(U*u + V*v + W)
+    // Given d_to_surface = -d_to_cam, the NDC coords are:
+    //   u = (f / cos_cam) * dot(d_to_surface, U) / |U|²
+    //   v = (f / cos_cam) * dot(d_to_surface, V) / |V|²
+    const float3 d_to_surface = -d_to_cam;
+    const float  hx_sq        = dot(cameraU, cameraU);
+    const float  hy_sq        = dot(cameraV, cameraV);
+    const float  scale        = f / cos_cam;
+    const float  u_ndc        = scale * dot(d_to_surface, cameraU) / hx_sq;
+    const float  v_ndc        = scale * dot(d_to_surface, cameraV) / hy_sq;
+    if (fabsf(u_ndc) > 1.f || fabsf(v_ndc) > 1.f) return 0.f;  // outside frustum
+
+    // Solid-angle PDF for perspective camera:
+    //   p_e_sa = f² / (4 * |U| * |V| * cos³(θ_camera))
+    const float film_area = 4.f * sqrtf(hx_sq * hy_sq);
+    const float p_e_sa    = f_sq / (film_area * cos_cam * cos_cam * cos_cam);
+
+    return p_e_sa;
+}
+
+struct NrcSpreadState
+{
+  float3 x0;
+  float  a0;
+  float  spread;
+  float3 posPrev;
+  float  pdfPrev;
+};
+
+__forceinline__ __device__ void updateNrcSpreadState(const PerRayData& prd, const int depth, NrcSpreadState& state)
+{
+  if (depth == 0)
+  {
+    // Reference spread a0 = ||x0 - x1||^2 / (4pi |cos theta1|).
+    const float3 d01    = prd.pos - state.x0;
+    const float  distSq = dot(d01, d01);
+    const float  cosT1  = fmaxf(dot(prd.nrcN, prd.wo), 1e-6f);
+    state.a0 = distSq / (4.0f * M_PIf * cosT1);
+  }
+  else
+  {
+    const float3 d      = prd.pos - state.posPrev;
+    const float  distSq = dot(d, d);
+    const float  cosT   = fmaxf(fabsf(dot(prd.nrcN, prd.wo)), 1e-6f);
+    state.spread += sqrtf(distSq / (fmaxf(state.pdfPrev, 1e-6f) * cosT));
+  }
+
+  // Track previous hit for the next segment (including specular events).
+  state.posPrev = prd.pos;
+  state.pdfPrev = prd.pdf;
+}
+
+__forceinline__ __device__ bool handleBdrcCacheLogic(
+    PerRayData& prd,
+    const uint2 theLaunchIndex,
+    uint2 payload)
+{
+
+  const unsigned int pixelIdx = theLaunchParameters.resolution.x * theLaunchIndex.y + theLaunchIndex.x;
+  const NrcLaunchBuffers& nrc = theLaunchParameters.nrc;
+
+  const float3 tpK1 = prd.throughput;
+
+  // ---- Render data (ALL terminated pixels) — written unconditionally for display ----
+  nrc.renderThroughput[3 * pixelIdx + 0] = tpK1.x;
+  nrc.renderThroughput[3 * pixelIdx + 1] = tpK1.y;
+  nrc.renderThroughput[3 * pixelIdx + 2] = tpK1.z;
+
+  const float3 prefix = prd.radiance;
+  nrc.renderPrefix[3 * pixelIdx + 0] = prefix.x;
+  nrc.renderPrefix[3 * pixelIdx + 1] = prefix.y;
+  nrc.renderPrefix[3 * pixelIdx + 2] = prefix.z;
+
+  nrc.renderValid[pixelIdx] = 1u;
+  bdrcPackFeatures(nrc.renderFeatures, pixelIdx, prd.pos, nrc.aabbMin, nrc.aabbMax);
+
+  // ---- Fractional training suffix (NRC_TRAIN_FRACTION of terminated pixels) ----
+  // Mirrors the NRC design (Müller et al. 2021): only a small fraction of paths
+  // trace the additional bounces required to build a self-training target.  The
+  // compact slot index keeps the training batch dense so tcnn sees no zero-target
+  // samples.  The unbiased flag suppresses the bootstrap for 1/NRC_UNBIASED_RATE
+  // paths, breaking potential self-reinforcing feedback cycles.
+    // const bool isUnbiased = (rng(prd.seed) * NRC_UNBIASED_RATE < 1.0f);
+
+    const unsigned int slot = atomicAdd(nrc.trainCount, 1u);
+    if (slot >= static_cast<unsigned int>(theLaunchParameters.resolution.x *
+                                          theLaunchParameters.resolution.y))
+    {
+      prd.nrcTerminated = true;
+      return true;
+    }
+
+    nrc.trainPixelIndices[slot] = pixelIdx;
+
+    // Compact slot-indexed eye features (3-dim, reuses the NRC trainFeatures buffer
+    // which is allocated large enough to hold batchSize × 3 floats).
+    bdrcPackFeatures(nrc.trainFeatures, slot, prd.pos, nrc.aabbMin, nrc.aabbMax);
+
+    nrc.trainThroughputAtK[3 * slot + 0] = tpK1.x;
+    nrc.trainThroughputAtK[3 * slot + 1] = tpK1.y;
+    nrc.trainThroughputAtK[3 * slot + 2] = tpK1.z;
+
+    const float3 radianceBefore = prd.radiance;
+    bool finalSuffixHit = false;
+
+    for (int s = 0; s < NRC_SUFFIX_STEPS; ++s)
+    {
+      prd.wo       = -prd.wi;
+      prd.distance = RT_DEFAULT_MAX;
+      prd.flags    = 0;
+
+      optixTrace(theLaunchParameters.handle,
+                 prd.pos, prd.wi,
+                 theLaunchParameters.sceneEpsilon, prd.distance, 0.0f,
+                 OptixVisibilityMask(0xFF),
+                 OPTIX_RAY_FLAG_CULL_BACK_FACING_TRIANGLES,
+                 TYPE_RAY_RADIANCE, NUM_RAY_TYPES, TYPE_RAY_RADIANCE,
+                 payload.x, payload.y);
+
+      if ((prd.typeEvent == BSDF_EVENT_ABSORB) || isNull(prd.throughput))
+        break;
+
+      finalSuffixHit = (prd.flags & FLAG_HIT) &&
+                       (prd.typeEvent & BSDF_EVENT_DIFFUSE);
+    }
+
+    const float3 suffDelta = prd.radiance - radianceBefore;
+    nrc.trainSuffixScaled[3 * slot + 0] = suffDelta.x;
+    nrc.trainSuffixScaled[3 * slot + 1] = suffDelta.y;
+    nrc.trainSuffixScaled[3 * slot + 2] = suffDelta.z;
+
+    // if (finalSuffixHit && !isUnbiased)
+    // {
+    //   bdrcPackFeatures(nrc.trainNextFeatures, slot, prd.pos, nrc.aabbMin, nrc.aabbMax);
+    //   const float3 tpK2 = prd.throughput;
+    //   nrc.trainSuffixThroughput[3 * slot + 0] = tpK2.x;
+    //   nrc.trainSuffixThroughput[3 * slot + 1] = tpK2.y;
+    //   nrc.trainSuffixThroughput[3 * slot + 2] = tpK2.z;
+    //   nrc.trainNextValid[slot] = 1u;
+    // }
+    // else
+    // {
+    //   nrc.trainNextFeatures[3 * slot + 0] = 0.0f;
+    //   nrc.trainNextFeatures[3 * slot + 1] = 0.0f;
+    //   nrc.trainNextFeatures[3 * slot + 2] = 0.0f;
+    //   nrc.trainSuffixThroughput[3 * slot + 0] = 0.0f;
+    //   nrc.trainSuffixThroughput[3 * slot + 1] = 0.0f;
+    //   nrc.trainSuffixThroughput[3 * slot + 2] = 0.0f;
+    //   nrc.trainNextValid[slot] = 0u;
+    // }
+
+  bdrcPackFeatures(nrc.trainNextFeatures, slot, prd.pos, nrc.aabbMin, nrc.aabbMax);
+  const float3 tpK2 = prd.throughput;
+  nrc.trainSuffixThroughput[3 * slot + 0] = tpK2.x;
+  nrc.trainSuffixThroughput[3 * slot + 1] = tpK2.y;
+  nrc.trainSuffixThroughput[3 * slot + 2] = tpK2.z;
+  nrc.trainNextValid[slot] = 1u;
+  nrc.albedo[3 * slot + 0] = prd.nrcBaseColor.x;
+  nrc.albedo[3 * slot + 1] = prd.nrcBaseColor.y;
+  nrc.albedo[3 * slot + 2] = prd.nrcBaseColor.z;
+
+  prd.nrcTerminated = true;
+  return true;
+}
+
+__forceinline__ __device__ bool handleBdrcDebugFirstHit(
+    PerRayData& prd,
+    const uint2 theLaunchIndex,
+    const float3 lastSpecPos)
+{
+  const unsigned int pixelIdx = theLaunchParameters.resolution.x * theLaunchIndex.y + theLaunchIndex.x;
+  const NrcLaunchBuffers& nrc = theLaunchParameters.nrc;
+
+  // Eye cache query: pack the first-hit position as the query feature.
+  bdrcPackFeatures(nrc.renderFeatures, pixelIdx, prd.pos, nrc.aabbMin, nrc.aabbMax);
+  nrc.renderValid[pixelIdx] = 1u;
+
+  // S position: last specular before this hit, or cameraP if path started diffuse.
+  nrc.eyeVertexPos[3*pixelIdx+0] = lastSpecPos.x;
+  nrc.eyeVertexPos[3*pixelIdx+1] = lastSpecPos.y;
+  nrc.eyeVertexPos[3*pixelIdx+2] = lastSpecPos.z;
+
+  // Suppress light cache contribution in composite: debug shows eye cache only.
+  nrc.eyeVertexThroughput[3*pixelIdx+0] = 0.0f;
+  nrc.eyeVertexThroughput[3*pixelIdx+1] = 0.0f;
+  nrc.eyeVertexThroughput[3*pixelIdx+2] = 0.0f;
+
+  // No radiance accumulated before the first hit; throughput is identity.
+  nrc.renderPrefix[3*pixelIdx+0] = 0.0f;
+  nrc.renderPrefix[3*pixelIdx+1] = 0.0f;
+  nrc.renderPrefix[3*pixelIdx+2] = 0.0f;
+  nrc.renderThroughput[3*pixelIdx+0] = 1.0f;
+  nrc.renderThroughput[3*pixelIdx+1] = 1.0f;
+  nrc.renderThroughput[3*pixelIdx+2] = 1.0f;
+
+  // R = first-hit position (no specular probe at depth 0; use D directly as fallback).
+  bdrcPackFeatures(nrc.resampledEndpoints, pixelIdx, prd.pos, nrc.aabbMin, nrc.aabbMax);
+  nrc.resampledValid[pixelIdx] = 1u;
+  nrc.resampled_p_e_area[pixelIdx] = 0.0f;  // debug path — no eye-area PDF available
+
+  prd.nrcTerminated = true;
+  return true;
+}
+
+__forceinline__ __device__ bool handleNrcDebugCacheOnly(
+    PerRayData& prd,
+    const uint2 theLaunchIndex)
+{
+  // Preconditions are checked by the caller (integrator).
+  const unsigned int pixelIdx = theLaunchParameters.resolution.x * theLaunchIndex.y + theLaunchIndex.x;
+  const NrcLaunchBuffers& nrc = theLaunchParameters.nrc;
+  nrcPackFeatures(nrc.renderFeatures, pixelIdx,
+                  prd.pos, prd.nrcN, prd.wo,
+                  prd.nrcRoughness, prd.nrcBaseColor, prd.nrcSpecColor,
+                  nrc.aabbMin, nrc.aabbMax);
+  nrc.renderValid[pixelIdx] = 1u;
+  prd.nrcTerminated = true;
+  return true;
+}
+
+__forceinline__ __device__ bool handleNrcCacheLogic(
+    PerRayData& prd,
+    const uint2 theLaunchIndex,
+    uint2 payload)
+{
+
+  const unsigned int pixelIdx = theLaunchParameters.resolution.x * theLaunchIndex.y + theLaunchIndex.x;
+  const NrcLaunchBuffers& nrc = theLaunchParameters.nrc;
+
+  // ---- Render data (all NRC-terminated pixels) ----
+  const float3 tpK1 = prd.throughput;
+  nrc.renderThroughput[3 * pixelIdx + 0] = tpK1.x;
+  nrc.renderThroughput[3 * pixelIdx + 1] = tpK1.y;
+  nrc.renderThroughput[3 * pixelIdx + 2] = tpK1.z;
+
+  const float3 prefix = prd.radiance;
+  nrc.renderPrefix[3 * pixelIdx + 0] = prefix.x;
+  nrc.renderPrefix[3 * pixelIdx + 1] = prefix.y;
+  nrc.renderPrefix[3 * pixelIdx + 2] = prefix.z;
+
+  nrc.renderValid[pixelIdx] = 1u;
+
+  nrcPackFeatures(nrc.renderFeatures, pixelIdx,
+                  prd.pos, prd.nrcN, prd.wo,
+                  prd.nrcRoughness, prd.nrcBaseColor, prd.nrcSpecColor,
+                  nrc.aabbMin, nrc.aabbMax);
+
+  // ---- Training suffix (~3% of NRC-terminated pixels) ----
+  if (rng(prd.seed) < NRC_TRAIN_FRACTION)
+  {
+    const bool isUnbiased = (rng(prd.seed) * NRC_UNBIASED_RATE < 1.0f);
+
+    const unsigned int slot = atomicAdd(nrc.trainCount, 1u);
+    if (slot >= static_cast<unsigned int>(theLaunchParameters.resolution.x *
+                                          theLaunchParameters.resolution.y))
+    {
+      prd.nrcTerminated = true;
+      return true;
+    }
+
+    nrc.trainPixelIndices[slot] = pixelIdx;
+
+    nrcPackFeatures(nrc.trainFeatures, slot,
+                    prd.pos, prd.nrcN, prd.wo,
+                    prd.nrcRoughness, prd.nrcBaseColor, prd.nrcSpecColor,
+                    nrc.aabbMin, nrc.aabbMax);
+
+    nrc.trainThroughputAtK[3 * slot + 0] = tpK1.x;
+    nrc.trainThroughputAtK[3 * slot + 1] = tpK1.y;
+    nrc.trainThroughputAtK[3 * slot + 2] = tpK1.z;
+
+    const float3 radianceBefore = prd.radiance;
+    bool finalSuffixHit = false;
+
+    for (int s = 0; s < NRC_SUFFIX_STEPS; ++s)
+    {
+      prd.wo       = -prd.wi;
+      prd.distance = RT_DEFAULT_MAX;
+      prd.flags    = 0;
+
+      optixTrace(theLaunchParameters.handle,
+                 prd.pos, prd.wi,
+                 theLaunchParameters.sceneEpsilon, prd.distance, 0.0f,
+                 OptixVisibilityMask(0xFF),
+                 OPTIX_RAY_FLAG_CULL_BACK_FACING_TRIANGLES,
+                 TYPE_RAY_RADIANCE, NUM_RAY_TYPES, TYPE_RAY_RADIANCE,
+                 payload.x, payload.y);
+
+      if ((prd.typeEvent == BSDF_EVENT_ABSORB) || isNull(prd.throughput))
+      {
+        break;
+      }
+
+      finalSuffixHit = (prd.flags & FLAG_HIT) &&
+                       (prd.typeEvent & (BSDF_EVENT_DIFFUSE | BSDF_EVENT_GLOSSY));
+    }
+
+    const float3 suffixDelta = prd.radiance - radianceBefore;
+    nrc.trainSuffixScaled[3 * slot + 0] = suffixDelta.x;
+    nrc.trainSuffixScaled[3 * slot + 1] = suffixDelta.y;
+    nrc.trainSuffixScaled[3 * slot + 2] = suffixDelta.z;
+
+    if (finalSuffixHit && !isUnbiased)
+    {
+      nrcPackFeatures(nrc.trainNextFeatures, slot,
+                      prd.pos, prd.nrcN, prd.wo,
+                      prd.nrcRoughness, prd.nrcBaseColor, prd.nrcSpecColor,
+                      nrc.aabbMin, nrc.aabbMax);
+      const float3 tpFinal = prd.throughput;
+      nrc.trainSuffixThroughput[3 * slot + 0] = tpFinal.x;
+      nrc.trainSuffixThroughput[3 * slot + 1] = tpFinal.y;
+      nrc.trainSuffixThroughput[3 * slot + 2] = tpFinal.z;
+      nrc.trainNextValid[slot] = 1u;
+    }
+    else
+    {
+      nrc.trainSuffixThroughput[3 * slot + 0] = 0.0f;
+      nrc.trainSuffixThroughput[3 * slot + 1] = 0.0f;
+      nrc.trainSuffixThroughput[3 * slot + 2] = 0.0f;
+      nrc.trainNextValid[slot] = 0u;
+    }
+  }
+
+  prd.nrcTerminated = true;
+  return true;
+}
+
 // Called by raygen.
 // @return radiance
 __forceinline__ __device__ float3 integrator(PerRayData& prd, const uint2 theLaunchIndex)
@@ -128,13 +489,9 @@ __forceinline__ __device__ float3 integrator(PerRayData& prd, const uint2 theLau
 
   // NRC area-spread tracking (Mueller et al. 2021, Section 3.4).
   // All local to the integrator; no need to store in PRD.
-  const float3 nrcX0    = prd.pos;  // x0: camera origin for a0 computation
-  float        nrcA0    = 0.0f;     // Reference spread: dist(x0,x1)^2 / (4π |cos θ1|)
-  float        nrcSpread = 0.0f;    // Cumulative sqrt-sum; area spread a(x1..xn) = nrcSpread^2
-  float3       nrcPosPrev = prd.pos; // Previous vertex position
-  float        nrcPdfPrev = 0.0f;    // BSDF pdf for direction toward current vertex (from prev hit)
-  
-  // Nested material handling. 
+  NrcSpreadState nrcSpreadState = {prd.pos, 0.0f, 0.0f, prd.pos, 0.0f};
+
+  // Nested material handling.
   prd.idxStack   = 0;
   // Small stack of four entries of which the first is vacuum.
   prd.stack[0].absorption_ior  = make_float4(0.0f, 0.0f, 0.0f, 1.0f); // No volume absorption, no effective IOR.
@@ -144,7 +501,13 @@ __forceinline__ __device__ float3 integrator(PerRayData& prd, const uint2 theLau
   uint2 payload = splitPointer(&prd);
 
   // Russian Roulette path termination after a specified number of bounces needs the current depth.
-  int depth = 0; // Path segment index. Primary ray is depth == 0. 
+  int depth = 0; // Path segment index. Primary ray is depth == 0.
+
+  // BDRC: track the last specular vertex S before the first diffuse hit.
+  // Defaults: S = camera (used when path starts diffuse — matches Python fallback).
+  float3 lastSpecPos    = theLaunchParameters.cameraP;
+  float3 lastSpecNormal = prd.wi;  // primary ray dir used as hemisphere axis for fallback
+  bool   hasSpecular    = false;
 
   while (depth < theLaunchParameters.pathLengths.y)
   {
@@ -195,185 +558,168 @@ __forceinline__ __device__ float3 integrator(PerRayData& prd, const uint2 theLau
     optixTrace(theLaunchParameters.handle,
                prd.pos, prd.wi, // origin, direction
                epsilon, prd.distance, 0.0f, // tmin, tmax, time
-               OptixVisibilityMask(0xFF), 
+               OptixVisibilityMask(0xFF),
                // GLTF default is backface culling enabled, but the GAS OptixGeometryFlags disable
                // culling depending on the material doubleSided condition.
-               OPTIX_RAY_FLAG_CULL_BACK_FACING_TRIANGLES, 
+               OPTIX_RAY_FLAG_CULL_BACK_FACING_TRIANGLES,
                TYPE_RAY_RADIANCE, NUM_RAY_TYPES, TYPE_RAY_RADIANCE,
                payload.x, payload.y);
 
     // NRC area-spread path termination (Mueller et al. 2021, Section 3.4).
     // Update the area spread for this segment, then check whether to cache-terminate the path.
-    if (theLaunchParameters.nrc.enabled && (prd.flags & FLAG_HIT))
+    if (theLaunchParameters.nrc.enabled && theLaunchParameters.nrc.nrcType == NRC && (prd.flags & FLAG_HIT))
     {
-      if (depth == 0)
-      {
-        // Reference spread a0 = ||x0 - x1||^2 / (4π |cos θ1|).
-        // x0 = nrcX0 (camera origin), x1 = prd.pos (first hit), cos θ1 = dot(nrcN, wo).
-        const float3 d01    = prd.pos - nrcX0;
-        const float  distSq = dot(d01, d01);
-        const float  cosT1  = fmaxf(dot(prd.nrcN, prd.wo), 1e-6f);
-        nrcA0 = distSq / (4.0f * M_PIf * cosT1);
-      }
-      else // depth >= 1: accumulate one spread term for segment x_{depth-1} → x_depth
-      {
-        const float3 d      = prd.pos - nrcPosPrev;
-        const float  distSq = dot(d, d);
-        const float  cosT   = fmaxf(fabsf(dot(prd.nrcN, prd.wo)), 1e-6f);
-        nrcSpread += sqrtf(distSq / (fmaxf(nrcPdfPrev, 1e-6f) * cosT));
-      }
-      // Update previous-vertex tracking for the next segment (all hit types, including specular).
-      nrcPosPrev = prd.pos;
-      nrcPdfPrev = prd.pdf;
+      updateNrcSpreadState(prd, depth, nrcSpreadState);
     }
 
-    // NRC_DEBUG_CACHE_ONLY: query the NRC at the first hit point from the camera.
-    // The first-hit position is deterministic (same surface point every frame for a static scene),
-    // so the NRC output is stable across frames — no Monte Carlo query-point variance.
-    if (theLaunchParameters.nrc.nrcDebugMode == 1 && depth == 0 && (prd.flags & FLAG_HIT))
-    {
-      const unsigned int pixelIdx = theLaunchParameters.resolution.x * theLaunchIndex.y + theLaunchIndex.x;
-      const NrcLaunchBuffers& nrc = theLaunchParameters.nrc;
-      nrcPackFeatures(nrc.renderFeatures, pixelIdx,
-                      prd.pos, prd.nrcN, prd.wo,
-                      prd.nrcRoughness, prd.nrcBaseColor, prd.nrcSpecColor,
-                      nrc.aabbMin, nrc.aabbMax);
-      nrc.renderValid[pixelIdx] = 1u;
-      prd.nrcTerminated = true;
-      break;
-    }
-
-    // Terminate and query the cache if the area spread threshold is met (or the fallback max depth
-    // is reached) at a diffuse/glossy vertex.
-    if (theLaunchParameters.nrc.enabled &&
-        depth >= 1 &&
-        nrcA0 > 0.0f &&
-        (nrcSpread * nrcSpread > theLaunchParameters.nrc.spreadC * nrcA0 ||
-         depth >= theLaunchParameters.nrc.terminationDepth) &&
+    // BDRC: record the last specular vertex before the first diffuse hit.
+    if (theLaunchParameters.nrc.enabled && theLaunchParameters.nrc.nrcType == BDRC &&
         (prd.flags & FLAG_HIT) &&
-        (prd.typeEvent & (BSDF_EVENT_DIFFUSE | BSDF_EVENT_GLOSSY)))
+        (prd.typeEvent & (BSDF_EVENT_SPECULAR | BSDF_EVENT_GLOSSY)))
     {
-      const unsigned int pixelIdx = theLaunchParameters.resolution.x * theLaunchIndex.y + theLaunchIndex.x;
+      lastSpecPos    = prd.pos;
+      lastSpecNormal = prd.nrcN;
+      hasSpecular    = true;
+    }
+
+    // BDRC debug first-hit: query caches at depth=0, analogous to NRC handleNrcDebugCacheOnly.
+    if (theLaunchParameters.nrc.nrcDebugMode != 0 && theLaunchParameters.nrc.nrcType == BDRC &&
+        depth == 0 && (prd.flags & FLAG_HIT))
+    {
+      if (handleBdrcDebugFirstHit(prd, theLaunchIndex, lastSpecPos))
+        break;
+    }
+
+    // BDRC: terminate at first diffuse/glossy vertex (specular-skip)
+    if (theLaunchParameters.nrc.enabled && theLaunchParameters.nrc.nrcType == BDRC &&
+        depth >= 1 && (prd.flags & FLAG_HIT) && (prd.typeEvent & (BSDF_EVENT_DIFFUSE)))
+    {
+      const unsigned int px = theLaunchParameters.resolution.x * theLaunchIndex.y + theLaunchIndex.x;
       const NrcLaunchBuffers& nrc = theLaunchParameters.nrc;
 
-      // ---- Render data (all NRC-terminated pixels) ----
+      // S position (last specular before D, or camera default).
+      nrc.eyeVertexPos[3*px+0] = lastSpecPos.x;
+      nrc.eyeVertexPos[3*px+1] = lastSpecPos.y;
+      nrc.eyeVertexPos[3*px+2] = lastSpecPos.z;
 
-      // T_{K+1}: throughput after BSDF scatter at the termination vertex K.
-      const float3 tpK1 = prd.throughput;
-      nrc.renderThroughput[3 * pixelIdx + 0] = tpK1.x;
-      nrc.renderThroughput[3 * pixelIdx + 1] = tpK1.y;
-      nrc.renderThroughput[3 * pixelIdx + 2] = tpK1.z;
+      // Pre-BSDF throughput at D: T(camera→D) not including BSDF at D.
+      nrc.eyeVertexThroughput[3*px+0] = prd.throughputPreBsdf.x;
+      nrc.eyeVertexThroughput[3*px+1] = prd.throughputPreBsdf.y;
+      nrc.eyeVertexThroughput[3*px+2] = prd.throughputPreBsdf.z;
 
-      // Accumulated direct radiance up to and including vertex K.
-      const float3 prefix = prd.radiance;
-      nrc.renderPrefix[3 * pixelIdx + 0] = prefix.x;
-      nrc.renderPrefix[3 * pixelIdx + 1] = prefix.y;
-      nrc.renderPrefix[3 * pixelIdx + 2] = prefix.z;
-
-      nrc.renderValid[pixelIdx] = 1u;
-
-      // Pixel-indexed render features (used by the full-batch inference pass).
-      nrcPackFeatures(nrc.renderFeatures, pixelIdx,
-                      prd.pos, prd.nrcN, prd.wo,
-                      prd.nrcRoughness, prd.nrcBaseColor, prd.nrcSpecColor,
-                      nrc.aabbMin, nrc.aabbMax);
-
-      // ---- Training suffix (~3% of NRC-terminated pixels) ----
-      // Each training pixel atomically claims a slot in the compact training buffer,
-      // then traces NRC_SUFFIX_STEPS extra bounces to build a self-training target.
-
-      if (rng(prd.seed) < NRC_TRAIN_FRACTION)
+      // Resampled position R for mask label-0 and light cache zero supervision.
+      if (hasSpecular)
       {
-        // 1/NRC_UNBIASED_RATE training paths skip the cache bootstrap entirely,
-        // injecting a pure MC estimate to prevent self-training drift.
-        const bool isUnbiased = (rng(prd.seed) * NRC_UNBIASED_RATE < 1.0f);
+        // Cosine-hemisphere sample from S using lastSpecNormal as the axis.
+        float3 w;
+        float  hemiPdf;
+        unitSquareToCosineHemisphere(rng2(prd.seed), lastSpecNormal, w, hemiPdf);
 
-        // Claim a compact slot via atomic increment. The slot count is bounded by
-        // batchSize (NRC_TRAIN_FRACTION << 1 so overflow is astronomically rare,
-        // but we guard explicitly to prevent out-of-bounds writes).
-        const unsigned int slot = atomicAdd(nrc.trainCount, 1u);
-        if (slot >= static_cast<unsigned int>(theLaunchParameters.resolution.x *
-                                              theLaunchParameters.resolution.y))
+        // Probe ray from S to find R.
+        PerRayData probePrd;
+        probePrd.pos        = lastSpecPos;
+        probePrd.wo         = -w;
+        probePrd.distance   = RT_DEFAULT_MAX;
+        probePrd.flags      = 0;
+        probePrd.seed       = prd.seed;
+        probePrd.idxStack   = 0;
+        probePrd.stack[0].absorption_ior = make_float4(0.0f, 0.0f, 0.0f, 1.0f);
+        probePrd.throughput = make_float3(1.0f);
+        probePrd.typeEvent  = BSDF_EVENT_ABSORB;
+
+        uint2 probePay = splitPointer(&probePrd);
+        optixTrace(theLaunchParameters.handle,
+                   lastSpecPos, w,
+                   theLaunchParameters.sceneEpsilon, RT_DEFAULT_MAX, 0.0f,
+                   OptixVisibilityMask(0xFF),
+                   OPTIX_RAY_FLAG_CULL_BACK_FACING_TRIANGLES,
+                   TYPE_RAY_RADIANCE, NUM_RAY_TYPES, TYPE_RAY_RADIANCE,
+                   probePay.x, probePay.y);
+
+        prd.seed = probePrd.seed;
+
+        if (probePrd.flags & FLAG_HIT)
         {
-          prd.nrcTerminated = true;
-          break;
-        }
-
-        nrc.trainPixelIndices[slot] = pixelIdx;
-
-        // Slot-indexed compact train features at vertex K.
-        nrcPackFeatures(nrc.trainFeatures, slot,
-                        prd.pos, prd.nrcN, prd.wo,
-                        prd.nrcRoughness, prd.nrcBaseColor, prd.nrcSpecColor,
-                        nrc.aabbMin, nrc.aabbMax);
-
-        // T_{K+1} stored at slot for the target-build kernel.
-        nrc.trainThroughputAtK[3 * slot + 0] = tpK1.x;
-        nrc.trainThroughputAtK[3 * slot + 1] = tpK1.y;
-        nrc.trainThroughputAtK[3 * slot + 2] = tpK1.z;
-
-        // Multi-vertex suffix trace (NRC_SUFFIX_STEPS bounces).
-        // prd.radiance accumulates T_{K+j} * Le_{K+j} at each hit naturally via
-        // the hit shader's NEE contribution, so the delta after N steps equals
-        // sum_{j=1}^{N} T_{K+j} * Le_{K+j} — the N-step direct radiance accumulation.
-        const float3 radianceBefore  = prd.radiance;
-        bool         finalSuffixHit  = false;
-
-        for (int s = 0; s < NRC_SUFFIX_STEPS; ++s)
-        {
-          prd.wo       = -prd.wi;
-          prd.distance = RT_DEFAULT_MAX;
-          prd.flags    = 0;
-
-          optixTrace(theLaunchParameters.handle,
-                     prd.pos, prd.wi,
-                     theLaunchParameters.sceneEpsilon, prd.distance, 0.0f,
-                     OptixVisibilityMask(0xFF),
-                     OPTIX_RAY_FLAG_CULL_BACK_FACING_TRIANGLES,
-                     TYPE_RAY_RADIANCE, NUM_RAY_TYPES, TYPE_RAY_RADIANCE,
-                     payload.x, payload.y);
-
-          // Natural path termination within the suffix (miss or absorption).
-          if ((prd.typeEvent == BSDF_EVENT_ABSORB) || isNull(prd.throughput))
-            break;
-
-          finalSuffixHit = (prd.flags & FLAG_HIT) &&
-                           (prd.typeEvent & (BSDF_EVENT_DIFFUSE | BSDF_EVENT_GLOSSY));
-        }
-
-        // Accumulated direct radiance from all suffix bounces, slot-indexed.
-        const float3 suffixDelta = prd.radiance - radianceBefore;
-        nrc.trainSuffixScaled[3 * slot + 0] = suffixDelta.x;
-        nrc.trainSuffixScaled[3 * slot + 1] = suffixDelta.y;
-        nrc.trainSuffixScaled[3 * slot + 2] = suffixDelta.z;
-
-        // Bootstrap: features + throughput at the last suffix vertex for the
-        // EMA inference that completes the self-training target. Skipped for
-        // unbiased paths (pure MC injection) and when the suffix ended without
-        // landing on a cacheable (diffuse/glossy) surface.
-        if (finalSuffixHit && !isUnbiased)
-        {
-          nrcPackFeatures(nrc.trainNextFeatures, slot,
-                          prd.pos, prd.nrcN, prd.wo,
-                          prd.nrcRoughness, prd.nrcBaseColor, prd.nrcSpecColor,
-                          nrc.aabbMin, nrc.aabbMax);
-          const float3 tpFinal = prd.throughput;
-          nrc.trainSuffixThroughput[3 * slot + 0] = tpFinal.x;
-          nrc.trainSuffixThroughput[3 * slot + 1] = tpFinal.y;
-          nrc.trainSuffixThroughput[3 * slot + 2] = tpFinal.z;
-          nrc.trainNextValid[slot] = 1u;
+          bdrcPackFeatures(nrc.resampledEndpoints, px, probePrd.pos, nrc.aabbMin, nrc.aabbMax);
+          nrc.resampledValid[px] = 1u;
+          nrc.resampled_p_sa[px] = hemiPdf;
+          {
+            // p_e_area(R) = hemiPdf * cos_R / dist_SR²  (solid-angle → area at R)
+            const float3 vecSR     = probePrd.pos - lastSpecPos;
+            const float  distSR_sq = dot(vecSR, vecSR);
+            const float  cos_R     = (distSR_sq > 1e-12f)
+                ? fmaxf(dot(probePrd.nrcN, -vecSR * rsqrtf(distSR_sq)), 0.0f)
+                : 0.0f;
+            nrc.resampled_p_e_area[px] = (distSR_sq > 1e-12f)
+                ? hemiPdf * cos_R / distSR_sq
+                : 0.0f;
+          }
+          nrc.eyeVertexNormals[3*px+0] = lastSpecNormal.x;
+          nrc.eyeVertexNormals[3*px+1] = lastSpecNormal.y;
+          nrc.eyeVertexNormals[3*px+2] = lastSpecNormal.z;
         }
         else
         {
-          nrc.trainSuffixThroughput[3 * slot + 0] = 0.0f;
-          nrc.trainSuffixThroughput[3 * slot + 1] = 0.0f;
-          nrc.trainSuffixThroughput[3 * slot + 2] = 0.0f;
-          nrc.trainNextValid[slot] = 0u;
+          nrc.resampledValid[px] = 0u;
         }
       }
+      else
+      {
+        // No specular before D: Python exact fallback — R = D position directly.
+        bdrcPackFeatures(nrc.resampledEndpoints, px, prd.pos, nrc.aabbMin, nrc.aabbMax);
+        nrc.resampledValid[px] = 1u;
+        {
+          const float p_sa = bdrcPerspectivePeSa(
+            prd.pos,
+            prd.nrcN,
+            theLaunchParameters.cameraP,
+            theLaunchParameters.cameraU,
+            theLaunchParameters.cameraV,
+            theLaunchParameters.cameraW,
+            1e-4f,
+            theLaunchParameters.cameraType);
+          nrc.resampled_p_sa[px] = p_sa;
+          // p_e_area(R=D) = p_e_sa * cos_D / dist_camD²  (solid-angle → area at D)
+          const float3 vecDcam    = theLaunchParameters.cameraP - prd.pos;
+          const float  distDcam_sq = dot(vecDcam, vecDcam);
+          const float  cos_D      = (distDcam_sq > 1e-12f)
+              ? fmaxf(dot(prd.nrcN, vecDcam * rsqrtf(distDcam_sq)), 0.0f)
+              : 0.0f;
+          nrc.resampled_p_e_area[px] = (distDcam_sq > 1e-12f)
+              ? p_sa * cos_D / distDcam_sq
+              : 0.0f;
+        }
+        nrc.eyeVertexNormals[3*px+0] = lastSpecNormal.x;
+        nrc.eyeVertexNormals[3*px+1] = lastSpecNormal.y;
+        nrc.eyeVertexNormals[3*px+2] = lastSpecNormal.z;
+      }
 
-      prd.nrcTerminated = true;
-      break; // NRC handles the rest; skip further path tracing.
+      if (handleBdrcCacheLogic(prd, theLaunchIndex, payload))
+      {
+        break;
+      }
+    }
+
+    // NRC debug-only mode: query at first hit
+    if (theLaunchParameters.nrc.nrcDebugMode == 1 && theLaunchParameters.nrc.nrcType == NRC && depth == 0 && (prd.flags & FLAG_HIT))
+    {
+      if (handleNrcDebugCacheOnly(prd, theLaunchIndex))
+      {
+        break;
+      }
+    }
+
+    // NRC termination: area-spread or fallback depth reached at diffuse/glossy vertex
+    if (theLaunchParameters.nrc.enabled && theLaunchParameters.nrc.nrcType == NRC &&
+        depth >= 1 && nrcSpreadState.a0 > 0.0f &&
+        ((nrcSpreadState.spread * nrcSpreadState.spread > theLaunchParameters.nrc.spreadC * nrcSpreadState.a0) ||
+         depth >= theLaunchParameters.nrc.terminationDepth) &&
+        (prd.flags & FLAG_HIT) && (prd.typeEvent & (BSDF_EVENT_DIFFUSE | BSDF_EVENT_GLOSSY)))
+    {
+      if (handleNrcCacheLogic(prd, theLaunchIndex, payload))
+      {
+        break; // NRC handles the rest; skip further path tracing.
+      }
     }
 
     // Path termination by miss shader or sample() routines.
@@ -668,12 +1014,190 @@ __forceinline__ __device__ void lightPathIntegrator(PerRayData& prd, const uint2
 }
 
 
+// BDRC light path integrator.
+// Traces a path starting from a light source to its first diffuse/glossy vertex (specular-skip).
+// Writes features + throughput (c_l estimate) to nrc.lightFeatures/lightTargets/lightValid.
+// Does NOT connect to camera (no bidirectional vertex connection).
+__forceinline__ __device__ void bdrcLightIntegrator(PerRayData& prd, const uint2 theLaunchIndex)
+{
+  prd.radiance  = make_float3(0.0f);
+  prd.pdf       = 0.0f;
+  prd.occlusion = 1.0f;
+  prd.sigma_t   = make_float3(0.0f);
+  prd.typeEvent = BSDF_EVENT_ABSORB;
+  prd.flags     = 0; // No FLAG_LIGHT_PATH: disables camera connections in hit.cu
+
+  // Initialize IOR material stack to vacuum — required for correct glass refraction.
+  prd.idxStack = 0;
+  prd.stack[0].absorption_ior = make_float4(0.0f, 0.0f, 0.0f, 1.0f);
+
+  const NrcLaunchBuffers& nrc = theLaunchParameters.nrc;
+  const unsigned int pixelIdx = theLaunchParameters.resolution.x * theLaunchIndex.y
+                                + theLaunchIndex.x;
+
+  // Requires a valid eye vertex written by the eye-path integrator this frame.
+  if (!nrc.renderValid[pixelIdx])
+  {
+    nrc.lightEndpoints[3*pixelIdx+0] = 0.0f;
+    nrc.lightEndpoints[3*pixelIdx+1] = 0.0f;
+    nrc.lightEndpoints[3*pixelIdx+2] = 0.0f;
+    nrc.lightTargets[3*pixelIdx+0]  = 0.0f;
+    nrc.lightTargets[3*pixelIdx+1]  = 0.0f;
+    nrc.lightTargets[3*pixelIdx+2]  = 0.0f;
+    nrc.lightValid[pixelIdx] = 0u;
+    return;
+  }
+
+  float3 origin;
+  float3 direction;
+
+  if (!sampleEmitterRay(prd, origin, direction))
+  {
+    nrc.lightEndpoints[3*pixelIdx+0] = 0.0f;
+    nrc.lightEndpoints[3*pixelIdx+1] = 0.0f;
+    nrc.lightEndpoints[3*pixelIdx+2] = 0.0f;
+    nrc.lightTargets[3*pixelIdx+0]  = 0.0f;
+    nrc.lightTargets[3*pixelIdx+1]  = 0.0f;
+    nrc.lightTargets[3*pixelIdx+2]  = 0.0f;
+    nrc.lightValid[pixelIdx] = 0u;
+    return;
+  }
+
+  prd.pos = origin;
+  prd.wi  = direction;
+
+  uint2 payload = splitPointer(&prd);
+
+  int  depth        = 0;
+  bool foundCaustic = false;
+  bool hasSpecular  = false; // require at least one specular bounce before accepting diffuse
+
+  while (depth < theLaunchParameters.pathLengths.y)
+  {
+    const float epsilon = (prd.flags & FLAG_HIT) ? theLaunchParameters.sceneEpsilon : 0.0f;
+
+    prd.wo       = -prd.wi;
+    prd.distance = RT_DEFAULT_MAX;
+    prd.flags    = 0;
+
+    optixTrace(theLaunchParameters.handle,
+               prd.pos, prd.wi,
+               epsilon, prd.distance, 0.0f,
+               OptixVisibilityMask(0xFF),
+               OPTIX_RAY_FLAG_CULL_BACK_FACING_TRIANGLES,
+               TYPE_RAY_RADIANCE, NUM_RAY_TYPES, TYPE_RAY_RADIANCE,
+               payload.x, payload.y);
+
+    if ((prd.typeEvent == BSDF_EVENT_ABSORB) || isNull(prd.throughput))
+      break;
+
+    if (!(prd.flags & FLAG_HIT))
+      break;
+
+    if (prd.typeEvent & BSDF_EVENT_DIFFUSE)
+    {
+      if (hasSpecular)
+      {
+        // Read S (last specular vertex on the eye path, or camera default).
+        const float3 S = make_float3(
+            nrc.eyeVertexPos[3*pixelIdx+0],
+            nrc.eyeVertexPos[3*pixelIdx+1],
+            nrc.eyeVertexPos[3*pixelIdx+2]);
+
+        const float3 vecYS  = S - prd.pos;
+        const float  distYS = length(vecYS);
+
+        if (distYS > theLaunchParameters.sceneEpsilon)
+        {
+          const float3 dir_Y_to_S = vecYS / distYS;
+
+          // Shadow ray: Y → S (full OptiX visibility test).
+          unsigned int isVisible  = 0;
+          unsigned int shadowSeed = prd.seed;
+          optixTrace(theLaunchParameters.handle,
+                     prd.pos, dir_Y_to_S,
+                     theLaunchParameters.sceneEpsilon,
+                     distYS - theLaunchParameters.sceneEpsilon,
+                     0.0f,
+                     OptixVisibilityMask(0xFF),
+                     OPTIX_RAY_FLAG_DISABLE_CLOSESTHIT | OPTIX_RAY_FLAG_TERMINATE_ON_FIRST_HIT,
+                     TYPE_RAY_SHADOW, NUM_RAY_TYPES, TYPE_RAY_SHADOW,
+                     isVisible, shadowSeed);
+          prd.seed = shadowSeed;
+
+          if (isVisible)  // shadow miss == Y can see S
+          {
+            // target = tp_Y_pre × f_Y_toward_S
+            // tp_Y_pre: light path throughput at Y BEFORE bsdf_over_pdf (view-independent)
+            // f_Y_toward_S: Lambertian BSDF at Y toward S = albedo × (cosθ / π)
+            const float3 tp_Y_pre     = prd.throughputPreBsdf;
+            const float  cos_Y        = fmaxf(dot(prd.nrcN, dir_Y_to_S), 0.0f);
+            const float3 f_Y_toward_S = prd.nrcBaseColor * (cos_Y * M_1_PIf);
+            const float3 target       = tp_Y_pre * f_Y_toward_S;
+
+            nrc.lightTargets[3*pixelIdx+0] = target.x;
+            nrc.lightTargets[3*pixelIdx+1] = target.y;
+            nrc.lightTargets[3*pixelIdx+2] = target.z;
+
+            // Write Y (caustic floor) position — NOT eye vertex D.
+            bdrcPackFeatures(nrc.lightEndpoints, pixelIdx, prd.pos, nrc.aabbMin, nrc.aabbMax);
+
+            const float3 eyeVertexNormal = make_float3(
+              nrc.eyeVertexNormals[3*pixelIdx+0],
+              nrc.eyeVertexNormals[3*pixelIdx+1],
+              nrc.eyeVertexNormals[3*pixelIdx+2]);
+
+            // p_e_sa = cos(angle between S-direction and hemisphere axis) / pi
+            const float p_e_sa = fmaxf(dot(dir_Y_to_S, eyeVertexNormal), 0.0f) * M_1_PIf;
+            nrc.light_p_sa[pixelIdx] = p_e_sa;
+            // p_e_area(Y) = p_e_sa * cos_Y / dist_YS²  (solid-angle → area conversion at Y)
+            nrc.light_p_e_area[pixelIdx] = p_e_sa * cos_Y / fmaxf(distYS * distYS, 1e-8f);
+
+            nrc.lightValid[pixelIdx] = 1u;
+            atomicAdd(nrc.lightCount, 1u); // Count for mask training gate in bdrcDispatch
+            foundCaustic = true;
+          }
+        }
+      }
+      // Diffuse without prior specular = non-caustic path; stop tracing.
+      break;
+    }
+
+    // Specular/transmissive bounce: mark and continue.
+    hasSpecular = true;
+
+    if (theLaunchParameters.pathLengths.x <= depth)
+    {
+      const float probability = fmaxf(prd.throughput.x, fmaxf(prd.throughput.y, prd.throughput.z));
+      if (probability < rng(prd.seed))
+        break;
+      prd.throughput /= probability;
+    }
+
+    ++depth;
+  }
+
+  if (!foundCaustic) 
+  {
+    // Zero stale data so Phase-1 mask training doesn't see garbage at label=1.
+    nrc.lightEndpoints[3*pixelIdx+0] = 0.0f;
+    nrc.lightEndpoints[3*pixelIdx+1] = 0.0f;
+    nrc.lightEndpoints[3*pixelIdx+2] = 0.0f;
+    nrc.lightTargets[3*pixelIdx+0]  = 0.0f;
+    nrc.lightTargets[3*pixelIdx+1]  = 0.0f;
+    nrc.lightTargets[3*pixelIdx+2]  = 0.0f;
+    nrc.lightValid[pixelIdx] = 0u;
+  }
+}
+
+
 // BDPT: Traces a path from a light source and atomically scatters contributions into bufferAccumLightPath.
 // One thread per pixel, using a different seed than the eye path raygen to avoid correlation.
 extern "C" __global__ void __raygen__light_path_tracer()
 {
-  // Skip if the BD accumulation buffer is not allocated or during picking.
-  if (theLaunchParameters.bufferAccumLightPath == nullptr || 0.0f <= theLaunchParameters.picking.x)
+  // Skip if the BD accumulation buffer is not allocated (and BDRC is not active) or during picking.
+  if ((theLaunchParameters.bufferAccumLightPath == nullptr && theLaunchParameters.nrc.nrcType != BDRC) ||
+      0.0f <= theLaunchParameters.picking.x)
   {
     return;
   }
@@ -686,7 +1210,14 @@ extern "C" __global__ void __raygen__light_path_tracer()
   prd.seed = tea<4>(theLaunchParameters.resolution.x * theLaunchIndex.y + theLaunchIndex.x,
                     theLaunchParameters.iteration + 0x12345678u);
 
-  lightPathIntegrator(prd, theLaunchIndex);
+  if (theLaunchParameters.nrc.nrcType == BDRC)
+  {
+    bdrcLightIntegrator(prd, theLaunchIndex);
+  }
+  else
+  {
+    lightPathIntegrator(prd, theLaunchIndex);
+  }
 }
 
 

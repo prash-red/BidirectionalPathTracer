@@ -1,36 +1,7 @@
-/*
- * Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
- *
- * NrcCache.h — C++ equivalent of bdrc/cache/base.py (BaseCache + create_ngp).
- *
- * Uses tcnn::NetworkWithInputEncoding directly instead of create_from_config,
- * giving explicit control over the training pipeline with the NRC paper-style
- * Composite encoding and fully fused MLP configuration.
- *
- * Why not create_from_config / Trainer::training_step:
- *   create_from_config returns a TrainableModel whose Trainer::training_step
- *   evaluates the loss on the raw network output (pre-activation). With
- *   output_activation="None", that means loss(logits, target) — wrong.
- *   By owning NetworkWithInputEncoding directly and calling forward -> loss ->
- *   backward -> optimizer step explicitly, loss evaluation and optimizer updates
- *   stay fully explicit and match the runtime training loop.
- *
- * Python → C++ mapping:
- *   create_ngp()               → NetworkWithInputEncoding constructor
- *   BaseCache.__init__()       → NrcCache::NrcCache()
- *   BaseCache.step()           → NrcCache::trainStep()
- *   BaseCache.update_ema()     → NrcCache::updateEma()
- *   BaseCache.swap_ema_in/out  → NrcCache::swapEmaIn/Out()
- *   BaseCache.set_learning_rate→ NrcCache::setLearningRate()
- *   ColorCache3D.query()       → NrcCache::query()
- */
+#ifndef GLTF_RENDERER_BASENGPCACHE_H
+#define GLTF_RENDERER_BASENGPCACHE_H
 
-#pragma once
-
-#ifndef NRC_H
-#define NRC_H
-
-#include "NrcConfig.h"
+#include "ngp_config.h"
 
 #include <tiny-cuda-nn/network_with_input_encoding.h>
 #include <tiny-cuda-nn/optimizer.h>
@@ -45,56 +16,20 @@
 #include <string>
 
 namespace tcnn {
-template <typename T>
-class NetworkWithInputEncoding;
+    template <typename T>
+    class NetworkWithInputEncoding;
 }
 
-// Shorthand for the half-precision type tcnn uses on SM75+ hardware.
-// Guard against redefinition when multiple headers define NrcNetT.
-#ifndef NRC_NET_T_DEFINED
-#define NRC_NET_T_DEFINED
-using NrcNetT = tcnn::network_precision_t;
-#endif
-
-// ============================================================================
-// NrcCache
-//
-// Manages one Neural Radiance Cache instance:
-//   Composite(TriangleWave + OneBlob + Identity) -> FullyFusedMLP -> RGB
-//
-// Training loop (mirrors bdrc/training/train_ngp.py):
-//
-//   NrcCache cache(config, 3, stream);
-//
-//   // Per-iteration (column-major: rows=features, cols=samples)
-//   cache.trainStep(stream, inputBatch, targetBatch);   // fwd+loss+bwd+Adam
-//   cache.updateEma(stream);                            // EMA shadow update
-//
-//   // Inference
-//   cache.query(stream, inputBatch, outputBatch);       // net(x) -> float32
-//
-//   // EMA inference (mirrors bdrc swap_ema_in/out)
-//   cache.swapEmaIn(stream);
-//   cache.query(stream, inputBatch, outputBatch);
-//   cache.swapEmaOut(stream);
-// ============================================================================
-
-class Nrc
+class base_ngp_cache
 {
 public:
-    // -------------------------------------------------------------------------
-    // Construction
-    //
-    // Builds NetworkWithInputEncoding with separate encoding and network JSON,
-    // initializes params, creates Adam optimizer and RelativeL2 loss.
-    // -------------------------------------------------------------------------
-    Nrc(const NrcConfig& config, int outputDim, cudaStream_t stream = nullptr);
-    ~Nrc() = default;
+    base_ngp_cache(const ngp_config& config, int outputDim, cudaStream_t stream = nullptr);
+    virtual ~base_ngp_cache() = default;
 
-    Nrc(const Nrc&)            = delete;
-    Nrc& operator=(const Nrc&) = delete;
-    Nrc(Nrc&&) noexcept                 = default;
-    Nrc& operator=(Nrc&&) noexcept      = default;
+    base_ngp_cache(const base_ngp_cache&)            = delete;
+    base_ngp_cache& operator=(const base_ngp_cache&) = delete;
+    base_ngp_cache(base_ngp_cache&&) noexcept                 = default;
+    base_ngp_cache& operator=(base_ngp_cache&&) noexcept      = default;
 
     // -------------------------------------------------------------------------
     // query — inference pass
@@ -129,7 +64,7 @@ public:
     //
     // Returns mean loss (float) — involves one device→host sync.
     // -------------------------------------------------------------------------
-    float trainStep(
+    virtual float trainStep(
         cudaStream_t                          stream,
         const tcnn::GPUMatrixDynamic<float>&  input,
         const tcnn::GPUMatrix<float>&         target);
@@ -165,30 +100,30 @@ public:
     // Diagnostics
     // =========================================================================
     [[nodiscard]] size_t      numParams() const { return m_network ? m_network->n_params() : 0; }
-    [[nodiscard]] std::string serialize(const std::string& name = "NrcCache") const;
+    [[nodiscard]] std::string serialize(const std::string& name = "BaseNGPCache") const;
 
     // Direct network access for advanced use (e.g. save/load weights)
-    tcnn::NetworkWithInputEncoding<NrcNetT>& network() { return *m_network; }
+    tcnn::NetworkWithInputEncoding<tcnn::network_precision_t>& network() { return *m_network; }
 
-private:
-    NrcConfig m_config;
-    int       m_outputDim = 0;
+protected:
+    ngp_config m_config;
+    int       m_outputDim = 3;
 
     // ---- Core tcnn objects (owned via shared_ptr for tcnn API compatibility) --
-    std::shared_ptr<tcnn::NetworkWithInputEncoding<NrcNetT>> m_network;
-    std::shared_ptr<tcnn::Optimizer<NrcNetT>>                m_optimizer;
-    std::shared_ptr<tcnn::Loss<NrcNetT>>                     m_loss;
+    std::shared_ptr<tcnn::NetworkWithInputEncoding<tcnn::network_precision_t>> m_network;
+    std::shared_ptr<tcnn::Optimizer<tcnn::network_precision_t>>                m_optimizer;
+    std::shared_ptr<tcnn::Loss<tcnn::network_precision_t>>                     m_loss;
 
     // ---- Parameter buffers -------------------------------------------------
-    // Layout: [ float * n_params | NrcNetT * n_params | NrcNetT * n_params ]
+    // Layout: [ float * n_params | tcnn::network_precision_t * n_params | tcnn::network_precision_t * n_params ]
     //          ^m_paramsFP        ^m_params             ^m_paramGrads
     //
     // Mirrors the Trainer's m_params_buffer layout so the same optimizer
     // API (step(stream, loss_scale, fp, hp, grads)) works directly.
     tcnn::GPUMemory<uint8_t> m_paramsBuf;
     float*    m_paramsFP    = nullptr;
-    NrcNetT*  m_params      = nullptr;  // half-precision training weights
-    NrcNetT*  m_paramGrads  = nullptr;  // gradient accumulation buffer
+    tcnn::network_precision_t*  m_params      = nullptr;  // half-precision training weights
+    tcnn::network_precision_t*  m_paramGrads  = nullptr;  // gradient accumulation buffer
 
     // ---- EMA state ---------------------------------------------------------
     bool  m_emaActive      = false;
@@ -197,8 +132,10 @@ private:
     int   m_emaUpdateCount = 0;
     bool  m_emaInitialized = false;
 
-    tcnn::GPUMemory<NrcNetT> m_emaParamsBuf;    // EMA shadow
-    tcnn::GPUMemory<NrcNetT> m_savedParamsBuf;  // saved training weights for swap
+    tcnn::GPUMemory<tcnn::network_precision_t> m_emaParamsBuf;    // EMA shadow
+    tcnn::GPUMemory<tcnn::network_precision_t> m_savedParamsBuf;  // saved training weights for swap
 };
 
-#endif // NRC_H
+
+
+#endif //GLTF_RENDERER_BASENGPCACHE_H

@@ -1,14 +1,13 @@
 //
-// Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 //
 // NrcHost.cu — Host-side NRC system managing the Forward NRC cache.
 // Compiled as CUDA (nvcc) so tcnn headers are available.
 //
 
-#include "NrcHost.h"
-#include "Nrc.h"
-#include "NrcConfig.h"
-#include "../HostKernels.h"
+#include "nrc_host.h"
+#include "nrc.h"
+#include "nrc_config.h"
+#include "../../../HostKernels.h"
 
 #include <cuda_runtime.h>
 #include <memory>
@@ -22,7 +21,7 @@
 struct NrcSystem
 {
   // ---- Forward NRC (Mueller 2021, 14-dim composite encoding) ---------------
-  std::unique_ptr<Nrc>              fwdNrc;
+  std::unique_ptr<nrc>              fwdNrc;
 
   // ---- Shared render-query buffers (pixel-indexed) -------------------------
   float*        d_renderThroughput    = nullptr; // [3 × batchSize]
@@ -87,12 +86,12 @@ struct NrcSystem
 
 static void initForwardNrc(NrcSystem* sys, cudaStream_t stream)
 {
-  NrcConfig config;
+  nrc_config config;
   config.ema.enabled   = true;
   config.ema.decay     = 0.999f;
   config.ema.startIter = 0;
 
-  sys->fwdNrc = std::make_unique<Nrc>(config, /*outputDim=*/3, stream);
+  sys->fwdNrc = std::make_unique<nrc>(config, /*outputDim=*/3, stream);
   sys->fwdNrc->initEma(config.ema.decay, config.ema.startIter);
 }
 
@@ -123,7 +122,7 @@ void nrcAllocBuffers(NrcSystem* sys, uint32_t batchSize)
   cudaMalloc(reinterpret_cast<void**>(&sys->d_renderValid),         batchSize      * sizeof(unsigned int));
 
   // ---- Forward NRC buffers -------------------------------------------------
-  const uint32_t fwdInputDim = static_cast<uint32_t>(NrcConfig().inputDim); // 14
+  const uint32_t fwdInputDim = static_cast<uint32_t>(nrc_config().inputDim); // 14
   cudaMalloc(reinterpret_cast<void**>(&sys->d_renderFeatures),      batchSize * fwdInputDim * sizeof(float));
   cudaMalloc(reinterpret_cast<void**>(&sys->d_trainNextFeatures),   batchSize * fwdInputDim * sizeof(float));
   cudaMalloc(reinterpret_cast<void**>(&sys->d_trainSuffixScaled),   batchSize * 3u          * sizeof(float));
@@ -249,7 +248,10 @@ void nrcDispatch(NrcSystem*   sys,
       sys->fwdNrc->query(stream, inputMat, outputMat, /*useEmaWeights=*/true);
     }
 
-    // 5. Build training targets from compact slot data.
+    // 5. Build training targets from compact slot data — valid slots only.
+    //    paddedTrainCount pads to 256 for tcnn, but the padding range was already zeroed
+    //    above.  Running k_nrc_build_targets on the padding slots would overwrite those
+    //    zeros with stale previous-frame data, injecting garbage into the training batch.
     device_nrc_build_targets(
         stream,
         sys->d_trainTargets,
@@ -258,7 +260,7 @@ void nrcDispatch(NrcSystem*   sys,
         sys->d_nrcNextOutput,
         sys->d_trainThroughputAtK,
         sys->d_trainNextValid,
-        static_cast<int>(paddedTrainCount));
+        static_cast<int>(trainCount));
 
     // 6. Training step on compact features + targets.
     {

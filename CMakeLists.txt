@@ -284,7 +284,7 @@ set(HEADERS_HOST
   src/ConversionArguments.h
   src/DeviceBuffer.h
   src/HostBuffer.h
-  src/HostKernels.h
+        src/HostKernels.h
   src/Logger.h
   src/Light.h
   src/Mesh.h
@@ -324,9 +324,12 @@ set(HEADERS_CUDA
   ${CMAKE_CURRENT_SOURCE_DIR}/src/MyAssert.h
   ${CMAKE_CURRENT_SOURCE_DIR}/src/cuda/vector_math.h
   ${CMAKE_CURRENT_SOURCE_DIR}/src/cuda/geometry_data.h
-        src/cuda/Nrc.cu
-        src/cuda/Nrc.h
-        src/cuda/NrcConfig.h
+        src/cuda/cache/bdrc/base_ngp_cache.h
+        src/cuda/cache/bdrc/mask_ngp_cache.h
+        src/cuda/cache/nrc/nrc.cu
+        src/cuda/cache/nrc/nrc.h
+        src/cuda/cache/nrc/nrc_config.h
+        src/cuda/cache/cache_helpers.h
 )
 
 # GLTF Renderer: CUDA kernels
@@ -335,11 +338,16 @@ set(SOURCES_CUDA
   ${CMAKE_CURRENT_SOURCE_DIR}/src/cuda/kernel_blend.cu
   ${CMAKE_CURRENT_SOURCE_DIR}/src/cuda/kernel_morphing.cu
   ${CMAKE_CURRENT_SOURCE_DIR}/src/cuda/kernel_skinning.cu
-  ${CMAKE_CURRENT_SOURCE_DIR}/src/cuda/kernel_nrc.cu
-        src/cuda/Nrc.cu
-        src/cuda/Nrc.h
-        src/cuda/NrcHost.cu
-        src/cuda/NrcHost.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/cuda/cache/cache_helpers.cu
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/cuda/cache/bdrc/base_ngp_cache.cu
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/cuda/cache/bdrc/mask_ngp_cache.cu
+        src/cuda/cache/kernel_nrc.cu
+        src/cuda/cache/nrc/nrc.cu
+        src/cuda/cache/nrc/nrc.h
+        src/cuda/cache/nrc/nrc_host.cu
+        src/cuda/cache/nrc/nrc_host.h
+        src/cuda/cache/bdrc/bdrc_host.cu
+        src/cuda/cache/bdrc/bdrc_host.h
 )
 
 # GLTF Renderer: OptiX specific headers
@@ -418,6 +426,8 @@ target_compile_options(${OPTIX_LIB} PRIVATE
     --generate-line-info
     -Wno-deprecated-gpu-targets
     --allow-unsupported-compiler
+    # Device debug symbols for cuda-gdb in Debug builds
+    $<$<CONFIG:Debug>:-G>
   >
   # You can also set different nvcc command line options per configuration:
   # -lineinfo in CUDA release builds, -G in debug.
@@ -450,7 +460,7 @@ set_property(TARGET ${PROJECT_NAME} PROPERTY CUDA_ARCHITECTURES ${CMAKE_CUDA_ARC
 
 
 if(MSVC)
-target_compile_options(${PROJECT_NAME} PRIVATE 
+target_compile_options(${PROJECT_NAME} PRIVATE
   $<$<COMPILE_LANGUAGE:CXX>:
     /W3 # Warning level only for the C++ language code.
   >
@@ -462,6 +472,19 @@ target_compile_options(${PROJECT_NAME} PRIVATE
     --generate-line-info
     -Wno-deprecated-gpu-targets
     --allow-unsupported-compiler
+    # Device debug symbols for cuda-gdb in Debug builds
+    $<$<CONFIG:Debug>:-G>
+  >
+)
+else()
+target_compile_options(${PROJECT_NAME} PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>:
+    --use_fast_math
+    --generate-line-info
+    -Wno-deprecated-gpu-targets
+    --allow-unsupported-compiler
+    # Device debug symbols for cuda-gdb in Debug builds
+    $<$<CONFIG:Debug>:-G>
   >
 )
 endif()

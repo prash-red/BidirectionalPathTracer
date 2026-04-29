@@ -37,6 +37,11 @@
 
 #include "light_definition.h"
 
+enum NrcType {
+    NRC,
+    BDRC
+};
+
 // Device buffers used by the NRC path-termination and self-training loop.
 // All float* and unsigned int* are device pointers.
 // When enabled == 0, all pointers may be nullptr and no NRC code executes.
@@ -56,6 +61,7 @@ struct NrcLaunchBuffers
   float*        trainSuffixThroughput; // [3 × batchSize]  slot-indexed: throughput at last suffix vertex
   float*        trainThroughputAtK;    // [3 × batchSize]  slot-indexed: T_{K+1} at termination vertex
   unsigned int* trainNextValid;        // [batchSize] 0 / 1  (slot-indexed)
+  float*        albedo;                // [3 × batchSize]
 
   // ---- Compact training batch (Option B: stream compaction via atomicAdd) ----
   // raygen writes training pixels into a compact slot array; only slot-indexed
@@ -64,6 +70,27 @@ struct NrcLaunchBuffers
   unsigned int* trainCount;        // [1] atomic counter: number of training slots used this frame
   unsigned int* trainPixelIndices; // [batchSize] pixel index for each training slot (unused by kernels, diagnostic)
   float*        trainFeatures;     // [NRC_INPUT_DIM × batchSize] compact slot-indexed train features
+
+  // ---- BDRC light-path buffers (null when bdrcEnabled == 0) -----------------
+  float*        lightEndpoints;        // [3 × numPixels]  Y pos (light caustic floor), normalized
+  float*        lightTargets;          // [3 × numPixels]  tp_Y_pre * f_Y_toward_S
+  unsigned int* lightValid;            // [numPixels]  1 if light path found a valid specular-diffuse Y
+  float*        light_p_sa;            // [numPixels]  Hemisphere pdf at Y for the sampled light path - analytic
+  float*        light_p_e_area;        // [numPixels]  Eye-path area PDF at Y: p_e_sa * cos_Y / dist_YS²
+  unsigned int* lightCount;            // [1] atomic counter: valid caustic samples this frame
+  float*        lightOutput;           // [3 × numPixels]  filled by bdrcDispatch() on host side
+
+  // ---- BDRC eye-path supervision buffers (written by eye integrator) ---------
+  float*        eyeVertexPos;          // [3 × numPixels]  S pos (last specular before D, or camera)
+  float*        eyeVertexNormals;       // [3 × numPixels]  S normal (last specular before D, or camera)
+  float*        eyeVertexThroughput;   // [3 × numPixels]  T(cam→D) pre-BSDF (Python ev.throughput)
+  float*        resampledEndpoints;     // [3 × numPixels]  R pos normalized (hemisphere from S, or D)
+  unsigned int* resampledValid;        // [numPixels]  1 if resampledFeatures is valid
+  float*        resampled_p_sa;        // [numPixels]  Hemisphere pdf at eye vertex positions - analytic
+  float*        resampled_p_e_area;    // [numPixels]  Eye-path area PDF at R: p_e_sa * cos_R / dist_SR²
+
+  // ---- BDRC training phase ---------------------------------------------------
+  int   bdrcPhase;    // 0 = Phase 1 (mask only), 1 = Phase 2 (color caches + frozen mask)
 
   // ---- Scene AABB ------------------------------------------------------------
   float3 aabbMin;
@@ -74,6 +101,7 @@ struct NrcLaunchBuffers
   int   terminationDepth;     // Fallback max depth if spread threshold not met.
 
   // ---- Mode flags -----------------------------------------------------------
+  NrcType nrcType;
   int enabled;       // 0 = NRC off, 1 = NRC active.
   int nrcDebugMode;  // 0=normal, 1=cache-only, 2=mask, 3=indirect (matches NrcDebugMode enum).
 };

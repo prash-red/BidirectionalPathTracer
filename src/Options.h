@@ -53,6 +53,7 @@ public:
   int                   getLaunches() const;
   int                   getInterop() const;
   bool                  getPunctual() const;
+  int                   getNrc() const;
   int                   getMiss() const;
   std::string           getEnvironment() const;
   // Radius of all the spheres (for glTF points) as fraction of the scene diameter.
@@ -73,6 +74,7 @@ private:
   int                   m_launches;
   int                   m_interop;
   bool                  m_punctual;
+  int                   m_nrc;
   int                   m_miss;
   std::string           m_environment;
   float                 m_sphereRadiusFraction;

@@ -116,7 +116,8 @@
 
 // NrcHost.h is included for NrcDebugMode enum and the NrcSystem opaque handle.
 // The full NrcSystem definition stays in NrcHost.cu to avoid pulling in tcnn headers.
-#include "cuda/NrcHost.h"
+#include "cuda/cache/nrc/nrc_host.h"
+#include "cuda/cache/bdrc/bdrc_host.h"
 
 #define APP_EXIT_SUCCESS          0
 
@@ -358,6 +359,7 @@ private:
   void initDenoiser();
 
   void initNRC();
+  void initBDRC();
 
   void updateDenoiserBuffers();
 
@@ -638,7 +640,7 @@ private:
   // Neural Radiance Cache (Mueller et al. 2021).
   // NrcSystem is defined in NrcHost.cu (CUDA) to avoid pulling tcnn device headers here.
   NrcSystem*   m_nrcSystem          = nullptr;
-  bool         m_nrcEnabled         = false;
+  int          m_nrc                = 0;    // 0=off, 1=NRC, 2=BDRC
   uint32_t     m_nrcBatchSize       = 0;    // numPixels rounded to tcnn BATCH_SIZE_GRANULARITY (256).
   int          m_nrcDebugMode       = 0;    // 0=normal, 1=cache-only, 2=mask, 3=indirect
 
@@ -650,6 +652,13 @@ private:
   static constexpr int NRC_LOSS_HISTORY = 128;
   float        m_nrcLossHistory[NRC_LOSS_HISTORY] = {};
   int          m_nrcLossHistoryIdx  = 0;
+
+  BdrcSystem*  m_bdrcSystem    = nullptr;
+  CUstream     m_cudaStreamLight = nullptr;  // Second stream for parallel light-path launch
+  uint32_t     m_nrcTrainingIteration = 0u;  // Total training frames — never reset on camera move
+  int          m_bdrcPhase     = 0;          // 0 = Phase 1 (mask warmup), 1 = Phase 2 (color)
+  int          m_bdrcWarmup    = 2000;       // Frames before Phase 2
+  int          m_bdrcDebugMode = 0;          // 0=normal, 1=eye cache, 2=light cache, 3=mask, 4=eye+light
 };
 
 #endif // APPLICATION_H

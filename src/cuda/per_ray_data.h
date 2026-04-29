@@ -140,6 +140,11 @@ struct PerRayData
   float3 nrcBaseColor;  // diffuse base color
   float3 nrcSpecColor;  // dielectric specular color (F0 proxy)
 
+  // Written by hit.cu before prd.throughput *= bsdf_over_pdf.
+  // Captures T(camera→this_vertex) before the BSDF at this vertex is applied.
+  // Used by bdrcLightIntegrator to compute tp_Y_pre at the caustic floor Y.
+  float3 throughputPreBsdf;
+
   // Set by integrator() when this pixel's path was NRC-terminated.
   // The raygen skips writing bufferAccum; the host-side accumulate kernel handles it.
   bool nrcTerminated;

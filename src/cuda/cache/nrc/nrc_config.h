@@ -1,5 +1,4 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
  *
  * NrcConfig.h — tiny-cuda-nn config for real-time Neural Radiance Caching
  * following Mueller et al. 2021.
@@ -29,7 +28,7 @@ struct EMAConfig
     int   startIter = 0;
 };
 
-struct NrcConfig
+struct nrc_config
 {
     // Raw input layout expected by NRC feature packing.
     // 3 position + 5 non-linear appearance + 6 linear reflectance features = 14.
@@ -108,8 +107,8 @@ struct NrcConfig
     {
         // tiny-cuda-nn implements the RelativeL2 normalization internally.
         return {
-            {"otype", useLuminanceRelativeL2 ? "RelativeL2Luminance" : "RelativeL2"},
-        };
+                {"otype", useLuminanceRelativeL2 ? "RelativeL2Luminance" : "RelativeL2"},
+            };
     }
 
     nlohmann::json toOptimizerJson() const
@@ -126,4 +125,3 @@ struct NrcConfig
 };
 
 #endif // NRCCONFIG_H
-

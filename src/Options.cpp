@@ -48,6 +48,7 @@ Options::Options()
   , m_interop(0)
   , m_miss(2)
   , m_punctual(true)
+  , m_nrc(0)
   , m_sphereRadiusFraction(0.005f)
 {
 }
@@ -140,12 +141,27 @@ bool Options::parseCommandLine(int argc, char *argv[])
     else if (arg == "-p" || arg == "--punctual")
     {
       if (i == argc - 1)
-      { 
+      {
         std::cerr << "ERROR: Option '" << arg << "' requires additional argument.\n";
         printUsage(argv[0]);
         return false;
       }
       m_punctual = (atoi(argv[++i]) != 0);
+    }
+    else if (arg == "-nrc")
+    {
+      if (i == argc - 1)
+      {
+        std::cerr << "ERROR: Option '" << arg << "' requires additional argument.\n";
+        printUsage(argv[0]);
+        return false;
+      }
+      m_nrc = atoi(argv[++i]);
+      if (m_nrc < 0 || m_nrc > 2) {
+        std::cerr << "ERROR: Option '" << arg << "'\n";
+        printUsage(argv[0]);
+        return false;
+      }
     }
     else if (arg == "-m" || arg == "--miss")
     {
@@ -300,6 +316,11 @@ bool Options::getPunctual() const
   return m_punctual;
 }
 
+int Options::getNrc() const
+{
+  return m_nrc;
+}
+
 float Options::getSphereRadiusFraction() const
 {
   return m_sphereRadiusFraction;
@@ -321,6 +342,7 @@ void Options::printUsage(std::string const& argv0)
     "  -l | --launches <int>  Number of launches per render call, range [1, 1000] (1)\n"
     "  -i | --interop <int>   OpenGL interop: 0 = off, 1 = pbo, 2 = array copy, 3 = surface write. (0)\n"
     "  -p | --punctual <int>  Select KHR_lights_punctual support: 0 = off. (1)\n"
+    "  -nrc                   Enable Radiance Caching: 0 = off, 1 = nrc, 2 = bdrc. (0)\n"
     "  -m | --miss <0|1|2>    Select the miss shader: 0 = null, 1 = white, 2 = environment. (2))\n"
     "  -e | --env <filename>  Filename of a spherical HDR texture. (empty)\n"
     "  -r | --radius <fraction>  Fraction of the scene diameter. (0.005)\n"

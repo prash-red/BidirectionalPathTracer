@@ -105,4 +105,32 @@ extern __host__ void device_nrc_build_targets(
     const unsigned int* trainNextValid,
     int                 numTrainSamples);
 
+// BDRC: composite eye+light cache outputs into bufferAccum.
+// radiance[px] = prefix + renderThroughput*eyeOutput + maskOutput*lightOutput
+// maskOutput is p_l_area(D) — scalar mask cache output at the eye vertex D.
+extern __host__ void device_bdrc_composite(
+    cudaStream_t        cudaStream,
+    float4*             bufferAccum,
+    const float*        renderPrefix,
+    const float*        renderThroughput,
+    const float*        eyeOutput,
+    const float*        lightOutput,
+    const float*        maskOutput,
+    const unsigned int* renderValid,
+    int                 numPixels,
+    unsigned int        iteration);
+
+// BDRC debug visualization: write one of the three cache outputs directly to bufferAccum.
+// debugMode: 1=eye(ĉ_e), 2=light(ĉ_l), 3=mask(α) grayscale, 4=eye+light combined.
+extern __host__ void device_bdrc_debug(
+    cudaStream_t        cudaStream,
+    float4*             bufferAccum,
+    const float*        eyeOutput,
+    const float*        lightOutput,
+    const float*        maskOutput,
+    const unsigned int* renderValid,
+    int                 numPixels,
+    unsigned int        iteration,
+    int                 debugMode);
+
 #endif // HOST_KERNELS_H

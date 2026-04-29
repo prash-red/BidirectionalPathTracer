@@ -1,5 +1,4 @@
 //
-// Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 //
 // NrcHost.h — Plain C++ host interface for the Neural Radiance Cache system.
 // Implemented in NrcHost.cu (CUDA compilation unit) to keep tcnn headers out

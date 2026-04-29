@@ -1681,8 +1681,9 @@ __forceinline__ __device__ void chRadiance()
       break;
   }
 
-  thePrd->wi          = state.k2;            // Continuation direction.
-  thePrd->throughput *= state.bsdf_over_pdf; // Adjust the path throughput for all following incident lighting.
+  thePrd->wi                = state.k2;            // Continuation direction.
+  thePrd->throughputPreBsdf = thePrd->throughput;  // pre-BSDF snapshot, used by bdrcLightIntegrator at Y
+  thePrd->throughput       *= state.bsdf_over_pdf; // Adjust the path throughput for all following incident lighting.
   thePrd->pdf         = state.pdf;           // Note that specular events in MDL return pdf == 0.0f! (=> Not a path termination condition.)
   thePrd->typeEvent   = state.typeEvent;     // If this is BSDF_EVENT_ABSORB, the path ends inside the integrator and the radiance is returned.
 

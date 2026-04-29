@@ -33,7 +33,8 @@
 #include "HostKernels.h"
 #include "Utils.h"
 #include "ConversionArguments.h"
-#include "cuda/NrcHost.h"
+#include "cuda/cache/nrc/nrc_host.h"
+#include "cuda/cache/bdrc/bdrc_host.h"
 
 // STB
 #define STB_IMAGE_IMPLEMENTATION
@@ -239,6 +240,7 @@ Application::Application(GLFWwindow* window,
   m_punctual  = options.getPunctual();
   m_missID    = options.getMiss();
   m_pathEnv   = options.getEnvironment();
+  m_nrc = options.getNrc();
 
   m_iterations.resize(MAX_LAUNCHES); // The size of this vector must always be greater or equal to m_launches. Just size it once to the maximum.
   
@@ -329,7 +331,8 @@ Application::Application(GLFWwindow* window,
   initOptiX();
   initSheenLUT();
   initDenoiser();
-  initNRC();
+  if (m_nrc == 1) initNRC();
+  if (m_nrc == 2) initBDRC();
 
   try
   {
@@ -1101,16 +1104,43 @@ void Application::initDenoiser()
 
 void Application::initNRC() {
   m_nrcSystem  = nrcCreate(m_cudaStream);
-  m_nrcEnabled = true;
 
   // Force single-sample-per-frame: NRC buffers are written once per optixLaunch.
   // With m_launches > 1, successive sub-frames would overwrite each other's NRC data.
   m_launches = 1;
 
   m_launchParameters.nrc.enabled          = 1;
+  m_launchParameters.nrc.nrcType          = NRC;
   m_launchParameters.nrc.spreadC          = 0.01f; // Mueller et al. 2021 Section 3.4.
   m_launchParameters.nrc.terminationDepth = 5;     // Fallback max depth if spread threshold not met.
 }
+
+
+
+void Application::initBDRC()
+{
+  m_bdrcSystem = bdrcCreate(m_cudaStream);
+
+  // BDRC still uses the NRC compact training batch for d_trainCount / d_trainFeatures.
+  // Create the shared NRC system as well so those launch-parameter pointers are valid.
+  m_nrcSystem = nrcCreate(m_cudaStream);
+
+  // Same constraint as initNRC(): the compact NRC training buffers are written once
+  // per render() call, so multiple launches would clobber the batch.
+  m_launches = 1;
+
+  // Create second stream for parallel light-path launch.
+  cudaError_t cudaErr = cudaStreamCreate(&m_cudaStreamLight);
+  if (cudaErr != cudaSuccess)
+  {
+    std::cerr << "ERROR: initBDRC() cudaStreamCreate() failed: " << cudaErr << '\n';
+    throw std::runtime_error("initBDRC() cudaStreamCreate() failed");
+  }
+
+  m_launchParameters.nrc.enabled          = 1;
+  m_launchParameters.nrc.nrcType          = BDRC;
+}
+
 
 
 void Application::updateDenoiserBuffers()
@@ -1326,8 +1356,7 @@ void Application::updateBuffers()
   updateDenoiserBuffers();
 
   // NRC buffer allocation: reallocate whenever resolution changes.
-  if (m_nrcEnabled && m_nrcSystem)
-  {
+  if (m_nrc > 0 && m_nrcSystem) {
     constexpr uint32_t NRC_GRAN = 256u; // tcnn BATCH_SIZE_GRANULARITY
     const uint32_t numPixels    = static_cast<uint32_t>(numElementsResolution);
     m_nrcBatchSize = (numPixels + NRC_GRAN - 1u) / NRC_GRAN * NRC_GRAN;
@@ -1354,6 +1383,43 @@ void Application::updateBuffers()
     nrcBuf.trainCount                = nrcTrainCount(m_nrcSystem);
     nrcBuf.trainPixelIndices         = nrcTrainPixelIndices(m_nrcSystem);
     nrcBuf.trainFeatures             = nrcTrainFeatures(m_nrcSystem);
+  }
+
+  if (m_nrc == 2 && m_bdrcSystem)
+  {
+    bdrcAllocBuffers(m_bdrcSystem, m_nrcBatchSize);
+
+    // Wire all BDRC buffer pointers into NrcLaunchBuffers for raygen.
+    NrcLaunchBuffers& nrcBuf         = m_launchParameters.nrc;
+
+    nrcBuf.renderFeatures        = bdrcRenderFeatures(m_bdrcSystem);
+    nrcBuf.renderThroughput      = bdrcRenderThroughput(m_bdrcSystem);
+    nrcBuf.renderPrefix          = bdrcRenderPrefix(m_bdrcSystem);
+    nrcBuf.renderValid           = bdrcRenderValid(m_bdrcSystem);
+    nrcBuf.trainNextFeatures     = bdrcTrainNextFeatures(m_bdrcSystem);
+    nrcBuf.trainSuffixScaled     = bdrcTrainSuffixScaled(m_bdrcSystem);
+    nrcBuf.trainSuffixThroughput = bdrcTrainSuffThroughput(m_bdrcSystem);
+    nrcBuf.trainThroughputAtK    = bdrcTrainThroughputAtK(m_bdrcSystem);
+    nrcBuf.trainNextValid        = bdrcTrainNextValid(m_bdrcSystem);
+    nrcBuf.albedo                 = bdrcAlbedo(m_bdrcSystem);
+
+    nrcBuf.lightEndpoints        = bdrcLightEndpoints(m_bdrcSystem);
+    nrcBuf.lightTargets          = bdrcLightTargets(m_bdrcSystem);
+    nrcBuf.lightValid            = bdrcLightValid(m_bdrcSystem);
+    nrcBuf.light_p_sa            = bdrcLight_p_sa(m_bdrcSystem);
+    nrcBuf.light_p_e_area        = bdrcLight_p_e_area(m_bdrcSystem);
+    nrcBuf.lightCount            = bdrcLightCount(m_bdrcSystem);
+    nrcBuf.lightOutput           = bdrcLightOutput(m_bdrcSystem);
+
+    nrcBuf.eyeVertexPos          = bdrcEyeVertexPos(m_bdrcSystem);
+    nrcBuf.eyeVertexNormals      = bdrcEyeVertexNormals(m_bdrcSystem);
+    nrcBuf.eyeVertexThroughput   = bdrcEyeVertexThroughput(m_bdrcSystem);
+    nrcBuf.resampledEndpoints    = bdrcResampledEndpoints(m_bdrcSystem);
+    nrcBuf.resampledValid        = bdrcResampledValid(m_bdrcSystem);
+    nrcBuf.resampled_p_sa        = bdrcResampled_p_sa(m_bdrcSystem);
+    nrcBuf.resampled_p_e_area    = bdrcResampled_p_e_area(m_bdrcSystem);
+
+    nrcBuf.bdrcPhase             = m_bdrcPhase;
   }
 }
 
@@ -1444,12 +1510,21 @@ bool Application::render()
     }
   }
 
-  m_launchParameters.nrc.nrcDebugMode = m_nrcEnabled ? m_nrcDebugMode : 0;
+  // Map the active debug mode into the launch parameters. For NRC mode use the
+  // NRC debug selection; for BDRC use the BDRC debug selection so the raygen
+  // can enable the "first-hit" debug path when requested by the user.
+  if (m_nrc == 1)
+    m_launchParameters.nrc.nrcDebugMode = m_nrcDebugMode;
+  else if (m_nrc == 2)
+    m_launchParameters.nrc.nrcDebugMode = m_bdrcDebugMode;
+  else
+    m_launchParameters.nrc.nrcDebugMode = 0;
 
-  // In debug mode the raygen skips non-NRC-terminated pixels, so bufferAccum must be zeroed
+  // In debug mode the raygen skips non-cache-terminated pixels, so bufferAccum must be zeroed
   // on every accumulation restart (not just on mode change) to clear stale path-traced values
   // or ghosted geometry from a previous camera orientation.
-  if (m_nrcEnabled && m_nrcDebugMode != 0 &&
+  const int activeDebugMode = (m_nrc == 2) ? m_bdrcDebugMode : m_nrcDebugMode;
+  if (m_nrc > 0 && activeDebugMode != 0 &&
       m_launchParameters.iteration == 0 &&
       m_launchParameters.bufferAccum != nullptr)
   {
@@ -1527,12 +1602,13 @@ bool Application::render()
     }
 
     m_launchParameters.iteration += m_launches; // Skip the number of rendered sub frames inside the host launch parameters.
+    m_nrcTrainingIteration       += m_launches; // Training counter — never reset on camera move.
 
     // BDPT: Launch the light path tracer (one launch per render call, same resolution as the eye path).
     // bufferAccumLightPath must be zero-cleared once per frame for correct running-sum accumulation;
     // instead of clearing per-frame we accumulate over all iterations and divide in update().
     float scaleLightPath = 0.0f; // Updated below when BDPT is active; used by INTEROP_IMG compositing.
-    if (m_sbtLightPath.raygenRecord && m_launchParameters.bufferAccumLightPath != nullptr)
+    if (m_sbtLightPath.raygenRecord && m_launchParameters.bufferAccumLightPath != nullptr && m_nrc != 2)
     {
       CUDA_CHECK( cudaMemcpyAsync(reinterpret_cast<void*>(m_d_launchParameters), &m_launchParameters, sizeof(LaunchParameters), cudaMemcpyHostToDevice, m_cudaStream) );
       OPTIX_CHECK( m_api.optixLaunch(m_pipeline, m_cudaStream, reinterpret_cast<CUdeviceptr>(m_d_launchParameters), sizeof(LaunchParameters), &m_sbtLightPath, m_resolution.x, m_resolution.y, 1) );
@@ -1544,29 +1620,65 @@ bool Application::render()
     }
     // Suppress BDPT light path compositing in NRC debug mode: the visualization (mask, cache-only,
     // indirect) must not be contaminated by scene-colored light path contributions.
-    if (m_nrcEnabled && m_nrcDebugMode != 0)
+    if (m_nrc > 0 && m_nrcDebugMode != 0)
       scaleLightPath = 0.0f;
 
-    // NRC dispatch: inference → accumulate → build targets → train → update EMA.
+    // NRC/BDRC dispatch: inference → accumulate → build targets → train → update EMA.
     // Runs once per render() call (after all eye-path sub-frame launches).
     // Requires m_launches == 1 so the NRC buffers hold data from exactly one launch.
-    if (m_nrcEnabled && m_nrcSystem && m_launchParameters.bufferAccum != nullptr)
+    if (m_nrc > 0 && m_launchParameters.bufferAccum != nullptr)
     {
       // Use the iteration value the raygen ran with (before the += m_launches increment above).
       const unsigned int nrcIteration = m_launchParameters.iteration - static_cast<unsigned int>(m_launches);
-      nrcDispatch(m_nrcSystem,
-                  m_cudaStream,
-                  m_launchParameters.bufferAccum,
-                  m_resolution.x * m_resolution.y,
-                  m_nrcBatchSize,
-                  nrcIteration,
-                  static_cast<NrcDebugMode>(m_nrcDebugMode));
 
-      // Update loss history for GUI display.
-      m_nrcLastLoss                           = nrcGetLastLoss(m_nrcSystem);
-      m_nrcLastTrainCount                     = static_cast<int>(nrcGetLastTrainCount(m_nrcSystem));
-      m_nrcLossHistory[m_nrcLossHistoryIdx]   = m_nrcLastLoss;
-      m_nrcLossHistoryIdx                     = (m_nrcLossHistoryIdx + 1) % NRC_LOSS_HISTORY;
+      if (m_nrc == 2 && m_bdrcSystem)
+      {
+        // Update BDRC phase flag using the persistent training counter (not reset on camera move).
+        m_bdrcPhase = (m_nrcTrainingIteration >= static_cast<unsigned int>(m_bdrcWarmup)) ? 1 : 0;
+        m_launchParameters.nrc.bdrcPhase = m_bdrcPhase;
+
+        // Launch light path on second stream. The cudaDeviceSynchronize() below ensures both
+        // complete before bdrcDispatch. True parallel execution requires CUDA events; left as future work.
+        if (m_sbtLightPath.raygenRecord)
+        {
+          CUDA_CHECK( cudaMemcpyAsync(reinterpret_cast<void*>(m_d_launchParameters),
+                                      &m_launchParameters, sizeof(LaunchParameters),
+                                      cudaMemcpyHostToDevice, m_cudaStreamLight) );
+          OPTIX_CHECK( m_api.optixLaunch(m_pipeline, m_cudaStreamLight,
+                                          reinterpret_cast<CUdeviceptr>(m_d_launchParameters),
+                                          sizeof(LaunchParameters),
+                                          &m_sbtLightPath,
+                                          m_resolution.x, m_resolution.y, 1) );
+        }
+        CUDA_CHECK( cudaDeviceSynchronize() );
+
+        bdrcDispatch(m_bdrcSystem,
+                     m_cudaStream,
+                     m_launchParameters.bufferAccum,
+                     m_resolution.x * m_resolution.y,
+                     m_nrcBatchSize,
+                     nrcIteration,
+                     m_bdrcPhase,
+                     m_bdrcDebugMode,
+                     nrcTrainCount(m_nrcSystem),
+                     nrcTrainFeatures(m_nrcSystem));
+      }
+      else if (m_nrc == 1 && m_nrcSystem)
+      {
+        nrcDispatch(m_nrcSystem,
+                    m_cudaStream,
+                    m_launchParameters.bufferAccum,
+                    m_resolution.x * m_resolution.y,
+                    m_nrcBatchSize,
+                    nrcIteration,
+                    static_cast<NrcDebugMode>(m_nrcDebugMode));
+
+        // Update loss history for GUI display.
+        m_nrcLastLoss                           = nrcGetLastLoss(m_nrcSystem);
+        m_nrcLastTrainCount                     = static_cast<int>(nrcGetLastTrainCount(m_nrcSystem));
+        m_nrcLossHistory[m_nrcLossHistoryIdx]   = m_nrcLastLoss;
+        m_nrcLossHistoryIdx                     = (m_nrcLossHistoryIdx + 1) % NRC_LOSS_HISTORY;
+      }
     }
 
     // Denoiser: run on the accumulated eye path buffer and write to m_d_bufferDenoised.
@@ -2079,7 +2191,7 @@ void Application::guiWindow()
     }
   }
 
-  if (m_nrcEnabled && ImGui::CollapsingHeader("Neural Radiance Cache"))
+  if (m_nrc == 1 && ImGui::CollapsingHeader("Neural Radiance Cache"))
   {
     const char* debugItems[] = {
       "Composited (normal)",
@@ -2136,6 +2248,32 @@ void Application::guiWindow()
 
     ImGui::Text("Loss:    %.4f", m_nrcLastLoss);
     ImGui::Text("Samples: %d / frame", m_nrcLastTrainCount);
+  }
+
+  if (m_nrc == 2 && ImGui::CollapsingHeader("BDRC Cache Visualization"))
+  {
+    ImGui::Text("BDRC Mode");
+    ImGui::Text("Phase: %s (training frame %u / warmup %d)",
+                m_bdrcPhase == 0 ? "1-Mask warmup" : "2-Color caches",
+                m_nrcTrainingIteration, m_bdrcWarmup);
+    ImGui::SliderInt("BDRC Warmup Frames", &m_bdrcWarmup, 200, 5000);
+
+    static const char* bdrcDebugItems[] = {
+      "Normal",
+      "Eye cache (ce)",
+      "Light cache (cl)",
+      "Mask (alpha)",
+      "Eye + Light",
+    };
+    if (ImGui::Combo("BDRC Debug View", &m_bdrcDebugMode, bdrcDebugItems, 5))
+    {
+      m_launchParameters.iteration = 0;
+      if (m_launchParameters.bufferAccum != nullptr)
+      {
+        const int numPixels = m_launchParameters.resolution.x * m_launchParameters.resolution.y;
+        CUDA_CHECK( cudaMemset(reinterpret_cast<void*>(m_launchParameters.bufferAccum), 0, numPixels * sizeof(float4)) );
+      }
+    }
   }
 
   if (ImGui::CollapsingHeader("Tonemapper"))
@@ -5409,6 +5547,24 @@ void Application::cleanup()
     m_d_bufferDenoised = 0;
   }
 
+  if (m_nrcSystem)
+  {
+    nrcDestroy(m_nrcSystem);
+    m_nrcSystem = nullptr;
+  }
+
+  // BDRC: destroy second stream, BDRC system, and eye-path device buffers.
+  if (m_cudaStreamLight)
+  {
+    cudaStreamDestroy(m_cudaStreamLight);
+    m_cudaStreamLight = nullptr;
+  }
+  if (m_bdrcSystem)
+  {
+    bdrcDestroy(m_bdrcSystem);
+    m_bdrcSystem = nullptr;
+  }
+
   // BDPT: Free the light path accumulation buffer, GPU blend output, and host mirror.
   if (m_launchParameters.bufferAccumLightPath != nullptr)
   {
@@ -5842,11 +5998,15 @@ void Application::initPipeline()
 #if USE_DEBUG_EXCEPTIONS
   m_mco.optLevel   = OPTIX_COMPILE_OPTIMIZATION_LEVEL_0; // No optimizations.
   m_mco.debugLevel = OPTIX_COMPILE_DEBUG_LEVEL_FULL;     // Full debug. Never profile kernels with this setting!
-#else
+#elif defined(NDEBUG)
   m_mco.optLevel   = OPTIX_COMPILE_OPTIMIZATION_LEVEL_3; // All optimizations, is the default.
   // Keep generated line info. (NVCC_OPTIONS use --generate-line-info in CMakeLists.txt)
   m_mco.debugLevel = OPTIX_COMPILE_DEBUG_LEVEL_MINIMAL; // PERF Must use OPTIX_COMPILE_DEBUG_LEVEL_MODERATE to profile code with Nsight Compute!
-#endif // USE_DEBUG_EXCEPTIONS
+#else
+  // Debug build: enable full debug info for cuda-gdb inspection
+  m_mco.optLevel   = OPTIX_COMPILE_OPTIMIZATION_LEVEL_0; // No optimizations for better debugging.
+  m_mco.debugLevel = OPTIX_COMPILE_DEBUG_LEVEL_FULL;     // Full debug symbols. WARNING: slow performance!
+#endif // USE_DEBUG_EXCEPTIONS / NDEBUG
 
   // OptixPipelineCompileOptions
   m_pco = {};
@@ -6816,7 +6976,7 @@ void Application::updateLaunchParameters()
     m_launchParameters.sceneSphereRadius = m_sceneExtent.getDiameter() * 0.5f;
 
     // Update NRC AABB for world-space position normalization in feature packing.
-    if (m_nrcEnabled)
+    if (m_nrc > 0)
     {
       const glm::vec3 mn = m_sceneExtent.getMin();
       const glm::vec3 mx = m_sceneExtent.getMax();
@@ -6979,7 +7139,7 @@ void Application::update()
                                   : reinterpret_cast<const void*>(m_launchParameters.bufferAccum);
           CUDA_CHECK( cudaMemcpy((void*) m_bufferHost, srcBuffer, numPixels * sizeof(float4), cudaMemcpyDeviceToHost) );
 
-          if (m_bdptDisplayMode == 2 && haveLightPath && !(m_nrcEnabled && m_nrcDebugMode != 0))
+          if (m_bdptDisplayMode == 2 && haveLightPath && !(m_nrc > 0 && m_nrcDebugMode != 0))
           {
             // Blend eye + light path contributions.
             const float scaleLightPath = 1.0f / (static_cast<float>(m_iterationLightPath) * 100.0f);
