@@ -329,9 +329,11 @@ __forceinline__ __device__ bool handleBdrcDebugFirstHit(
 
   // Modes 1, 5, 6: let the path continue so the diffuse-termination block can write
   // renderValid, resampledEndpoints (hemisphere-probed R), and eyeVertexPos correctly.
-  // Modes 2-4 terminate here since they only need the first-hit cache outputs.
+  // Mode 3 (mask): also continues so the diffuse-termination probe writes a valid p_e_area
+  // and eyeVertexThroughput, which are required for non-zero mask training gradients.
+  // Modes 2, 4 terminate here since they only need the first-hit cache outputs.
   const int dbg = theLaunchParameters.nrc.nrcDebugMode;
-  if (dbg == 1 || dbg == 5 || dbg == 6)
+  if (dbg == 1 || dbg == 3 || dbg == 5 || dbg == 6)
     return false;
 
   prd.nrcTerminated = true;
