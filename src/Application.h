@@ -257,6 +257,8 @@ private:
 
   void checkInfoLog(const char *msg, GLuint object);
   void initGLSL();
+  void initAABBOverlay();
+  void drawAABBOverlay();
 
   void updateTonemapper();
 
@@ -477,6 +479,14 @@ private:
   GLint m_locAttrPosition = -1;
   GLint m_locAttrTexCoord = -1;
   GLint m_locProjection   = -1;
+
+  // AABB wireframe overlay
+  bool   m_showAABB       = false;
+  GLuint m_aabbProgram    = 0;
+  GLuint m_aabbVBO        = 0;
+  GLuint m_aabbVAO        = 0;
+  GLint  m_aabbLocMVP     = -1;
+  GLint  m_aabbLocColor   = -1;
     
   //std::vector<cudaDeviceProp> m_deviceProperties;
 
@@ -659,6 +669,14 @@ private:
   int          m_bdrcPhase     = 0;          // 0 = Phase 1 (mask warmup), 1 = Phase 2 (color)
   int          m_bdrcWarmup    = 2000;       // Frames before Phase 2
   int          m_bdrcDebugMode = 0;          // 0=normal, 1=eye cache, 2=light cache, 3=mask, 4=eye+light
+  bool         m_bdrcFreezeTraining = true;  // Freeze all cache weight updates; inference still runs
+
+  float        m_bdrcLastEyeLoss   = 0.0f;
+  float        m_bdrcLastLightLoss = 0.0f;
+  float        m_bdrcEyeLossHistory  [NRC_LOSS_HISTORY] = {};
+  float        m_bdrcLightLossHistory[NRC_LOSS_HISTORY] = {};
+  int          m_bdrcEyeLossHistoryIdx   = 0;
+  int          m_bdrcLightLossHistoryIdx = 0;
 };
 
 #endif // APPLICATION_H

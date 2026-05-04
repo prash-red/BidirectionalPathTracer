@@ -36,7 +36,7 @@ float*        bdrcTrainSuffixScaled (const BdrcSystem* sys);
 float*        bdrcTrainSuffThroughput(const BdrcSystem* sys);
 float*        bdrcTrainThroughputAtK(const BdrcSystem* sys);
 unsigned int* bdrcTrainNextValid    (const BdrcSystem* sys);
-float*      bdrcAlbedo             (const BdrcSystem* sys);
+float*        bdrcAlbedo             (const BdrcSystem* sys);
 float*        bdrcEyeVertexPos      (const BdrcSystem* sys);
 float*        bdrcEyeVertexNormals  (const BdrcSystem* sys);
 float*        bdrcEyeVertexThroughput(const BdrcSystem* sys);
@@ -51,6 +51,9 @@ float*        bdrcCompactLight_p_e_area  (const BdrcSystem* sys);
 float*        bdrcCompactResampledEndpoints(const BdrcSystem* sys);
 unsigned int* bdrcCompactResampledCount  (const BdrcSystem* sys);
 float*        bdrcCompactResampled_p_e_area(const BdrcSystem* sys);
+float         bdrcGetLastEyeLoss  (const BdrcSystem* sys);
+float         bdrcGetLastLightLoss(const BdrcSystem* sys);
+float*        bdrcRenderOutput    (const BdrcSystem* sys);
 
 // Per-frame dispatch. Call after both eye and light raygen launches complete.
 // All eye-path and light-path buffers are owned by BdrcSystem.
@@ -72,6 +75,16 @@ void bdrcDispatch(
     int           debugMode,
     // Compact training batch (from NRC system)
     unsigned int* d_trainCount,
-    float*        d_trainFeatures);
+    float*        d_trainFeatures,
+    bool          freezeTraining,
+    // Camera and scene AABB — required for debug modes 5 and 6 (endpoint splatting)
+    float3        aabbMin,
+    float3        aabbMax,
+    float3        cameraP,
+    float3        cameraU,
+    float3        cameraV,
+    float3        cameraW,
+    int           resolutionX,
+    int           resolutionY);
 
 #endif // BDRC_HOST_H

@@ -12,6 +12,36 @@
 #include <cstdio>
 #include <stdexcept>
 
+// ---- Gradient overflow detection -------------------------------------------
+
+static __global__ void k_check_grad_overflow(
+    const tcnn::network_precision_t* __restrict__ grads,
+    uint32_t n,
+    uint32_t* __restrict__ d_flag)
+{
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    if (!isfinite((float)grads[i]))
+        atomicOr(d_flag, 1u);
+}
+
+bool base_ngp_cache::checkGradOverflow(cudaStream_t stream)
+{
+    const uint32_t n = static_cast<uint32_t>(m_network->n_params());
+    if (n == 0) return false;
+    CUDA_CHECK_THROW(cudaMemsetAsync(m_overflowFlag.data(), 0, sizeof(uint32_t), stream));
+    k_check_grad_overflow<<<tcnn::n_blocks_linear(n), tcnn::N_THREADS_LINEAR, 0, stream>>>(
+        m_paramGrads, n, m_overflowFlag.data());
+    CUDA_CHECK_THROW(cudaGetLastError());
+    uint32_t flag = 0;
+    CUDA_CHECK_THROW(cudaMemcpyAsync(&flag, m_overflowFlag.data(), sizeof(uint32_t),
+                                     cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK_THROW(cudaStreamSynchronize(stream));
+    return flag != 0;
+}
+
+// ----------------------------------------------------------------------------
+
 base_ngp_cache::base_ngp_cache(const ngp_config& config, int outputDim, cudaStream_t /*stream*/)
 	: m_config(config), m_outputDim(outputDim) {
 	if (outputDim <= 0) {
@@ -34,6 +64,10 @@ base_ngp_cache::base_ngp_cache(const ngp_config& config, int outputDim, cudaStre
 	m_paramsFP = reinterpret_cast<float*>(m_paramsBuf.data());
 	m_params = reinterpret_cast<tcnn::network_precision_t*>(m_paramsBuf.data() + sizeof(float) * n);
 	m_paramGrads = m_params + n;
+
+	m_gradScaler.init(config.gradScaler, config.gradScalerInitScale,
+	                  config.gradScalerGrowthFactor, config.gradScalerGrowth);
+	m_overflowFlag.resize(1);
 
 	tcnn::pcg32 rng{1337};
 	m_network->initialize_params(rng, m_paramsFP);
@@ -70,8 +104,15 @@ void base_ngp_cache::query(
 		throw std::runtime_error("BaseNGPCache::query: output shape mismatch");
 	}
 
+	const bool doEmaInfer = useEmaWeights && m_emaActive && m_emaInitialized;
+	if (doEmaInfer)
+		m_network->set_params(m_params, m_emaParamsBuf.data(), m_paramGrads);
+
 	tcnn::GPUMatrixDynamic<tcnn::network_precision_t> rawOutput(paddedWidth, batchSize, stream);
-	m_network->inference_mixed_precision(stream, input, rawOutput, useEmaWeights);
+	m_network->inference_mixed_precision(stream, input, rawOutput, doEmaInfer);
+
+	if (doEmaInfer)
+		m_network->set_params(m_params, m_params, m_paramGrads);
 
 	const uint32_t n = static_cast<uint32_t>(m_outputDim) * batchSize;
 	k_cast_half_to_float_strided<<<tcnn::n_blocks_linear(n), tcnn::N_THREADS_LINEAR, 0, stream>>>(
@@ -110,7 +151,7 @@ float base_ngp_cache::trainStep(
 		&networkOut,
 		false,
 		false);
-	const float lossScale = tcnn::default_loss_scale<tcnn::network_precision_t>();
+	const float lossScale = m_gradScaler.currentScale();
 	m_loss->evaluate(stream, lossScale, networkOut, target, lossVals, dLdOutput);
 
 	m_network->backward(
@@ -123,7 +164,16 @@ float base_ngp_cache::trainStep(
 		false,
 		tcnn::GradientMode::Overwrite);
 
-	m_optimizer->step(stream, lossScale, m_paramsFP, m_params, m_paramGrads);
+	if (m_config.gradScaler) {
+		if (checkGradOverflow(stream)) {
+			m_gradScaler.onOverflow();
+		} else {
+			m_gradScaler.onSuccess();
+			m_optimizer->step(stream, lossScale, m_paramsFP, m_params, m_paramGrads);
+		}
+	} else {
+		m_optimizer->step(stream, lossScale, m_paramsFP, m_params, m_paramGrads);
+	}
 
 	const float totalLoss = tcnn::reduce_sum(lossVals.data(), lossVals.n_elements(), stream);
 	return totalLoss / static_cast<float>(static_cast<uint32_t>(m_outputDim) * batchSize);

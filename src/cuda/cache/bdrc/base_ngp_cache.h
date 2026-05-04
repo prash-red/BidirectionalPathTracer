@@ -2,6 +2,7 @@
 #define GLTF_RENDERER_BASENGPCACHE_H
 
 #include "ngp_config.h"
+#include "grad_scaler.h"
 
 #include <tiny-cuda-nn/network_with_input_encoding.h>
 #include <tiny-cuda-nn/optimizer.h>
@@ -134,6 +135,14 @@ protected:
 
     tcnn::GPUMemory<tcnn::network_precision_t> m_emaParamsBuf;    // EMA shadow
     tcnn::GPUMemory<tcnn::network_precision_t> m_savedParamsBuf;  // saved training weights for swap
+
+    // ---- Gradient scaler ---------------------------------------------------
+    GradScaler m_gradScaler;
+    tcnn::GPUMemory<uint32_t> m_overflowFlag;  // 1-element device buffer; 1 = NaN/Inf detected
+
+    // Returns true if any gradient in m_paramGrads is non-finite; syncs the stream.
+    // Only call this when m_config.gradScaler is true.
+    bool checkGradOverflow(cudaStream_t stream);
 };
 
 

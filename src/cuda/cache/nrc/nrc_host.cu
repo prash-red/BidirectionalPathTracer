@@ -43,6 +43,7 @@ struct NrcSystem
   unsigned int* d_trainCount          = nullptr; // [1] atomic counter
   unsigned int* d_trainPixelIndices   = nullptr; // [batchSize] pixel index per slot (diagnostic)
   float*        d_trainFeatures       = nullptr; // [NRC_INPUT_DIM × batchSize]  compact
+  float*        d_albedo              = nullptr; // [3 × batchSize] base color at NRC termination vertex
 
   // ---- Per-frame diagnostics ----------------------------------------------
   float        m_lastLoss        = 0.0f;
@@ -69,6 +70,7 @@ struct NrcSystem
     cudaFree(d_trainCount);          d_trainCount          = nullptr;
     cudaFree(d_trainPixelIndices);   d_trainPixelIndices   = nullptr;
     cudaFree(d_trainFeatures);       d_trainFeatures       = nullptr;
+    cudaFree(d_albedo);              d_albedo              = nullptr;
   }
 
   void freeAllBuffers()
@@ -136,6 +138,7 @@ void nrcAllocBuffers(NrcSystem* sys, uint32_t batchSize)
   cudaMalloc(reinterpret_cast<void**>(&sys->d_trainCount),          sizeof(unsigned int));
   cudaMalloc(reinterpret_cast<void**>(&sys->d_trainPixelIndices),   batchSize * sizeof(unsigned int));
   cudaMalloc(reinterpret_cast<void**>(&sys->d_trainFeatures),       batchSize * fwdInputDim * sizeof(float));
+  cudaMalloc(reinterpret_cast<void**>(&sys->d_albedo),              batchSize * 3u          * sizeof(float));
 
   // Zero-initialise all flags and the training counter.
   cudaMemset(sys->d_renderValid,    0, batchSize * sizeof(unsigned int));
@@ -164,6 +167,7 @@ unsigned int* nrcTrainNextValid     (const NrcSystem* sys) { return sys->d_train
 unsigned int* nrcTrainCount        (const NrcSystem* sys) { return sys->d_trainCount;         }
 unsigned int* nrcTrainPixelIndices (const NrcSystem* sys) { return sys->d_trainPixelIndices;  }
 float*        nrcTrainFeatures     (const NrcSystem* sys) { return sys->d_trainFeatures;      }
+float*        nrcAlbedo            (const NrcSystem* sys) { return sys->d_albedo;             }
 
 float        nrcGetLastLoss       (const NrcSystem* sys) { return sys->m_lastLoss;           }
 unsigned int nrcGetLastTrainCount (const NrcSystem* sys) { return sys->m_lastTrainCount;     }

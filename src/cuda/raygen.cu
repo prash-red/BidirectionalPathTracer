@@ -209,26 +209,29 @@ __forceinline__ __device__ bool handleBdrcCacheLogic(
 
   const float3 tpK1 = prd.throughput;
 
-  // ---- Render data (ALL terminated pixels) — written unconditionally for display ----
-  nrc.renderThroughput[3 * pixelIdx + 0] = tpK1.x;
-  nrc.renderThroughput[3 * pixelIdx + 1] = tpK1.y;
-  nrc.renderThroughput[3 * pixelIdx + 2] = tpK1.z;
+  // In eye-cache debug mode the render buffers were already captured at the first-hit
+  // vertex (depth=0) by handleBdrcDebugFirstHit, so don't overwrite them here.
+  if (theLaunchParameters.nrc.nrcDebugMode != 1)
+  {
+    nrc.renderThroughput[3 * pixelIdx + 0] = tpK1.x;
+    nrc.renderThroughput[3 * pixelIdx + 1] = tpK1.y;
+    nrc.renderThroughput[3 * pixelIdx + 2] = tpK1.z;
 
-  const float3 prefix = prd.radiance;
-  nrc.renderPrefix[3 * pixelIdx + 0] = prefix.x;
-  nrc.renderPrefix[3 * pixelIdx + 1] = prefix.y;
-  nrc.renderPrefix[3 * pixelIdx + 2] = prefix.z;
+    const float3 prefix = prd.radiance;
+    nrc.renderPrefix[3 * pixelIdx + 0] = prefix.x;
+    nrc.renderPrefix[3 * pixelIdx + 1] = prefix.y;
+    nrc.renderPrefix[3 * pixelIdx + 2] = prefix.z;
 
-  nrc.renderValid[pixelIdx] = 1u;
-  bdrcPackFeatures(nrc.renderFeatures, pixelIdx, prd.pos, nrc.aabbMin, nrc.aabbMax);
+    nrc.renderValid[pixelIdx] = 1u;
+    bdrcPackFeatures(nrc.renderFeatures, pixelIdx, prd.pos, nrc.aabbMin, nrc.aabbMax);
+  }
 
-  // ---- Fractional training suffix (NRC_TRAIN_FRACTION of terminated pixels) ----
-  // Mirrors the NRC design (Müller et al. 2021): only a small fraction of paths
-  // trace the additional bounces required to build a self-training target.  The
-  // compact slot index keeps the training batch dense so tcnn sees no zero-target
-  // samples.  The unbiased flag suppresses the bootstrap for 1/NRC_UNBIASED_RATE
-  // paths, breaking potential self-reinforcing feedback cycles.
-    // const bool isUnbiased = (rng(prd.seed) * NRC_UNBIASED_RATE < 1.0f);
+  // ---- Training suffix: continue path from D with full NEE + Russian Roulette ----
+  // Every diffuse-terminated pixel contributes a training slot (no fraction gate).
+  // The suffix runs the same loop as the main integrator — NEE is handled inside
+  // the hit shader — until natural absorption or Russian Roulette termination.
+  // trainNextValid=0 so k_nrc_build_targets uses the pure MC formula:
+  //   target = suffixDelta / trainThroughputAtK
 
     const unsigned int slot = atomicAdd(nrc.trainCount, 1u);
     if (slot >= static_cast<unsigned int>(theLaunchParameters.resolution.x *
@@ -240,8 +243,6 @@ __forceinline__ __device__ bool handleBdrcCacheLogic(
 
     nrc.trainPixelIndices[slot] = pixelIdx;
 
-    // Compact slot-indexed eye features (3-dim, reuses the NRC trainFeatures buffer
-    // which is allocated large enough to hold batchSize × 3 floats).
     bdrcPackFeatures(nrc.trainFeatures, slot, prd.pos, nrc.aabbMin, nrc.aabbMax);
 
     nrc.trainThroughputAtK[3 * slot + 0] = tpK1.x;
@@ -249,9 +250,8 @@ __forceinline__ __device__ bool handleBdrcCacheLogic(
     nrc.trainThroughputAtK[3 * slot + 2] = tpK1.z;
 
     const float3 radianceBefore = prd.radiance;
-    bool finalSuffixHit = false;
 
-    for (int s = 0; s < NRC_SUFFIX_STEPS; ++s)
+    for (int s = 0; s < theLaunchParameters.pathLengths.y; ++s)
     {
       prd.wo       = -prd.wi;
       prd.distance = RT_DEFAULT_MAX;
@@ -268,41 +268,21 @@ __forceinline__ __device__ bool handleBdrcCacheLogic(
       if ((prd.typeEvent == BSDF_EVENT_ABSORB) || isNull(prd.throughput))
         break;
 
-      finalSuffixHit = (prd.flags & FLAG_HIT) &&
-                       (prd.typeEvent & BSDF_EVENT_DIFFUSE);
+      if (theLaunchParameters.pathLengths.x <= s)
+      {
+        const float probability = fmaxf(prd.throughput);
+        if (probability < rng(prd.seed))
+          break;
+        prd.throughput /= probability;
+      }
     }
 
     const float3 suffDelta = prd.radiance - radianceBefore;
     nrc.trainSuffixScaled[3 * slot + 0] = suffDelta.x;
     nrc.trainSuffixScaled[3 * slot + 1] = suffDelta.y;
     nrc.trainSuffixScaled[3 * slot + 2] = suffDelta.z;
+    nrc.trainNextValid[slot] = 0u;
 
-    // if (finalSuffixHit && !isUnbiased)
-    // {
-    //   bdrcPackFeatures(nrc.trainNextFeatures, slot, prd.pos, nrc.aabbMin, nrc.aabbMax);
-    //   const float3 tpK2 = prd.throughput;
-    //   nrc.trainSuffixThroughput[3 * slot + 0] = tpK2.x;
-    //   nrc.trainSuffixThroughput[3 * slot + 1] = tpK2.y;
-    //   nrc.trainSuffixThroughput[3 * slot + 2] = tpK2.z;
-    //   nrc.trainNextValid[slot] = 1u;
-    // }
-    // else
-    // {
-    //   nrc.trainNextFeatures[3 * slot + 0] = 0.0f;
-    //   nrc.trainNextFeatures[3 * slot + 1] = 0.0f;
-    //   nrc.trainNextFeatures[3 * slot + 2] = 0.0f;
-    //   nrc.trainSuffixThroughput[3 * slot + 0] = 0.0f;
-    //   nrc.trainSuffixThroughput[3 * slot + 1] = 0.0f;
-    //   nrc.trainSuffixThroughput[3 * slot + 2] = 0.0f;
-    //   nrc.trainNextValid[slot] = 0u;
-    // }
-
-  bdrcPackFeatures(nrc.trainNextFeatures, slot, prd.pos, nrc.aabbMin, nrc.aabbMax);
-  const float3 tpK2 = prd.throughput;
-  nrc.trainSuffixThroughput[3 * slot + 0] = tpK2.x;
-  nrc.trainSuffixThroughput[3 * slot + 1] = tpK2.y;
-  nrc.trainSuffixThroughput[3 * slot + 2] = tpK2.z;
-  nrc.trainNextValid[slot] = 1u;
   nrc.albedo[3 * slot + 0] = prd.nrcBaseColor.x;
   nrc.albedo[3 * slot + 1] = prd.nrcBaseColor.y;
   nrc.albedo[3 * slot + 2] = prd.nrcBaseColor.z;
@@ -341,10 +321,18 @@ __forceinline__ __device__ bool handleBdrcDebugFirstHit(
   nrc.renderThroughput[3*pixelIdx+1] = 1.0f;
   nrc.renderThroughput[3*pixelIdx+2] = 1.0f;
 
-  // R = first-hit position (no specular probe at depth 0; use D directly as fallback).
+  // R = first-hit position (placeholder; overwritten by the diffuse-termination probe when
+  // the path continues, and p_e_area=0 makes it a zero-gradient slot if it is not overwritten).
   bdrcPackFeatures(nrc.resampledEndpoints, pixelIdx, prd.pos, nrc.aabbMin, nrc.aabbMax);
   nrc.resampledValid[pixelIdx] = 1u;
-  nrc.resampled_p_e_area[pixelIdx] = 0.0f;  // debug path — no eye-area PDF available
+  nrc.resampled_p_e_area[pixelIdx] = 0.0f;
+
+  // Modes 1, 5, 6: let the path continue so the diffuse-termination block can write
+  // renderValid, resampledEndpoints (hemisphere-probed R), and eyeVertexPos correctly.
+  // Modes 2-4 terminate here since they only need the first-hit cache outputs.
+  const int dbg = theLaunchParameters.nrc.nrcDebugMode;
+  if (dbg == 1 || dbg == 5 || dbg == 6)
+    return false;
 
   prd.nrcTerminated = true;
   return true;
@@ -407,6 +395,10 @@ __forceinline__ __device__ bool handleNrcCacheLogic(
     }
 
     nrc.trainPixelIndices[slot] = pixelIdx;
+
+    nrc.albedo[3 * slot + 0] = prd.nrcBaseColor.x;
+    nrc.albedo[3 * slot + 1] = prd.nrcBaseColor.y;
+    nrc.albedo[3 * slot + 2] = prd.nrcBaseColor.z;
 
     nrcPackFeatures(nrc.trainFeatures, slot,
                     prd.pos, prd.nrcN, prd.wo,
@@ -582,7 +574,9 @@ __forceinline__ __device__ float3 integrator(PerRayData& prd, const uint2 theLau
       hasSpecular    = true;
     }
 
-    // BDRC debug first-hit: query caches at depth=0, analogous to NRC handleNrcDebugCacheOnly.
+    // BDRC debug first-hit: capture first-hit render features for all debug modes.
+    // Modes >= 2 terminate the path here; mode 1 (eye cache) returns false and the path
+    // continues so diffuse-termination training still runs — see handleBdrcDebugFirstHit.
     if (theLaunchParameters.nrc.nrcDebugMode != 0 && theLaunchParameters.nrc.nrcType == BDRC &&
         depth == 0 && (prd.flags & FLAG_HIT))
     {
@@ -591,8 +585,7 @@ __forceinline__ __device__ float3 integrator(PerRayData& prd, const uint2 theLau
     }
 
     // BDRC: terminate at first diffuse/glossy vertex (specular-skip)
-    if (theLaunchParameters.nrc.enabled && theLaunchParameters.nrc.nrcType == BDRC &&
-        depth >= 1 && (prd.flags & FLAG_HIT) && (prd.typeEvent & (BSDF_EVENT_DIFFUSE)))
+    if (theLaunchParameters.nrc.enabled && theLaunchParameters.nrc.nrcType == BDRC && (prd.flags & FLAG_HIT) && (prd.typeEvent & (BSDF_EVENT_DIFFUSE)))
     {
       const unsigned int px = theLaunchParameters.resolution.x * theLaunchIndex.y + theLaunchIndex.x;
       const NrcLaunchBuffers& nrc = theLaunchParameters.nrc;
@@ -616,6 +609,7 @@ __forceinline__ __device__ float3 integrator(PerRayData& prd, const uint2 theLau
         unitSquareToCosineHemisphere(rng2(prd.seed), lastSpecNormal, w, hemiPdf);
 
         // Probe ray from S to find R.
+        // radiance/occlusion/sigma_t initialized so chRadiance accumulates NEE cleanly at R.
         PerRayData probePrd;
         probePrd.pos        = lastSpecPos;
         probePrd.wo         = -w;
@@ -626,6 +620,9 @@ __forceinline__ __device__ float3 integrator(PerRayData& prd, const uint2 theLau
         probePrd.stack[0].absorption_ior = make_float4(0.0f, 0.0f, 0.0f, 1.0f);
         probePrd.throughput = make_float3(1.0f);
         probePrd.typeEvent  = BSDF_EVENT_ABSORB;
+        probePrd.radiance   = make_float3(0.0f);
+        probePrd.occlusion  = 1.0f;
+        probePrd.sigma_t    = make_float3(0.0f);
 
         uint2 probePay = splitPointer(&probePrd);
         optixTrace(theLaunchParameters.handle,
@@ -657,6 +654,18 @@ __forceinline__ __device__ float3 integrator(PerRayData& prd, const uint2 theLau
           nrc.eyeVertexNormals[3*px+0] = lastSpecNormal.x;
           nrc.eyeVertexNormals[3*px+1] = lastSpecNormal.y;
           nrc.eyeVertexNormals[3*px+2] = lastSpecNormal.z;
+
+          // Debug mode 5: chRadiance computed NEE at R into probePrd.radiance.
+          // Store it for the host-side splat-to-camera visualization.
+          if (theLaunchParameters.nrc.nrcDebugMode == 5)
+          {
+            // nrc.renderOutput[3*px+0] = probePrd.radiance.x;
+            // nrc.renderOutput[3*px+1] = probePrd.radiance.y;
+            // nrc.renderOutput[3*px+2] = probePrd.radiance.z;
+            nrc.renderOutput[3*px+0] = 1;
+            nrc.renderOutput[3*px+1] = 1;
+            nrc.renderOutput[3*px+2] = 1;
+          }
         }
         else
         {
@@ -692,6 +701,18 @@ __forceinline__ __device__ float3 integrator(PerRayData& prd, const uint2 theLau
         nrc.eyeVertexNormals[3*px+0] = lastSpecNormal.x;
         nrc.eyeVertexNormals[3*px+1] = lastSpecNormal.y;
         nrc.eyeVertexNormals[3*px+2] = lastSpecNormal.z;
+
+        // Debug mode 5 (R=D fallback): prd.radiance holds NEE at D (depth 0, no prior bounces).
+        // Capture before handleBdrcCacheLogic extends it with the suffix path.
+        if (theLaunchParameters.nrc.nrcDebugMode == 5)
+        {
+          // nrc.renderOutput[3*px+0] = prd.radiance.x;
+          // nrc.renderOutput[3*px+1] = prd.radiance.y;
+          // nrc.renderOutput[3*px+2] = prd.radiance.z;
+          nrc.renderOutput[3*px+0] = 1;
+          nrc.renderOutput[3*px+1] = 1;
+          nrc.renderOutput[3*px+2] = 1;
+        }
       }
 
       if (handleBdrcCacheLogic(prd, theLaunchIndex, payload))
@@ -711,7 +732,7 @@ __forceinline__ __device__ float3 integrator(PerRayData& prd, const uint2 theLau
 
     // NRC termination: area-spread or fallback depth reached at diffuse/glossy vertex
     if (theLaunchParameters.nrc.enabled && theLaunchParameters.nrc.nrcType == NRC &&
-        depth >= 1 && nrcSpreadState.a0 > 0.0f &&
+        depth >= 0 && nrcSpreadState.a0 > 0.0f &&
         ((nrcSpreadState.spread * nrcSpreadState.spread > theLaunchParameters.nrc.spreadC * nrcSpreadState.a0) ||
          depth >= theLaunchParameters.nrc.terminationDepth) &&
         (prd.flags & FLAG_HIT) && (prd.typeEvent & (BSDF_EVENT_DIFFUSE | BSDF_EVENT_GLOSSY)))
@@ -1288,8 +1309,8 @@ extern "C" __global__ void __raygen__path_tracer_surface()
 
   if (theLaunchParameters.picking.x < 0.0f) // Rendering.
   {
-    // NRC-terminated pixels are composited by the host-side accumulate kernel; skip here.
-    // && theLaunchParameters.nrc.nrcDebugMode == 0
+    // NRC/BDRC-terminated pixels are composited by the host dispatch; skip here.
+    // Debug modes also skip — the dispatch kernels own bufferAccum in that case.
     if (!prd.nrcTerminated && theLaunchParameters.nrc.nrcDebugMode == 0)
     {
       if (0 < theLaunchParameters.iteration)

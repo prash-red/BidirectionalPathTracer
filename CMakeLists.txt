@@ -144,6 +144,7 @@ set(TCNN_BUILD_BENCHMARK OFF)
 set(TCNN_BUILD_EXAMPLES OFF)
 set(TCNN_BUILD_WITH_RTC ${GLTF_RENDERER_BUILD_WITH_RTC})
 set(TCNN_ALLOW_CUBLAS_CUSOLVER OFF)
+set(TCNN_HALF_PRECISION OFF)
 add_subdirectory(${LOCAL_3RDPARTY}/tiny-cuda-nn)
 # Inherit the CUDA architectures that tiny-cuda-nn resolved (same as instant-ngp).
 set(CMAKE_CUDA_ARCHITECTURES ${TCNN_CUDA_ARCHITECTURES})

@@ -22,6 +22,7 @@
 #ifndef NRC_FEATURES_H
 #define NRC_FEATURES_H
 
+#include <cstdio>
 #include <cuda_runtime.h>
 #include <stdint.h>
 #include <math_constants.h>

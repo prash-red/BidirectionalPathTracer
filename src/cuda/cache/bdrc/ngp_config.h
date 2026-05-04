@@ -26,8 +26,8 @@ struct ngp_config
     int         numHiddenLayers = 2;
     float       lr              = 1e-2f;
     float       mlpLrScale      = 1.0f;
-    std::string activation      = "relu";
-    std::string outputActivation = "None";
+    std::string hiddenActivation = "ReLu";
+    std::string outputActivation = "Softplus";
 
     // Optimizer settings.
     std::string optimizer   = "adam"; // "sgd" or "adam"
@@ -37,8 +37,7 @@ struct ngp_config
     bool        lamb        = false;
 
     // Precision and gradient-scaling controls.
-    bool  fp32Encoding           = true;
-    bool  gradScaler             = false;
+    bool  gradScaler             = true;
     float gradScalerInitScale    = 65536.0f;
     float gradScalerGrowthFactor = 2.0f;
     bool  gradScalerGrowth       = true;
@@ -47,9 +46,6 @@ struct ngp_config
     float gradClip       = 0.0f;
     float weightDecayMlp = 0.0f;
     float weightDecayEnc = 0.0f;
-
-    // Keep L2 option for mask-cache style training.
-    bool useL2Loss = false;
 
     EMAConfig ema;
 
@@ -75,6 +71,14 @@ struct ngp_config
         };
     }
 
+    // nlohmann::json toEncodingJson() const
+    // {
+    //     int spatialFrequencies    = 12; // 2^d hierarchy via TriangleWave basis.
+    //     return {
+    //                 {"otype", "TriangleWave"},
+    //                 {"n_frequencies", spatialFrequencies}};
+    // }
+
     nlohmann::json toNetworkJson() const
     {
         if (hiddenDim != 16 && hiddenDim != 32 && hiddenDim != 64 && hiddenDim != 128) {
@@ -84,12 +88,6 @@ struct ngp_config
             throw std::invalid_argument("NGPConfig.numHiddenLayers must be >= 0");
         }
 
-        std::string hiddenActivation = activation;
-        if (hiddenActivation == "softplus") {
-            hiddenActivation = "Softplus";
-        } else if (hiddenActivation == "relu") {
-            hiddenActivation = "ReLU";
-        }
 
         return {
             {"otype",             "FullyFusedMLP"},
@@ -102,13 +100,7 @@ struct ngp_config
 
     nlohmann::json toLossJson() const
     {
-        if (useL2Loss)
-        {
-            return {{"otype", "L2"}};
-        }
-        return {
-            {"otype", "None"},
-        };
+        return {{"otype", "L2"}};
     }
 
     nlohmann::json toOptimizerJson() const

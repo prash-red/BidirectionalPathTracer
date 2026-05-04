@@ -1383,6 +1383,7 @@ void Application::updateBuffers()
     nrcBuf.trainCount                = nrcTrainCount(m_nrcSystem);
     nrcBuf.trainPixelIndices         = nrcTrainPixelIndices(m_nrcSystem);
     nrcBuf.trainFeatures             = nrcTrainFeatures(m_nrcSystem);
+    nrcBuf.albedo                    = nrcAlbedo(m_nrcSystem);
   }
 
   if (m_nrc == 2 && m_bdrcSystem)
@@ -1392,6 +1393,7 @@ void Application::updateBuffers()
     // Wire all BDRC buffer pointers into NrcLaunchBuffers for raygen.
     NrcLaunchBuffers& nrcBuf         = m_launchParameters.nrc;
 
+    nrcBuf.renderOutput          = bdrcRenderOutput(m_bdrcSystem);
     nrcBuf.renderFeatures        = bdrcRenderFeatures(m_bdrcSystem);
     nrcBuf.renderThroughput      = bdrcRenderThroughput(m_bdrcSystem);
     nrcBuf.renderPrefix          = bdrcRenderPrefix(m_bdrcSystem);
@@ -1401,7 +1403,7 @@ void Application::updateBuffers()
     nrcBuf.trainSuffixThroughput = bdrcTrainSuffThroughput(m_bdrcSystem);
     nrcBuf.trainThroughputAtK    = bdrcTrainThroughputAtK(m_bdrcSystem);
     nrcBuf.trainNextValid        = bdrcTrainNextValid(m_bdrcSystem);
-    nrcBuf.albedo                 = bdrcAlbedo(m_bdrcSystem);
+    nrcBuf.albedo                = bdrcAlbedo(m_bdrcSystem);
 
     nrcBuf.lightEndpoints        = bdrcLightEndpoints(m_bdrcSystem);
     nrcBuf.lightTargets          = bdrcLightTargets(m_bdrcSystem);
@@ -1602,7 +1604,8 @@ bool Application::render()
     }
 
     m_launchParameters.iteration += m_launches; // Skip the number of rendered sub frames inside the host launch parameters.
-    m_nrcTrainingIteration       += m_launches; // Training counter — never reset on camera move.
+    if (m_nrc != 2 || !m_bdrcFreezeTraining)
+      m_nrcTrainingIteration     += m_launches; // Training counter — never reset on camera move.
 
     // BDPT: Launch the light path tracer (one launch per render call, same resolution as the eye path).
     // bufferAccumLightPath must be zero-cleared once per frame for correct running-sum accumulation;
@@ -1661,7 +1664,23 @@ bool Application::render()
                      m_bdrcPhase,
                      m_bdrcDebugMode,
                      nrcTrainCount(m_nrcSystem),
-                     nrcTrainFeatures(m_nrcSystem));
+                     nrcTrainFeatures(m_nrcSystem),
+                     m_bdrcFreezeTraining,
+                     m_launchParameters.nrc.aabbMin,
+                     m_launchParameters.nrc.aabbMax,
+                     m_launchParameters.cameraP,
+                     m_launchParameters.cameraU,
+                     m_launchParameters.cameraV,
+                     m_launchParameters.cameraW,
+                     m_resolution.x,
+                     m_resolution.y);
+
+        m_bdrcLastEyeLoss   = bdrcGetLastEyeLoss(m_bdrcSystem);
+        m_bdrcLastLightLoss = bdrcGetLastLightLoss(m_bdrcSystem);
+        m_bdrcEyeLossHistory  [m_bdrcEyeLossHistoryIdx]   = m_bdrcLastEyeLoss;
+        m_bdrcLightLossHistory[m_bdrcLightLossHistoryIdx] = m_bdrcLastLightLoss;
+        m_bdrcEyeLossHistoryIdx   = (m_bdrcEyeLossHistoryIdx   + 1) % NRC_LOSS_HISTORY;
+        m_bdrcLightLossHistoryIdx = (m_bdrcLightLossHistoryIdx + 1) % NRC_LOSS_HISTORY;
       }
       else if (m_nrc == 1 && m_nrcSystem)
       {
@@ -2036,7 +2055,7 @@ void Application::guiWindow()
       m_benchmarkCell    = 0;
     }
     ImGui::SameLine();
-    ImGui::LabelText("Benchmark", "");
+    ImGui::LabelText("Benchmark", " ");
 
     // Plot the benchmark results.
     if (m_benchmarkMode != OFF)
@@ -2253,6 +2272,7 @@ void Application::guiWindow()
   if (m_nrc == 2 && ImGui::CollapsingHeader("BDRC Cache Visualization"))
   {
     ImGui::Text("BDRC Mode");
+    ImGui::Checkbox("Freeze Training", &m_bdrcFreezeTraining);
     ImGui::Text("Phase: %s (training frame %u / warmup %d)",
                 m_bdrcPhase == 0 ? "1-Mask warmup" : "2-Color caches",
                 m_nrcTrainingIteration, m_bdrcWarmup);
@@ -2264,8 +2284,10 @@ void Application::guiWindow()
       "Light cache (cl)",
       "Mask (alpha)",
       "Eye + Light",
+      "Eye Resampled Endpoints",
+      "Light Endpoints"
     };
-    if (ImGui::Combo("BDRC Debug View", &m_bdrcDebugMode, bdrcDebugItems, 5))
+    if (ImGui::Combo("BDRC Debug View", &m_bdrcDebugMode, bdrcDebugItems, 7))
     {
       m_launchParameters.iteration = 0;
       if (m_launchParameters.bufferAccum != nullptr)
@@ -2273,6 +2295,38 @@ void Application::guiWindow()
         const int numPixels = m_launchParameters.resolution.x * m_launchParameters.resolution.y;
         CUDA_CHECK( cudaMemset(reinterpret_cast<void*>(m_launchParameters.bufferAccum), 0, numPixels * sizeof(float4)) );
       }
+    }
+
+    // Show loss for the visualized cache. Eye/light losses are only non-zero in Phase 2.
+    if (m_bdrcDebugMode == 1 || m_bdrcDebugMode == 4)
+    {
+      const float* hist    = m_bdrcEyeLossHistory;
+      float        lossMax = *std::max_element(hist, hist + NRC_LOSS_HISTORY);
+      if (lossMax < 1e-6f) lossMax = 1e-6f;
+      char overlay[32];
+      snprintf(overlay, sizeof(overlay), "%.4f", m_bdrcLastEyeLoss);
+      ImGui::PlotLines("##BdrcEyeLoss", hist, NRC_LOSS_HISTORY, m_bdrcEyeLossHistoryIdx,
+                       overlay, 0.0f, lossMax * 1.1f, ImVec2(0, 40));
+      if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Eye cache (ce) training loss — Phase 2 only");
+      ImGui::Text("Eye loss:   %.4f", m_bdrcLastEyeLoss);
+    }
+    if (m_bdrcDebugMode == 2 || m_bdrcDebugMode == 4)
+    {
+      const float* hist    = m_bdrcLightLossHistory;
+      float        lossMax = *std::max_element(hist, hist + NRC_LOSS_HISTORY);
+      if (lossMax < 1e-6f) lossMax = 1e-6f;
+      char overlay[32];
+      snprintf(overlay, sizeof(overlay), "%.4f", m_bdrcLastLightLoss);
+      ImGui::PlotLines("##BdrcLightLoss", hist, NRC_LOSS_HISTORY, m_bdrcLightLossHistoryIdx,
+                       overlay, 0.0f, lossMax * 1.1f, ImVec2(0, 40));
+      if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Light cache (cl) training loss (avg of Y-target and zero-target passes) — Phase 2 only");
+      ImGui::Text("Light loss: %.4f", m_bdrcLastLightLoss);
+    }
+    if (m_bdrcDebugMode == 3)
+    {
+      ImGui::TextDisabled("Mask uses DRE Brier loss (no scalar readout)");
     }
   }
 
@@ -6953,8 +7007,16 @@ void Application::initLaunchParameters()
   m_launchParameters.lightDefinitions = reinterpret_cast<LightDefinition*>(m_d_lightDefinitions);
   m_launchParameters.numLights        = static_cast<int>(m_lightDefinitions.size());
 
-  m_launchParameters.sceneSphereCenter = make_float3(0.0f); // Updated by updateLaunchParameters() after scene is built.
+  m_launchParameters.sceneSphereCenter = make_float3(0.0f);
   m_launchParameters.sceneSphereRadius = 1.0f;
+
+  if (m_sceneExtent.isValid() && m_nrc > 0)
+  {
+    const glm::vec3 mn = m_sceneExtent.getMin();
+    const glm::vec3 mx = m_sceneExtent.getMax();
+    m_launchParameters.nrc.aabbMin = make_float3(mn.x, mn.y, mn.z);
+    m_launchParameters.nrc.aabbMax = make_float3(mx.x, mx.y, mx.z);
+  }
 
   // All dirty flags are set here and the first render() call will take care to allocate and update all necessary resources.
 }
@@ -6980,6 +7042,7 @@ void Application::updateLaunchParameters()
     {
       const glm::vec3 mn = m_sceneExtent.getMin();
       const glm::vec3 mx = m_sceneExtent.getMax();
+      std::cout << "Scene AABB for NRC normalization: min(" << mn.x << ", " << mn.y << ", " << mn.z << ") max(" << mx.x << ", " << mx.y << ", " << mx.z << ")" << std::endl;
       m_launchParameters.nrc.aabbMin = make_float3(mn.x, mn.y, mn.z);
       m_launchParameters.nrc.aabbMax = make_float3(mx.x, mx.y, mx.z);
     }

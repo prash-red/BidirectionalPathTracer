@@ -133,4 +133,25 @@ extern __host__ void device_bdrc_debug(
     unsigned int        iteration,
     int                 debugMode);
 
+// BDRC debug modes 5 and 6: splat per-pixel endpoint contributions to camera-projected pixels.
+// Unpacks world positions from packed BDRC features, projects through the perspective camera,
+// and atomically adds valueBuffer[i] to bufferAccum at the projected pixel.
+// bufferAccum must be zero-cleared before this call.
+extern __host__ void device_bdrc_splat_endpoints(
+    cudaStream_t        cudaStream,
+    float4*             bufferAccum,
+    const float*        featureBuffer,    // [3 × numPixels] packed BDRC features
+    const float*        valueBuffer,      // [3 × numPixels] RGB values to splat
+    const unsigned int* validBuffer,      // [numPixels]
+    int                 numPixels,
+    float3              aabbMin,
+    float3              aabbRange,        // aabbMax - aabbMin
+    float3              cameraP,
+    float3              cameraU,
+    float3              cameraV,
+    float3              cameraW,
+    int                 resX,
+    int                 resY,
+    int                 iteration);
+
 #endif // HOST_KERNELS_H

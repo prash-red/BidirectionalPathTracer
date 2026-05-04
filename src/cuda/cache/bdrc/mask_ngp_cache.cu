@@ -10,8 +10,8 @@ ngp_config makeMaskConfig()
 {
 	ngp_config cfg;
 	cfg.outputActivation = "Softplus";
-	cfg.useL2Loss = true;
-	cfg.ema.enabled = true;
+	cfg.ema.enabled = false;
+	cfg.lr = 1e-3f;
 	return cfg;
 }
 
@@ -150,7 +150,7 @@ void mask_ngp_cache::dreLossAccumGrad(
 
 	auto ctx = m_network->forward(stream, input, &networkOut, false, false);
 
-	const float lossScale = tcnn::default_loss_scale<tcnn::network_precision_t>();
+	const float lossScale = m_gradScaler.currentScale();
 	const float gradScale = lossScale / (float)(paddedWidth * normBatch);
 	const uint32_t blocks = (batchSize + tcnn::N_THREADS_LINEAR - 1u) / tcnn::N_THREADS_LINEAR;
 	k_dre_brier_grad<<<blocks, tcnn::N_THREADS_LINEAR, 0, stream>>>(
@@ -171,7 +171,14 @@ void mask_ngp_cache::dreLossAccumGrad(
 
 void mask_ngp_cache::optimizerStep(cudaStream_t stream)
 {
-	const float lossScale = tcnn::default_loss_scale<tcnn::network_precision_t>();
+	const float lossScale = m_gradScaler.currentScale();
+	if (m_config.gradScaler) {
+		if (checkGradOverflow(stream)) {
+			m_gradScaler.onOverflow();
+			return;
+		}
+		m_gradScaler.onSuccess();
+	}
 	m_optimizer->step(stream, lossScale, m_paramsFP, m_params, m_paramGrads);
 }
 

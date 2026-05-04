@@ -26,6 +26,9 @@ struct BdrcSystem
     std::unique_ptr<base_ngp_cache>  lightNrc;  // 3-ch, Softplus output, RelativeL2
     std::unique_ptr<mask_ngp_cache>  maskNrc;   // 1-ch, Softplus output, DRE Brier loss
 
+    float m_lastEyeLoss   = 0.0f;
+    float m_lastLightLoss = 0.0f;
+
     // BDRC light-path buffers
     float*        d_lightEndpoints  = nullptr; // [3 × batchSize]
     float*        d_lightTargets    = nullptr; // [3 × batchSize]
@@ -53,7 +56,7 @@ struct BdrcSystem
     float*        d_trainSuffThroughput = nullptr; // [3 × batchSize]
     float*        d_trainThroughputAtK  = nullptr; // [3 × batchSize]
     unsigned int* d_trainNextValid      = nullptr; // [batchSize]
-    float*        d_albedo              = nullptr; // [3 × batchSize] albedo at eye vertices (for training stability analysis)
+    float*        d_albedo              = nullptr; // [3 × batchSize] (optional) albedo at eye vertices for weighted losses
     float*        d_eyeVertexPos        = nullptr; // [3 × batchSize]
     float*        d_eyeVertexNormals    = nullptr; // [3 × batchSize]
     float*        d_eyeVertexThroughput = nullptr; // [3 × batchSize]
@@ -71,7 +74,7 @@ struct BdrcSystem
     unsigned int* d_compactResampledCount        = nullptr; // [1] reset + filled by compaction kernel
     float*        d_compactResampled_p_e_area    = nullptr; // [batchSize]  compacted eye-area PDF at R
     float*        d_compactResampled_throughput  = nullptr; // [batchSize]  compacted eye-vertex throughput luminance
-    float*        d_debugTargetMatrix           = nullptr; // [3 × batchSize] debug visualization target (eye or light color)
+    float*        d_debugTargetMatrix          = nullptr; // [3 × batchsize]
 
     void freeAllBuffers()
     {
@@ -98,7 +101,7 @@ struct BdrcSystem
         cudaFree(d_trainSuffThroughput); d_trainSuffThroughput = nullptr;
         cudaFree(d_trainThroughputAtK);  d_trainThroughputAtK  = nullptr;
         cudaFree(d_trainNextValid);      d_trainNextValid      = nullptr;
-        cudaFree(d_albedo);             d_albedo              = nullptr;
+        cudaFree(d_albedo);              d_albedo              = nullptr;
         cudaFree(d_eyeVertexPos);        d_eyeVertexPos        = nullptr;
         cudaFree(d_eyeVertexNormals);    d_eyeVertexNormals    = nullptr;
         cudaFree(d_eyeVertexThroughput); d_eyeVertexThroughput = nullptr;
@@ -115,6 +118,7 @@ struct BdrcSystem
         cudaFree(d_compactResampledCount);           d_compactResampledCount           = nullptr;
         cudaFree(d_compactResampled_p_e_area);       d_compactResampled_p_e_area       = nullptr;
         cudaFree(d_compactResampled_throughput);     d_compactResampled_throughput     = nullptr;
+        cudaFree(d_debugTargetMatrix);           d_debugTargetMatrix           = nullptr;
     }
 
     ~BdrcSystem() { freeAllBuffers(); }
@@ -132,8 +136,6 @@ BdrcSystem* bdrcCreate(cudaStream_t stream)
     // Loss: L_eye = E_{x~p_e}[||ĉ_e(x) - c_e(x)||²]  (standard L2, Phase 2 only).
     {
         ngp_config cfg;
-        cfg.useL2Loss = true;  // standard L2 per spec
-        cfg.lr = 1e-3f;
         sys->eyeNrc = std::make_unique<base_ngp_cache>(cfg, /*outputDim=*/3, stream);
         sys->eyeNrc->initEma(cfg.ema.decay, cfg.ema.startIter);
     }
@@ -145,7 +147,6 @@ BdrcSystem* bdrcCreate(cudaStream_t stream)
     // Both are standard L2.
     {
         ngp_config cfg;
-        cfg.useL2Loss = true;  // standard L2 per spec
         sys->lightNrc = std::make_unique<base_ngp_cache>(cfg, /*outputDim=*/3, stream);
         sys->lightNrc->initEma(cfg.ema.decay, cfg.ema.startIter);
     }
@@ -155,10 +156,6 @@ BdrcSystem* bdrcCreate(cudaStream_t stream)
     //   = L2 vs label-0 on eye samples  +  L2 vs label-1 on light samples (Phase 1).
     // Softplus output keeps α(x)≥0; the ratio N_l/N_e is 1 (equal batch sizes).
     {
-        ngp_config cfg;
-        cfg.useL2Loss = true;  // standard L2 per spec
-        cfg.lr = 1e-3f;
-        cfg.outputActivation = "softplus";
         sys->maskNrc = std::make_unique<mask_ngp_cache>(stream);
     }
 
@@ -224,8 +221,7 @@ void bdrcAllocBuffers(BdrcSystem* sys, uint32_t batchSize)
     cudaMalloc(reinterpret_cast<void**>(&sys->d_compactResampledCount),                1u       * sizeof(unsigned int));
     cudaMalloc(reinterpret_cast<void**>(&sys->d_compactResampled_p_e_area),    batchSize      * sizeof(float));
     cudaMalloc(reinterpret_cast<void**>(&sys->d_compactResampled_throughput),  batchSize      * sizeof(float));
-    cudaMalloc(reinterpret_cast<void**>(&sys->d_debugTargetMatrix), batchSize * 3u * sizeof(float));
-
+    cudaMalloc(reinterpret_cast<void**>(&sys->d_debugTargetMatrix),          batchSize * 3u * sizeof(float));
 
     // Zero-init valid flags, counters, and zero-target buffers
     cudaMemset(sys->d_lightValid,               0, batchSize * sizeof(unsigned int));
@@ -241,16 +237,20 @@ void bdrcAllocBuffers(BdrcSystem* sys, uint32_t batchSize)
     cudaMemset(sys->d_compactLight_p_e_area,    0, batchSize * sizeof(float));
     cudaMemset(sys->d_compactResampled_p_e_area,0, batchSize * sizeof(float));
 
-    // fill d_debugTargetMatrix to store just red
-    for (uint32_t i = 0; i < batchSize; ++i) {
-        float redValue = 255;
-        float debugColor[3] = { redValue, 0.0f, 0.0f }; // Red channel varies, Green and Blue are zero
-        cudaMemcpy(sys->d_debugTargetMatrix + 3 * i, debugColor, 3 * sizeof(float), cudaMemcpyHostToDevice);
-    }
-
     // Fill d_oneTargets1 with 1.0f
     std::vector<float> ones(batchSize, 1.0f);
     cudaMemcpy(sys->d_oneTargets1, ones.data(), batchSize * sizeof(float), cudaMemcpyHostToDevice);
+
+    // fill debugTargetMatrix with blue values
+    {
+        std::vector<float> blue(batchSize * 3u);
+        for (uint32_t i = 0; i < batchSize; i++) {
+            blue[i * 3 + 0] = 1.0f;
+            blue[i * 3 + 1] = 0.0f;
+            blue[i * 3 + 2] = 0.0f;
+        }
+        cudaMemcpy(sys->d_debugTargetMatrix, blue.data(), batchSize * 3u * sizeof(float), cudaMemcpyHostToDevice);
+    }
 }
 
 // ---- Buffer accessors -------------------------------------------------------
@@ -272,7 +272,7 @@ float*        bdrcTrainSuffixScaled (const BdrcSystem* sys) { return sys->d_trai
 float*        bdrcTrainSuffThroughput(const BdrcSystem* sys){ return sys->d_trainSuffThroughput;  }
 float*        bdrcTrainThroughputAtK(const BdrcSystem* sys) { return sys->d_trainThroughputAtK;   }
 unsigned int* bdrcTrainNextValid    (const BdrcSystem* sys) { return sys->d_trainNextValid;       }
-float*      bdrcAlbedo             (const BdrcSystem* sys) { return sys->d_albedo;               }
+float*        bdrcAlbedo            (const BdrcSystem* sys) { return sys->d_albedo;              }
 float*        bdrcEyeVertexPos      (const BdrcSystem* sys) { return sys->d_eyeVertexPos;         }
 float*        bdrcEyeVertexNormals  (const BdrcSystem* sys) { return sys->d_eyeVertexNormals;     }
 float*        bdrcEyeVertexThroughput(const BdrcSystem* sys){ return sys->d_eyeVertexThroughput;  }
@@ -287,6 +287,9 @@ float*        bdrcCompactLight_p_e_area  (const BdrcSystem* sys) { return sys->d
 float*        bdrcCompactResampledEndpoints(const BdrcSystem* sys){ return sys->d_compactResampledEndpoints; }
 unsigned int* bdrcCompactResampledCount  (const BdrcSystem* sys) { return sys->d_compactResampledCount;      }
 float*        bdrcCompactResampled_p_e_area(const BdrcSystem* sys){ return sys->d_compactResampled_p_e_area; }
+float         bdrcGetLastEyeLoss  (const BdrcSystem* sys) { return sys->m_lastEyeLoss;   }
+float         bdrcGetLastLightLoss(const BdrcSystem* sys) { return sys->m_lastLightLoss; }
+float*        bdrcRenderOutput    (const BdrcSystem* sys) { return sys->d_renderOutput;  }
 
 // ---- Compaction kernels -----------------------------------------------------
 //
@@ -398,8 +401,57 @@ void bdrcDispatch(
     int           bdrcPhase,
     int           debugMode,
     unsigned int* d_trainCount,
-    float*        d_trainFeatures)
+    float*        d_trainFeatures,
+    bool          freezeTraining,
+    float3        aabbMin,
+    float3        aabbMax,
+    float3        cameraP,
+    float3        cameraU,
+    float3        cameraV,
+    float3        cameraW,
+    int           resolutionX,
+    int           resolutionY)
 {
+    // =========================================================================
+    // Debug modes 5 and 6: endpoint-splat visualization.
+    // Skip compaction, training, and inference. Just project endpoints to camera.
+    // =========================================================================
+    if (debugMode == 5 || debugMode == 6)
+    {
+        const float3 aabbRange = make_float3(aabbMax.x - aabbMin.x,
+                                             aabbMax.y - aabbMin.y,
+                                             aabbMax.z - aabbMin.z);
+
+        // // Clear bufferAccum so atomicAdds start from zero each frame.
+        // cudaMemsetAsync(bufferAccum, 0, static_cast<size_t>(numPixels) * sizeof(float4), stream);
+
+        if (debugMode == 5)
+        {
+            // d_renderOutput was written by raygen (chRadiance NEE at R) — splat directly.
+            device_bdrc_splat_endpoints(stream, bufferAccum,
+                sys->d_resampledEndpoints, sys->d_renderOutput, sys->d_resampledValid,
+                numPixels, aabbMin, aabbRange, cameraP, cameraU, cameraV, cameraW,
+                resolutionX, resolutionY, iteration);
+        }
+        else // debugMode == 6
+        {
+            // Splat actual caustic contribution (lightTargets = tp_Y_pre × f_Y→S) at Y.
+            device_bdrc_splat_endpoints(stream, bufferAccum,
+                sys->d_lightEndpoints, sys->d_oneTargets1, sys->d_lightValid,
+                numPixels, aabbMin, aabbRange, cameraP, cameraU, cameraV, cameraW,
+                resolutionX, resolutionY, iteration);
+        }
+
+        // Clear all valid flags and training counter (same as normal dispatch).
+        cudaMemsetAsync(sys->d_renderValid,    0, batchSize * sizeof(unsigned int), stream);
+        cudaMemsetAsync(sys->d_trainNextValid, 0, batchSize * sizeof(unsigned int), stream);
+        cudaMemsetAsync(sys->d_lightValid,     0, batchSize * sizeof(unsigned int), stream);
+        cudaMemsetAsync(sys->d_resampledValid, 0, batchSize * sizeof(unsigned int), stream);
+        cudaMemsetAsync(d_trainCount,          0, sizeof(unsigned int),             stream);
+        cudaStreamSynchronize(stream);
+        return;
+    }
+
     // Compact sparse pixel-indexed light and resampled buffers to dense slot-indexed arrays.
     // Counts are zeroed here so the atomic slots in the kernels start from 0.
     cudaMemsetAsync(sys->d_compactLightCount,     0, sizeof(unsigned int), stream);
@@ -447,6 +499,7 @@ void bdrcDispatch(
         //    lossScale / (paddedWidth * N_eye).  Eye samples are also weighted by
         //    throughput luminance to match Python's eye_throughput_w.
         //    Zero-pad p_e_area tails so padding samples contribute zero gradient.
+        if (!freezeTraining)
         {
             // normCount is N_eye (paddedResampledCount); fall back to N_light if no eye samples.
             const uint32_t normCount = (paddedResampledCount > 0u) ? paddedResampledCount : paddedLightCount;
@@ -461,7 +514,7 @@ void bdrcDispatch(
                                                        tcnn::MatrixLayout::ColumnMajor);
                 sys->maskNrc->dreLossAccumGrad(stream, inputMat,
                                                sys->d_compactResampled_p_e_area, 0,
-                                               normCount,
+                                               paddedResampledCount,
                                                sys->d_compactResampled_throughput,
                                                tcnn::GradientMode::Overwrite);
                 didAccumGrad = true;
@@ -476,7 +529,7 @@ void bdrcDispatch(
                                                        tcnn::MatrixLayout::ColumnMajor);
                 sys->maskNrc->dreLossAccumGrad(stream, inputMat,
                                                sys->d_compactLight_p_e_area, 1,
-                                               normCount,
+                                               paddedLightCount,
                                                sys->d_compactLight_throughput,
                                                didAccumGrad ? tcnn::GradientMode::Accumulate
                                                             : tcnn::GradientMode::Overwrite);
@@ -485,10 +538,10 @@ void bdrcDispatch(
 
             if (didAccumGrad)
                 sys->maskNrc->optimizerStep(stream);
-        }
 
-        // 2. maskNrc EMA update
-        sys->maskNrc->updateEma(stream);
+            // 2. maskNrc EMA update
+            sys->maskNrc->updateEma(stream);
+        }
 
         // 3. Query eyeNrc (EMA) on renderFeatures -> d_renderOutput
         {
@@ -623,7 +676,7 @@ void bdrcDispatch(
         }
 
         // 6. Eye-cache training — compact batch only (paddedTrainCount ≤ batchSize).
-        if (paddedTrainCount > 0)
+        if (!freezeTraining && paddedTrainCount > 0)
         {
             // Zero the padding range in d_trainTargets before building targets so that
             // device_nrc_build_targets (clamped to trainCount) leaves padding as zero.
@@ -654,43 +707,48 @@ void bdrcDispatch(
                 sys->d_trainNextValid,
                 static_cast<int>(trainCount));
 
-            // 6c. Train eyeNrc on compact features + targets
+            // 6c. Train eyeNrc on compact features + targets (pure MC, no bootstrap)
             {
                 tcnn::GPUMatrixDynamic<float> inputMat(d_trainFeatures, 3u, paddedTrainCount,
                                                        tcnn::MatrixLayout::ColumnMajor);
-                tcnn::GPUMatrix<float> targetMat(sys->d_debugTargetMatrix, 3u, paddedTrainCount);
+                tcnn::GPUMatrix<float> targetMat(sys->d_trainTargets, 3u, paddedTrainCount);
                 sys->eyeNrc->trainStep(stream, inputMat, targetMat);
             }
         }
 
         // 7. eyeNrc EMA update
-        sys->eyeNrc->updateEma(stream);
+        if (!freezeTraining)
+            sys->eyeNrc->updateEma(stream);
 
         // 8. Train lightNrc L_light at compact Y positions.
         //    target = tp_Y_pre × f_Y_toward_S  (written by bdrcLightIntegrator).
-        if (paddedLightCount > 0u)
+        sys->m_lastLightLoss = 0.0f;
+        if (!freezeTraining)
         {
-            // Zero-pad the AoS target tail so tcnn sees target=0 for padding slots.
-            if (paddedLightCount > lightCount)
-                cudaMemsetAsync(sys->d_compactLightTargets + 3u * lightCount, 0,
-                                (paddedLightCount - lightCount) * 3u * sizeof(float), stream);
-            tcnn::GPUMatrixDynamic<float> inputMat(sys->d_compactLightEndpoints, 3u, paddedLightCount,
-                                                   tcnn::MatrixLayout::ColumnMajor);
-            tcnn::GPUMatrix<float> targetMat(sys->d_compactLightTargets, 3u, paddedLightCount);
-            sys->lightNrc->trainStep(stream, inputMat, targetMat);
-        }
+            if (paddedLightCount > 0u)
+            {
+                // Zero-pad the AoS target tail so tcnn sees target=0 for padding slots.
+                if (paddedLightCount > lightCount)
+                    cudaMemsetAsync(sys->d_compactLightTargets + 3u * lightCount, 0,
+                                    (paddedLightCount - lightCount) * 3u * sizeof(float), stream);
+                tcnn::GPUMatrixDynamic<float> inputMat(sys->d_compactLightEndpoints, 3u, paddedLightCount,
+                                                       tcnn::MatrixLayout::ColumnMajor);
+                tcnn::GPUMatrix<float> targetMat(sys->d_compactLightTargets, 3u, paddedLightCount);
+                sys->m_lastLightLoss += sys->lightNrc->trainStep(stream, inputMat, targetMat);
+            }
 
-        // 9. Train lightNrc L_zero: compact resampled R with zero targets.
-        if (paddedResampledCount > 0u)
-        {
-            tcnn::GPUMatrixDynamic<float> inputMat(sys->d_compactResampledEndpoints, 3u, paddedResampledCount,
-                                                   tcnn::MatrixLayout::ColumnMajor);
-            tcnn::GPUMatrix<float> targetMat(sys->d_zeroTargets3, 3u, paddedResampledCount);
-            sys->lightNrc->trainStep(stream, inputMat, targetMat);
-        }
+            // 9. Train lightNrc L_zero: compact resampled R with zero targets.
+            if (paddedResampledCount > 0u)
+            {
+                tcnn::GPUMatrixDynamic<float> inputMat(sys->d_compactResampledEndpoints, 3u, paddedResampledCount,
+                                                       tcnn::MatrixLayout::ColumnMajor);
+                tcnn::GPUMatrix<float> targetMat(sys->d_zeroTargets3, 3u, paddedResampledCount);
+                sys->m_lastLightLoss += sys->lightNrc->trainStep(stream, inputMat, targetMat);
+            }
 
-        // 10. lightNrc EMA update
-        sys->lightNrc->updateEma(stream);
+            // 10. lightNrc EMA update
+            sys->lightNrc->updateEma(stream);
+        }
 
         // 11. Clear valid flags and training counter
         cudaMemsetAsync(sys->d_renderValid,    0, batchSize * sizeof(unsigned int), stream);

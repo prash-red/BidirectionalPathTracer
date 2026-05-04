@@ -59,6 +59,7 @@ unsigned int* nrcTrainNextValid     (const NrcSystem* sys);
 unsigned int* nrcTrainCount        (const NrcSystem* sys);
 unsigned int* nrcTrainPixelIndices (const NrcSystem* sys);
 float*        nrcTrainFeatures     (const NrcSystem* sys);
+float*        nrcAlbedo            (const NrcSystem* sys);
 
 // ---- Per-frame diagnostics -----------------------------------------------
 // Call after nrcDispatch() to read the loss and training sample count
