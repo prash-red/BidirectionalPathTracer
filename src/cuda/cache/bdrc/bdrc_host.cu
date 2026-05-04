@@ -478,6 +478,16 @@ void bdrcDispatch(
     cudaMemcpy(&lightCount,     sys->d_compactLightCount,     sizeof(unsigned int), cudaMemcpyDeviceToHost);
     cudaMemcpy(&resampledCount, sys->d_compactResampledCount, sizeof(unsigned int), cudaMemcpyDeviceToHost);
 
+    if (resampledCount > 0 && iteration % 100 == 0) {                                                                                                                                    
+      const uint32_t n = std::min(resampledCount, 4u);                                                                                                                                   
+      std::vector<float> tmp(n);                                                                                                                                                         
+      cudaMemcpy(tmp.data(), sys->d_compactResampled_p_e_area,                                                                                                                           
+                 n * sizeof(float), cudaMemcpyDeviceToHost);                                                                                                                             
+      printf("[mask-dbg] resampled p_e_area[0..%u]:", n);                                                                                                                              
+      for (auto v : tmp) printf(" %.3e", v);                                                                                                                                             
+      printf("\n");                                                                                                                                                                    
+    }     
+
     constexpr uint32_t GRAN = 256u;
     const auto padTo256 = [](uint32_t n) -> uint32_t {
         return n > 0u ? (n + GRAN - 1u) / GRAN * GRAN : 0u;
@@ -501,12 +511,17 @@ void bdrcDispatch(
         //    Zero-pad p_e_area tails so padding samples contribute zero gradient.
         if (!freezeTraining)
         {
+            if (iteration % 100 == 0)                                                                                                                                                                  
+                printf("[bdrc] iter=%u phase=%d freeze=%d resampled=%u light=%u train=%u\n",
+                    iteration, bdrcPhase, (int)freezeTraining, resampledCount, lightCount, trainCount);
+
             // normCount is N_eye (paddedResampledCount); fall back to N_light if no eye samples.
             const uint32_t normCount = (paddedResampledCount > 0u) ? paddedResampledCount : paddedLightCount;
             bool didAccumGrad = false;
 
             if (paddedResampledCount > 0u)
             {
+                printf("[bdrc] mask - eye samples: count=%u padded=%u\n", resampledCount, paddedResampledCount);
                 if (paddedResampledCount > resampledCount)
                     cudaMemsetAsync(sys->d_compactResampled_p_e_area + resampledCount, 0,
                                     (paddedResampledCount - resampledCount) * sizeof(float), stream);
@@ -522,6 +537,8 @@ void bdrcDispatch(
 
             if (paddedLightCount > 0u)
             {
+                printf("[bdrc] mask - light samples: count=%u padded=%u\n", lightCount, paddedLightCount);
+
                 if (paddedLightCount > lightCount)
                     cudaMemsetAsync(sys->d_compactLight_p_e_area + lightCount, 0,
                                     (paddedLightCount - lightCount) * sizeof(float), stream);

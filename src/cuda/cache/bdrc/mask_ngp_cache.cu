@@ -11,7 +11,7 @@ ngp_config makeMaskConfig()
 	ngp_config cfg;
 	cfg.outputActivation = "Softplus";
 	cfg.ema.enabled = false;
-	cfg.lr = 1e-3f;
+	cfg.lr = 1e-5f;
 	return cfg;
 }
 
@@ -167,6 +167,16 @@ void mask_ngp_cache::dreLossAccumGrad(
 	m_network->backward(
 	    stream, *ctx, input, networkOut, dLdOutput,
 	    nullptr, false, gradMode);
+
+	if (gradMode == tcnn::GradientMode::Accumulate || gradMode == tcnn::GradientMode::Overwrite) {                                                                                         
+      const uint32_t np = m_network->n_params();                                                                                                                                         
+      // Sum of squares of half-precision grads                                                                                                                                          
+      cudaStreamSynchronize(stream);                                                                                                                                                     
+      // simple check: just read first param grad                                                                                                                                        
+      tcnn::network_precision_t g0;                                                                                                                                                      
+      cudaMemcpy(&g0, m_paramGrads, sizeof(g0), cudaMemcpyDeviceToHost);                                                                                                                 
+      printf("[mask-dbg] paramGrads[0] = %.4e (label=%d)\n", (float)g0, label);                                                                                                          
+  	}
 }
 
 void mask_ngp_cache::optimizerStep(cudaStream_t stream)
@@ -174,6 +184,7 @@ void mask_ngp_cache::optimizerStep(cudaStream_t stream)
 	const float lossScale = m_gradScaler.currentScale();
 	if (m_config.gradScaler) {
 		if (checkGradOverflow(stream)) {
+			printf("[mask-dbg] grad OVERFLOW — step skipped\n");
 			m_gradScaler.onOverflow();
 			return;
 		}
