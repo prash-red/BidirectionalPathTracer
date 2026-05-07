@@ -201,13 +201,14 @@ __forceinline__ __device__ void updateNrcSpreadState(const PerRayData& prd, cons
 __forceinline__ __device__ bool handleBdrcCacheLogic(
     PerRayData& prd,
     const uint2 theLaunchIndex,
-    uint2 payload)
+    uint2 payload,
+    const float3 radianceBeforeD)
 {
 
   const unsigned int pixelIdx = theLaunchParameters.resolution.x * theLaunchIndex.y + theLaunchIndex.x;
   const NrcLaunchBuffers& nrc = theLaunchParameters.nrc;
 
-  const float3 tpK1 = prd.throughput;
+  const float3 tpK1 = prd.throughputPreBsdf;
 
   // In eye-cache debug mode the render buffers were already captured at the first-hit
   // vertex (depth=0) by handleBdrcDebugFirstHit, so don't overwrite them here.
@@ -217,10 +218,9 @@ __forceinline__ __device__ bool handleBdrcCacheLogic(
     nrc.renderThroughput[3 * pixelIdx + 1] = tpK1.y;
     nrc.renderThroughput[3 * pixelIdx + 2] = tpK1.z;
 
-    const float3 prefix = prd.radiance;
-    nrc.renderPrefix[3 * pixelIdx + 0] = prefix.x;
-    nrc.renderPrefix[3 * pixelIdx + 1] = prefix.y;
-    nrc.renderPrefix[3 * pixelIdx + 2] = prefix.z;
+    nrc.renderPrefix[3 * pixelIdx + 0] = radianceBeforeD.x;
+    nrc.renderPrefix[3 * pixelIdx + 1] = radianceBeforeD.y;
+    nrc.renderPrefix[3 * pixelIdx + 2] = radianceBeforeD.z;
 
     nrc.renderValid[pixelIdx] = 1u;
     bdrcPackFeatures(nrc.renderFeatures, pixelIdx, prd.pos, nrc.aabbMin, nrc.aabbMax);
@@ -248,8 +248,8 @@ __forceinline__ __device__ bool handleBdrcCacheLogic(
     nrc.trainThroughputAtK[3 * slot + 0] = tpK1.x;
     nrc.trainThroughputAtK[3 * slot + 1] = tpK1.y;
     nrc.trainThroughputAtK[3 * slot + 2] = tpK1.z;
-
-    const float3 radianceBefore = prd.radiance;
+  
+    const float3 radianceBefore = radianceBeforeD;
 
     for (int s = 0; s < theLaunchParameters.pathLengths.y; ++s)
     {
@@ -480,6 +480,8 @@ __forceinline__ __device__ float3 integrator(PerRayData& prd, const uint2 theLau
   //prd.walk          = 0;               // Number of random walk steps taken through volume scattering.
   prd.typeEvent     = BSDF_EVENT_ABSORB; // Initialize for exit. (Otherwise miss programs do not work.)
   prd.nrcTerminated = false;
+  prd.eyePathFoundDiffuse    = false;
+  prd.eyePathInSpecularChain = false;
 
   // NRC area-spread tracking (Mueller et al. 2021, Section 3.4).
   // All local to the integrator; no need to store in PRD.
@@ -513,6 +515,8 @@ __forceinline__ __device__ float3 integrator(PerRayData& prd, const uint2 theLau
     prd.wo       = -prd.wi;        // Direction to observer.
     prd.distance = RT_DEFAULT_MAX; // Shoot the next ray with maximum length.
     prd.flags    = 0;
+
+    const float3 radianceBeforeTrace = prd.radiance;
 
     {
       // FIXME Not implementing volume scattering.
@@ -586,7 +590,7 @@ __forceinline__ __device__ float3 integrator(PerRayData& prd, const uint2 theLau
         break;
     }
 
-    // BDRC: terminate at first diffuse/glossy vertex (specular-skip)
+    // BDRC: terminate at first diffuse vertex (specular-skip)
     if (theLaunchParameters.nrc.enabled && theLaunchParameters.nrc.nrcType == BDRC && (prd.flags & FLAG_HIT) && (prd.typeEvent & (BSDF_EVENT_DIFFUSE)))
     {
       const unsigned int px = theLaunchParameters.resolution.x * theLaunchIndex.y + theLaunchIndex.x;
@@ -625,6 +629,8 @@ __forceinline__ __device__ float3 integrator(PerRayData& prd, const uint2 theLau
         probePrd.radiance   = make_float3(0.0f);
         probePrd.occlusion  = 1.0f;
         probePrd.sigma_t    = make_float3(0.0f);
+        probePrd.eyePathFoundDiffuse    = false;
+        probePrd.eyePathInSpecularChain = false;
 
         uint2 probePay = splitPointer(&probePrd);
         optixTrace(theLaunchParameters.handle,
@@ -717,7 +723,7 @@ __forceinline__ __device__ float3 integrator(PerRayData& prd, const uint2 theLau
         }
       }
 
-      if (handleBdrcCacheLogic(prd, theLaunchIndex, payload))
+      if (handleBdrcCacheLogic(prd, theLaunchIndex, payload, radianceBeforeTrace))
       {
         break;
       }
@@ -1049,6 +1055,8 @@ __forceinline__ __device__ void bdrcLightIntegrator(PerRayData& prd, const uint2
   prd.sigma_t   = make_float3(0.0f);
   prd.typeEvent = BSDF_EVENT_ABSORB;
   prd.flags     = 0; // No FLAG_LIGHT_PATH: disables camera connections in hit.cu
+  prd.eyePathFoundDiffuse    = false;
+  prd.eyePathInSpecularChain = false;
 
   // Initialize IOR material stack to vacuum — required for correct glass refraction.
   prd.idxStack = 0;

@@ -28,6 +28,7 @@ struct ngp_config
     float       mlpLrScale      = 1.0f;
     std::string hiddenActivation = "ReLu";
     std::string outputActivation = "Softplus";
+    std::string loss             = "L2";
 
     // Optimizer settings.
     std::string optimizer   = "adam"; // "sgd" or "adam"
@@ -100,7 +101,13 @@ struct ngp_config
 
     nlohmann::json toLossJson() const
     {
-        return {{"otype", "L2"}};
+        if (loss == "L2") {
+            return {{"otype", "L2"}};
+        }
+        if (loss == "RelativeL2Luminance") {
+            return {{"otype", "RelativeL2Luminance"}};
+        }
+        throw std::invalid_argument("NGPConfig.loss must be 'L2' or 'RelativeL2Luminance'");
     }
 
     nlohmann::json toOptimizerJson() const

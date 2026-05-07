@@ -1513,38 +1513,48 @@ __forceinline__ __device__ void chRadiance()
     thePrd->nrcSpecColor = state.specularColor;
   }
 
+  // Suppress diffuse→specular→light contributions so the eye cache does not double-count
+  // caustic paths that are already captured by the light cache (light→specular→diffuse).
+  const bool validForEyeCache = !(theLaunchParameters.nrc.enabled
+                                  && theLaunchParameters.nrc.nrcType == BDRC
+                                  && thePrd->eyePathFoundDiffuse
+                                  && thePrd->eyePathInSpecularChain);
+
   // FIXME Implement arbitrary mesh lights. This only handles geometry emission on implicit hits.
   // Unfortunately many emission textures in glTF models are applied to the whole models 
   // with only little emissive regions and the rest of the texture being black.
   // That would need a pre-process emissive texture integration over the geometry to identify
   // which triangles are emissive at all and only put these into the light definitions
   // for explicit mesh light sampling.
-  // 
+  //
   // This implements a diffuse EDF for implicit light hits.
   // (I disagree with the KHR_materials_clearcoat extension.)
   //
 
-  // Basic Implementation of area mesh lights
-  if (thePrd->pdf > 0.0f
-      && hitGroupData->lightDefinitionIndex >= 0
-      && theLaunchParameters.directLighting
-      && 0 < theLaunchParameters.numLights)
+  if (validForEyeCache)
   {
-    const LightDefinition& meshLight =
-        theLaunchParameters.lightDefinitions[hitGroupData->lightDefinitionIndex];
-    const float3 rayDir = optixGetWorldRayDirection();
-    const float  dist   = optixGetRayTmax();
-    const float  cosL   = dot(-normalize(rayDir), state.Ng);
-    if (cosL > 0.0f)
+    // Basic Implementation of area mesh lights
+    if (thePrd->pdf > 0.0f
+        && hitGroupData->lightDefinitionIndex >= 0
+        && theLaunchParameters.directLighting
+        && 0 < theLaunchParameters.numLights)
     {
-      const float lightPdf = (dist * dist) / (cosL * meshLight.area);
-      const float weight   = balanceHeuristic(thePrd->pdf, lightPdf);
-      thePrd->radiance += throughput * state.emission * weight;
+      const LightDefinition& meshLight =
+          theLaunchParameters.lightDefinitions[hitGroupData->lightDefinitionIndex];
+      const float3 rayDir = optixGetWorldRayDirection();
+      const float  dist   = optixGetRayTmax();
+      const float  cosL   = dot(-normalize(rayDir), state.Ng);
+      if (cosL > 0.0f)
+      {
+        const float lightPdf = (dist * dist) / (cosL * meshLight.area);
+        const float weight   = balanceHeuristic(thePrd->pdf, lightPdf);
+        thePrd->radiance += throughput * state.emission * weight;
+      }
     }
-  }
-  else
-  {
-    thePrd->radiance += throughput * state.emission;
+    else
+    {
+      thePrd->radiance += throughput * state.emission;
+    }
   }
 
   // Start fresh with the next BSDF sample.
@@ -1686,6 +1696,13 @@ __forceinline__ __device__ void chRadiance()
   thePrd->throughput       *= state.bsdf_over_pdf; // Adjust the path throughput for all following incident lighting.
   thePrd->pdf         = state.pdf;           // Note that specular events in MDL return pdf == 0.0f! (=> Not a path termination condition.)
   thePrd->typeEvent   = state.typeEvent;     // If this is BSDF_EVENT_ABSORB, the path ends inside the integrator and the radiance is returned.
+
+  // Update BDRC caustic-suppression state (mirrors Python bdpt.py lines 691/696).
+  if (theLaunchParameters.nrc.enabled && theLaunchParameters.nrc.nrcType == BDRC)
+  {
+    thePrd->eyePathFoundDiffuse    = thePrd->eyePathFoundDiffuse | ((state.typeEvent & BSDF_EVENT_DIFFUSE) != 0);
+    thePrd->eyePathInSpecularChain = (state.typeEvent & (BSDF_EVENT_SPECULAR | BSDF_EVENT_GLOSSY)) != 0;
+  }
 
   // End of BXDF sampling
 
@@ -1829,7 +1846,7 @@ __forceinline__ __device__ void chRadiance()
   // No need to to check the thePrd->eventType to see if it's diffuse oor glossy which can handle direct lighting.
   const int numLights = theLaunchParameters.numLights;
 
-  if (!theLaunchParameters.directLighting || numLights <= 0)
+  if (!theLaunchParameters.directLighting || numLights <= 0 || !validForEyeCache)
   {
     return;
   }
@@ -1912,7 +1929,7 @@ __forceinline__ __device__ void chRadiance()
     // Only do multiple-importance sampling for area lights, not singular lights.
     const float weightMIS = (light.typeLight <= TYPE_LIGHT_ENV_SPHERE ||
                              light.typeLight == TYPE_LIGHT_MESH)
-                            ? balanceHeuristic(lightSample.pdf, pdf) : 1.0f;
+                            ? balanceHeuristic(lightSample.pdf / float(numLights), pdf) : 1.0f;
 
     // The sampled emission needs to be scaled by the inverse probability to have selected this light,
     // Selecting one of many lights means the inverse of 1.0f / numLights.

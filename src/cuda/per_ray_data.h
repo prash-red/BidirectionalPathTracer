@@ -148,6 +148,12 @@ struct PerRayData
   // Set by integrator() when this pixel's path was NRC-terminated.
   // The raygen skips writing bufferAccum; the host-side accumulate kernel handles it.
   bool nrcTerminated;
+
+  // BDRC eye-cache caustic suppression.
+  // Suppresses diffuse→specular→light contributions in the eye path so they are not
+  // double-counted with the light cache's light→specular→diffuse caustic paths.
+  bool eyePathFoundDiffuse;    // latches True once any diffuse vertex is hit
+  bool eyePathInSpecularChain; // True if the previous BSDF bounce was specular
 };
 
 

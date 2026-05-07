@@ -136,6 +136,7 @@ BdrcSystem* bdrcCreate(cudaStream_t stream)
     // Loss: L_eye = E_{x~p_e}[||ĉ_e(x) - c_e(x)||²]  (standard L2, Phase 2 only).
     {
         ngp_config cfg;
+        cfg.loss = "RelativeL2Luminance";
         sys->eyeNrc = std::make_unique<base_ngp_cache>(cfg, /*outputDim=*/3, stream);
         sys->eyeNrc->initEma(cfg.ema.decay, cfg.ema.startIter);
     }
@@ -147,6 +148,7 @@ BdrcSystem* bdrcCreate(cudaStream_t stream)
     // Both are standard L2.
     {
         ngp_config cfg;
+        cfg.loss = "RelativeL2Luminance";
         sys->lightNrc = std::make_unique<base_ngp_cache>(cfg, /*outputDim=*/3, stream);
         sys->lightNrc->initEma(cfg.ema.decay, cfg.ema.startIter);
     }
@@ -478,6 +480,9 @@ void bdrcDispatch(
     cudaMemcpy(&lightCount,     sys->d_compactLightCount,     sizeof(unsigned int), cudaMemcpyDeviceToHost);
     cudaMemcpy(&resampledCount, sys->d_compactResampledCount, sizeof(unsigned int), cudaMemcpyDeviceToHost);
 
+    // printf("[bdrc] iter=%u resampled=%u light=%u train=%u\n",
+    //        iteration, resampledCount, lightCount, trainCount);
+
     if (resampledCount > 0 && iteration % 100 == 0) {                                                                                                                                    
       const uint32_t n = std::min(resampledCount, 4u);                                                                                                                                   
       std::vector<float> tmp(n);                                                                                                                                                         
@@ -530,7 +535,7 @@ void bdrcDispatch(
                 sys->maskNrc->dreLossAccumGrad(stream, inputMat,
                                                sys->d_compactResampled_p_e_area, 0,
                                                paddedResampledCount,
-                                               sys->d_compactResampled_throughput,
+                                               nullptr,
                                                tcnn::GradientMode::Overwrite);
                 didAccumGrad = true;
             }

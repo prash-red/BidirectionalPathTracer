@@ -11,7 +11,7 @@ ngp_config makeMaskConfig()
 	ngp_config cfg;
 	cfg.outputActivation = "Softplus";
 	cfg.ema.enabled = false;
-	cfg.lr = 1e-5f;
+	cfg.lr = 5e-4f;
 	return cfg;
 }
 
