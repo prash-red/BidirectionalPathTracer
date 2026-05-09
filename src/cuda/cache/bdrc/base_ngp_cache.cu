@@ -12,6 +12,72 @@
 #include <cstdio>
 #include <stdexcept>
 
+// ---- Gradient clipping (global L2 norm) ------------------------------------
+
+// Block-level sum of squares of half-precision grads; each block atomicAdds its
+// partial sum into d_result.  Uses a grid-stride loop so any grid size works.
+static __global__ void k_grad_norm_sq(
+    const tcnn::network_precision_t* __restrict__ grads,
+    uint32_t n,
+    float* __restrict__ d_result)
+{
+    __shared__ float sdata[tcnn::N_THREADS_LINEAR];
+    const uint32_t tid = threadIdx.x;
+
+    float s = 0.0f;
+    for (uint32_t i = blockIdx.x * blockDim.x + tid; i < n; i += gridDim.x * blockDim.x) {
+        const float g = (float)grads[i];
+        s += g * g;
+    }
+    sdata[tid] = s;
+    __syncthreads();
+
+    for (uint32_t stride = blockDim.x >> 1; stride > 0u; stride >>= 1) {
+        if (tid < stride) sdata[tid] += sdata[tid + stride];
+        __syncthreads();
+    }
+
+    if (tid == 0) atomicAdd(d_result, sdata[0]);
+}
+
+static __global__ void k_scale_grads(
+    tcnn::network_precision_t* __restrict__ grads,
+    uint32_t n,
+    float scale)
+{
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    grads[i] = (tcnn::network_precision_t)((float)grads[i] * scale);
+}
+
+void base_ngp_cache::clipGradNorm(cudaStream_t stream, float maxNorm)
+{
+    const uint32_t n = static_cast<uint32_t>(m_network->n_params());
+    if (n == 0) return;
+
+    float* d_normSq = nullptr;
+    CUDA_CHECK_THROW(cudaMalloc(&d_normSq, sizeof(float)));
+    CUDA_CHECK_THROW(cudaMemsetAsync(d_normSq, 0, sizeof(float), stream));
+
+    // Cap to 1024 blocks; grid-stride loop in k_grad_norm_sq handles the rest.
+    const uint32_t numBlocks = std::min(tcnn::n_blocks_linear(n), 1024u);
+    k_grad_norm_sq<<<numBlocks, tcnn::N_THREADS_LINEAR, 0, stream>>>(m_paramGrads, n, d_normSq);
+    CUDA_CHECK_THROW(cudaGetLastError());
+
+    float h_normSq = 0.0f;
+    CUDA_CHECK_THROW(cudaMemcpyAsync(&h_normSq, d_normSq, sizeof(float), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK_THROW(cudaStreamSynchronize(stream));
+    cudaFree(d_normSq);
+
+    const float norm = sqrtf(h_normSq);
+    if (norm > maxNorm) {
+        const float scale = maxNorm / norm;
+        k_scale_grads<<<tcnn::n_blocks_linear(n), tcnn::N_THREADS_LINEAR, 0, stream>>>(
+            m_paramGrads, n, scale);
+        CUDA_CHECK_THROW(cudaGetLastError());
+    }
+}
+
 // ---- Gradient overflow detection -------------------------------------------
 
 static __global__ void k_check_grad_overflow(
@@ -127,7 +193,8 @@ void base_ngp_cache::query(
 float base_ngp_cache::trainStep(
 	cudaStream_t stream,
 	const tcnn::GPUMatrixDynamic<float>& input,
-	const tcnn::GPUMatrix<float>& target) {
+	const tcnn::GPUMatrix<float>& target,	
+	tcnn::GradientMode gradMode) {
 	if (static_cast<int>(input.m()) != m_config.inputDim) {
 		throw std::runtime_error("BaseNGPCache::trainStep: input row count != inputDim");
 	}
@@ -162,16 +229,20 @@ float base_ngp_cache::trainStep(
 		dLdOutput,
 		nullptr,
 		false,
-		tcnn::GradientMode::Overwrite);
+		gradMode);
 
 	if (m_config.gradScaler) {
 		if (checkGradOverflow(stream)) {
 			m_gradScaler.onOverflow();
 		} else {
 			m_gradScaler.onSuccess();
+			if (m_config.gradClip > 0.0f)
+				clipGradNorm(stream, m_config.gradClip * lossScale);
 			m_optimizer->step(stream, lossScale, m_paramsFP, m_params, m_paramGrads);
 		}
 	} else {
+		if (m_config.gradClip > 0.0f)
+			clipGradNorm(stream, m_config.gradClip * lossScale);
 		m_optimizer->step(stream, lossScale, m_paramsFP, m_params, m_paramGrads);
 	}
 

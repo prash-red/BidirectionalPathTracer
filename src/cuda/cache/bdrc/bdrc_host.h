@@ -53,6 +53,7 @@ unsigned int* bdrcCompactResampledCount  (const BdrcSystem* sys);
 float*        bdrcCompactResampled_p_e_area(const BdrcSystem* sys);
 float         bdrcGetLastEyeLoss  (const BdrcSystem* sys);
 float         bdrcGetLastLightLoss(const BdrcSystem* sys);
+float         bdrcGetLastMaskLoss (const BdrcSystem* sys);
 float*        bdrcRenderOutput    (const BdrcSystem* sys);
 
 // Per-frame dispatch. Call after both eye and light raygen launches complete.

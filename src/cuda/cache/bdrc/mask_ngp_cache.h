@@ -8,11 +8,6 @@ class mask_ngp_cache : public base_ngp_cache
 public:
     explicit mask_ngp_cache(cudaStream_t stream = nullptr);
 
-    float trainStep(
-        cudaStream_t                         stream,
-        const tcnn::GPUMatrixDynamic<float>& input,
-        const tcnn::GPUMatrix<float>&        target) override;
-
     // Brier-score DRE loss with correct p_e_area in the denominator.
     //
     // Trains p_l_area(x) directly:
@@ -30,14 +25,16 @@ public:
 
     // Accumulate DRE gradients without taking an optimizer step.
     //
-    // normBatch: gradient normalizer — use paddedResampledCount for BOTH eye and light
-    //   passes so the light term is implicitly balanced by (n_light/n_eye) as in Python.
+    // normBatch: gradient normalizer — use n_eye (resolutionX*resolutionY) for BOTH eye
+    //   and light passes so the composite loss total = (sum_eye + sum_light) / n_eye
+    //   matches Python: eye_loss + (n_light/n_eye) * light_loss.
     // d_throughputWeights: [batchSize] per-sample eye-vertex throughput luminance; nullptr = uniform 1.0.
     //   Pass for both eye (label=0) and light (label=1) passes to match Python's throughput weighting.
     // gradMode: GradientMode::Overwrite for first pass, Accumulate for subsequent passes.
     //
+    // Returns the sum of per-sample throughput-weighted Brier loss values for this batch.
     // Call optimizerStep() once after all dreLossAccumGrad() calls for the frame.
-    void dreLossAccumGrad(
+    float dreLossAccumGrad(
         cudaStream_t                         stream,
         const tcnn::GPUMatrixDynamic<float>& input,
         const float*                         d_p_e_area,

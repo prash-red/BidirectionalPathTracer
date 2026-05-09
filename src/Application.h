@@ -673,10 +673,13 @@ private:
 
   float        m_bdrcLastEyeLoss   = 0.0f;
   float        m_bdrcLastLightLoss = 0.0f;
+  float        m_bdrcLastMaskLoss  = 0.0f;
   float        m_bdrcEyeLossHistory  [NRC_LOSS_HISTORY] = {};
   float        m_bdrcLightLossHistory[NRC_LOSS_HISTORY] = {};
+  float        m_bdrcMaskLossHistory [NRC_LOSS_HISTORY] = {};
   int          m_bdrcEyeLossHistoryIdx   = 0;
   int          m_bdrcLightLossHistoryIdx = 0;
+  int          m_bdrcMaskLossHistoryIdx  = 0;
 };
 
 #endif // APPLICATION_H

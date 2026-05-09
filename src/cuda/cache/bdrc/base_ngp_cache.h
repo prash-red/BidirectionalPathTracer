@@ -68,7 +68,8 @@ public:
     virtual float trainStep(
         cudaStream_t                          stream,
         const tcnn::GPUMatrixDynamic<float>&  input,
-        const tcnn::GPUMatrix<float>&         target);
+        const tcnn::GPUMatrix<float>&         target,
+        tcnn::GradientMode              gradMode = tcnn::GradientMode::Overwrite);
 
     // -------------------------------------------------------------------------
     // setLearningRate — mirrors bdrc BaseCache.set_learning_rate(factor)
@@ -143,6 +144,11 @@ protected:
     // Returns true if any gradient in m_paramGrads is non-finite; syncs the stream.
     // Only call this when m_config.gradScaler is true.
     bool checkGradOverflow(cudaStream_t stream);
+
+    // Clips m_paramGrads in-place so their global L2 norm does not exceed maxNorm.
+    // maxNorm should be gradClip * lossScale since the stored grads are loss-scaled.
+    // No-op if maxNorm <= 0.  Syncs the stream to read the norm back to the host.
+    void clipGradNorm(cudaStream_t stream, float maxNorm);
 };
 
 

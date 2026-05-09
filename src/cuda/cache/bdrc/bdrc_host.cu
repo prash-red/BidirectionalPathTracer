@@ -28,6 +28,7 @@ struct BdrcSystem
 
     float m_lastEyeLoss   = 0.0f;
     float m_lastLightLoss = 0.0f;
+    float m_lastMaskLoss  = 0.0f;
 
     // BDRC light-path buffers
     float*        d_lightEndpoints  = nullptr; // [3 × batchSize]
@@ -133,22 +134,26 @@ BdrcSystem* bdrcCreate(cudaStream_t stream)
     auto* sys = new BdrcSystem();
 
     // Eye color cache — learns ĉ_e(x) ≈ L_eye(x).
-    // Loss: L_eye = E_{x~p_e}[||ĉ_e(x) - c_e(x)||²]  (standard L2, Phase 2 only).
+    // Loss: L_eye = E_{x~p_e}[||ĉ_e(x) - c_e(x)||²].
     {
         ngp_config cfg;
         cfg.loss = "RelativeL2Luminance";
+        cfg.gradClip = 0.005;
+        cfg.lr = 1e-3f;
         sys->eyeNrc = std::make_unique<base_ngp_cache>(cfg, /*outputDim=*/3, stream);
         sys->eyeNrc->initEma(cfg.ema.decay, cfg.ema.startIter);
     }
 
-    // Light color cache — learns ĉ_l(x) ≈ p_{l,area}(x)·c_l(x).
+    // Light color cache — learns ĉ_l(x)
     // Two loss terms applied in Phase 2:
-    //   L_light = E_{x~p_l}[||ĉ_l(x) - c_l(x)·(p_{e,area}+p_{l,area})||²]   (on light samples)
+    //   L_light = E_{x~p_l}[||ĉ_l(x) - c_l(x)||²]   (on light samples)
     //   L_zero  = E_{x~p_e}[||ĉ_l(x)||²]                                      (zero supervision at eye positions)
     // Both are standard L2.
     {
         ngp_config cfg;
         cfg.loss = "RelativeL2Luminance";
+        cfg.gradClip = 0.005;
+        cfg.lr = 1e-4 ;
         sys->lightNrc = std::make_unique<base_ngp_cache>(cfg, /*outputDim=*/3, stream);
         sys->lightNrc->initEma(cfg.ema.decay, cfg.ema.startIter);
     }
@@ -291,6 +296,7 @@ unsigned int* bdrcCompactResampledCount  (const BdrcSystem* sys) { return sys->d
 float*        bdrcCompactResampled_p_e_area(const BdrcSystem* sys){ return sys->d_compactResampled_p_e_area; }
 float         bdrcGetLastEyeLoss  (const BdrcSystem* sys) { return sys->m_lastEyeLoss;   }
 float         bdrcGetLastLightLoss(const BdrcSystem* sys) { return sys->m_lastLightLoss; }
+float         bdrcGetLastMaskLoss (const BdrcSystem* sys) { return sys->m_lastMaskLoss;  }
 float*        bdrcRenderOutput    (const BdrcSystem* sys) { return sys->d_renderOutput;  }
 
 // ---- Compaction kernels -----------------------------------------------------
@@ -520,38 +526,38 @@ void bdrcDispatch(
                 printf("[bdrc] iter=%u phase=%d freeze=%d resampled=%u light=%u train=%u\n",
                     iteration, bdrcPhase, (int)freezeTraining, resampledCount, lightCount, trainCount);
 
-            // normCount is N_eye (paddedResampledCount); fall back to N_light if no eye samples.
-            const uint32_t normCount = (paddedResampledCount > 0u) ? paddedResampledCount : paddedLightCount;
+            // Both eye and light passes use normBatch = n_eye so the composite loss is
+            //   total = (sum_eye_terms + sum_light_terms) / n_eye
+            const uint32_t normCount = (uint32_t)(resolutionX * resolutionY);
             bool didAccumGrad = false;
+            float eyeLossSum   = 0.0f;
+            float lightLossSum = 0.0f;
 
             if (paddedResampledCount > 0u)
             {
-                printf("[bdrc] mask - eye samples: count=%u padded=%u\n", resampledCount, paddedResampledCount);
                 if (paddedResampledCount > resampledCount)
                     cudaMemsetAsync(sys->d_compactResampled_p_e_area + resampledCount, 0,
                                     (paddedResampledCount - resampledCount) * sizeof(float), stream);
                 tcnn::GPUMatrixDynamic<float> inputMat(sys->d_compactResampledEndpoints, 3u, paddedResampledCount,
                                                        tcnn::MatrixLayout::ColumnMajor);
-                sys->maskNrc->dreLossAccumGrad(stream, inputMat,
+                eyeLossSum = sys->maskNrc->dreLossAccumGrad(stream, inputMat,
                                                sys->d_compactResampled_p_e_area, 0,
-                                               paddedResampledCount,
-                                               nullptr,
+                                               normCount,
+                                               sys->d_compactResampled_throughput,
                                                tcnn::GradientMode::Overwrite);
                 didAccumGrad = true;
             }
 
             if (paddedLightCount > 0u)
             {
-                printf("[bdrc] mask - light samples: count=%u padded=%u\n", lightCount, paddedLightCount);
-
                 if (paddedLightCount > lightCount)
                     cudaMemsetAsync(sys->d_compactLight_p_e_area + lightCount, 0,
                                     (paddedLightCount - lightCount) * sizeof(float), stream);
                 tcnn::GPUMatrixDynamic<float> inputMat(sys->d_compactLightEndpoints, 3u, paddedLightCount,
                                                        tcnn::MatrixLayout::ColumnMajor);
-                sys->maskNrc->dreLossAccumGrad(stream, inputMat,
+                lightLossSum = sys->maskNrc->dreLossAccumGrad(stream, inputMat,
                                                sys->d_compactLight_p_e_area, 1,
-                                               paddedLightCount,
+                                               normCount / 100,
                                                sys->d_compactLight_throughput,
                                                didAccumGrad ? tcnn::GradientMode::Accumulate
                                                             : tcnn::GradientMode::Overwrite);
@@ -559,7 +565,10 @@ void bdrcDispatch(
             }
 
             if (didAccumGrad)
+            {
                 sys->maskNrc->optimizerStep(stream);
+                sys->m_lastMaskLoss = (eyeLossSum + lightLossSum) / (float)normCount;
+            }
 
             // 2. maskNrc EMA update
             sys->maskNrc->updateEma(stream);
@@ -756,7 +765,7 @@ void bdrcDispatch(
                 tcnn::GPUMatrixDynamic<float> inputMat(sys->d_compactLightEndpoints, 3u, paddedLightCount,
                                                        tcnn::MatrixLayout::ColumnMajor);
                 tcnn::GPUMatrix<float> targetMat(sys->d_compactLightTargets, 3u, paddedLightCount);
-                sys->m_lastLightLoss += sys->lightNrc->trainStep(stream, inputMat, targetMat);
+                sys->m_lastLightLoss += sys->lightNrc->trainStep(stream, inputMat, targetMat, tcnn::GradientMode::Accumulate);
             }
 
             // 9. Train lightNrc L_zero: compact resampled R with zero targets.
@@ -768,7 +777,7 @@ void bdrcDispatch(
                 sys->m_lastLightLoss += sys->lightNrc->trainStep(stream, inputMat, targetMat);
             }
 
-            // 10. lightNrc EMA update
+            // 10. lightNrc EM0A update
             sys->lightNrc->updateEma(stream);
         }
 

@@ -11,7 +11,8 @@ ngp_config makeMaskConfig()
 	ngp_config cfg;
 	cfg.outputActivation = "Softplus";
 	cfg.ema.enabled = false;
-	cfg.lr = 5e-4f;
+	cfg.lr = 5e-5f;
+	cfg.gradClip = 5.0f;
 	return cfg;
 }
 
@@ -25,12 +26,15 @@ ngp_config makeMaskConfig()
 //   label=1 (light):  dL/d(p_l) = -2 * p_e²     / (p_l + p_e)³
 //
 // gradScale = lossScale / (paddedWidth * normBatch) is pre-computed by the caller.
-// normBatch should be paddedResampledCount for BOTH eye and light passes so that
-// the light term is implicitly scaled by (n_light/n_eye) as in the Python formulation.
+// Both eye and light passes use normBatch = n_eye so that the composite loss
+//   total = (sum_eye_terms + sum_light_terms) / n_eye
 //
 // d_throughputWeights: per-sample eye-vertex throughput luminance (nullptr = uniform 1.0).
-//   Applied to both eye (label=0) and light (label=1) passes to match Python's throughput weighting.
-//   For padding samples p_e_area is zeroed → grad = 0 regardless of weight.
+//   Applied to both eye and light passes to match Python's throughput weighting.
+//
+// lossOut: [batchSize] per-sample throughput-weighted Brier loss value
+//   (tw * alpha^2 for eye, tw * (alpha-1)^2 for light).
+//   Padding samples (p_e_area == 0) contribute 0.
 //
 // networkOut : [paddedWidth × batchSize] half, column-major — row 0 = p_l_area
 // p_e_area   : [batchSize] float — area-measure eye PDF per sample
@@ -40,6 +44,7 @@ __global__ void k_dre_brier_grad(
     const float*                     __restrict__ p_e_area,
     const float*                     __restrict__ throughputWeights,
     tcnn::network_precision_t*       __restrict__ dLdOut,
+    float*                           __restrict__ lossOut,
     uint32_t batchSize,
     uint32_t paddedWidth,
     int      label,
@@ -50,31 +55,38 @@ __global__ void k_dre_brier_grad(
 
     const uint32_t base = i * paddedWidth;  // column-major: col i starts here
 
-    // Read p_l_area (row 0, col i).  Forward already applied Softplus → always ≥ 0.
-    const float p_l = (float)networkOut[base];
+    const float p_l = networkOut[base];
     const float p_e = p_e_area[i];
+    const float tw  = throughputWeights ? throughputWeights[i] : 1.0f;
 
-    // Stable denominator: add small epsilon to avoid 0/0 when both are zero.
+    // Padding guard: p_e == 0 means this slot was zero-padded; contribute nothing.
+    if (p_e < 1e-10f) {
+        for (uint32_t r = 0u; r < paddedWidth; ++r)
+            dLdOut[base + r] = static_cast<tcnn::network_precision_t>(0.0f);
+        lossOut[i] = 0.0f;
+        return;
+    }
+
     const float denom    = p_l + p_e + 1e-8f;
     const float denom_cu = denom * denom * denom;
 
     float grad;
     if (label == 0) {
-        // Eye sample: L = alpha²  →  dL/d(p_l) = 2 * p_l * p_e / (p_l+p_e)³
         grad = 2.0f * p_l * p_e / denom_cu;
     } else {
-        // Light sample: L = (alpha-1)²  →  dL/d(p_l) = -2 * p_e² / (p_l+p_e)³
         grad = -2.0f * p_e * p_e / denom_cu;
     }
 
-    grad *= gradScale;
-    if (throughputWeights)
-        grad *= throughputWeights[i];
+    grad *= gradScale * tw;
 
-    // Write gradient for row 0; zero out padding rows
-    dLdOut[base] = (tcnn::network_precision_t)grad;
+    // Per-sample throughput-weighted Brier loss
+    const float alpha = p_l / denom;
+    const float lv    = (label == 0) ? (alpha * alpha) : ((alpha - 1.0f) * (alpha - 1.0f));
+    lossOut[i] = tw * lv;
+
+    dLdOut[base] = static_cast<tcnn::network_precision_t>(grad);
     for (uint32_t r = 1u; r < paddedWidth; ++r)
-        dLdOut[base + r] = (tcnn::network_precision_t)(0.0f);
+        dLdOut[base + r] = static_cast<tcnn::network_precision_t>(0.0f);
 }
 } // namespace
 
@@ -83,54 +95,7 @@ mask_ngp_cache::mask_ngp_cache(cudaStream_t stream)
 {
 }
 
-float mask_ngp_cache::trainStep(
-	cudaStream_t stream,
-	const tcnn::GPUMatrixDynamic<float>& input,
-	const tcnn::GPUMatrix<float>& target)
-{
-	if (static_cast<int>(input.m()) != m_config.inputDim) {
-		throw std::runtime_error("BaseNGPCache::trainStep: input row count != inputDim");
-	}
-	if (static_cast<int>(target.m()) != m_outputDim) {
-		throw std::runtime_error("BaseNGPCache::trainStep: target row count != outputDim");
-	}
-	if (input.n() != target.n()) {
-		throw std::runtime_error("BaseNGPCache::trainStep: input/target batch size mismatch");
-	}
-
-	const uint32_t batchSize = input.n();
-	const uint32_t paddedWidth = m_network->padded_output_width();
-
-	tcnn::GPUMatrix<tcnn::network_precision_t> networkOut(paddedWidth, batchSize, stream);
-	tcnn::GPUMatrix<float> lossVals(paddedWidth, batchSize, stream);
-	tcnn::GPUMatrix<tcnn::network_precision_t> dLdOutput(paddedWidth, batchSize, stream);
-
-	auto ctx = m_network->forward(
-		stream,
-		input,
-		&networkOut,
-		false,
-		false);
-	const float lossScale = tcnn::default_loss_scale<tcnn::network_precision_t>();
-	m_loss->evaluate(stream, lossScale, networkOut, target, lossVals, dLdOutput);
-
-	m_network->backward(
-		stream,
-		*ctx,
-		input,
-		networkOut,
-		dLdOutput,
-		nullptr,
-		false,
-		tcnn::GradientMode::Overwrite);
-
-	m_optimizer->step(stream, lossScale, m_paramsFP, m_params, m_paramGrads);
-
-	const float totalLoss = tcnn::reduce_sum(lossVals.data(), lossVals.n_elements(), stream);
-	return totalLoss / static_cast<float>(static_cast<uint32_t>(m_outputDim) * batchSize);
-}
-
-void mask_ngp_cache::dreLossAccumGrad(
+float mask_ngp_cache::dreLossAccumGrad(
 	cudaStream_t stream,
 	const tcnn::GPUMatrixDynamic<float>& input,
 	const float* d_p_e_area,
@@ -148,6 +113,9 @@ void mask_ngp_cache::dreLossAccumGrad(
 	tcnn::GPUMatrix<tcnn::network_precision_t> networkOut(paddedWidth, batchSize, stream);
 	tcnn::GPUMatrix<tcnn::network_precision_t> dLdOutput(paddedWidth, batchSize, stream);
 
+	float* d_lossOut = nullptr;
+	CUDA_CHECK_THROW(cudaMalloc(&d_lossOut, batchSize * sizeof(float)));
+
 	auto ctx = m_network->forward(stream, input, &networkOut, false, false);
 
 	const float lossScale = m_gradScaler.currentScale();
@@ -158,6 +126,7 @@ void mask_ngp_cache::dreLossAccumGrad(
 	    d_p_e_area,
 	    d_throughputWeights,
 	    dLdOutput.data(),
+	    d_lossOut,
 	    batchSize,
 	    paddedWidth,
 	    label,
@@ -168,15 +137,17 @@ void mask_ngp_cache::dreLossAccumGrad(
 	    stream, *ctx, input, networkOut, dLdOutput,
 	    nullptr, false, gradMode);
 
-	if (gradMode == tcnn::GradientMode::Accumulate || gradMode == tcnn::GradientMode::Overwrite) {                                                                                         
-      const uint32_t np = m_network->n_params();                                                                                                                                         
-      // Sum of squares of half-precision grads                                                                                                                                          
-      cudaStreamSynchronize(stream);                                                                                                                                                     
-      // simple check: just read first param grad                                                                                                                                        
-      tcnn::network_precision_t g0;                                                                                                                                                      
-      cudaMemcpy(&g0, m_paramGrads, sizeof(g0), cudaMemcpyDeviceToHost);                                                                                                                 
-      printf("[mask-dbg] paramGrads[0] = %.4e (label=%d)\n", (float)g0, label);                                                                                                          
-  	}
+	// Sync and sum per-sample loss values for display
+	CUDA_CHECK_THROW(cudaStreamSynchronize(stream));
+	std::vector<float> h_loss(batchSize);
+	CUDA_CHECK_THROW(cudaMemcpy(h_loss.data(), d_lossOut, batchSize * sizeof(float), cudaMemcpyDeviceToHost));
+	cudaFree(d_lossOut);
+
+	float lossSum = 0.0f;
+	for (uint32_t i = 0u; i < batchSize; ++i)
+		lossSum += h_loss[i];
+
+	return lossSum;
 }
 
 void mask_ngp_cache::optimizerStep(cudaStream_t stream)
@@ -184,12 +155,13 @@ void mask_ngp_cache::optimizerStep(cudaStream_t stream)
 	const float lossScale = m_gradScaler.currentScale();
 	if (m_config.gradScaler) {
 		if (checkGradOverflow(stream)) {
-			printf("[mask-dbg] grad OVERFLOW — step skipped\n");
 			m_gradScaler.onOverflow();
 			return;
 		}
 		m_gradScaler.onSuccess();
 	}
+	if (m_config.gradClip > 0.0f)
+		clipGradNorm(stream, m_config.gradClip * lossScale);
 	m_optimizer->step(stream, lossScale, m_paramsFP, m_params, m_paramGrads);
 }
 
@@ -199,8 +171,8 @@ float mask_ngp_cache::dreLossTrainStep(
 	const float* d_p_e_area,
 	int label)
 {
-	dreLossAccumGrad(stream, input, d_p_e_area, label,
-	                 input.n(), nullptr, tcnn::GradientMode::Overwrite);
+	const float lossSum = dreLossAccumGrad(stream, input, d_p_e_area, label,
+	                                       input.n(), nullptr, tcnn::GradientMode::Overwrite);
 	optimizerStep(stream);
-	return 0.0f;
+	return lossSum;
 }

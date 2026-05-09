@@ -1619,7 +1619,7 @@ bool Application::render()
       ++m_iterationLightPath;
 
 
-      scaleLightPath = 1.0f / (static_cast<float>(m_iterationLightPath) * 100.0f);
+      scaleLightPath = 1.0f / (static_cast<float>(m_iterationLightPath) * 1.0f);
     }
     // Suppress BDPT light path compositing in NRC debug mode: the visualization (mask, cache-only,
     // indirect) must not be contaminated by scene-colored light path contributions.
@@ -1677,10 +1677,13 @@ bool Application::render()
 
         m_bdrcLastEyeLoss   = bdrcGetLastEyeLoss(m_bdrcSystem);
         m_bdrcLastLightLoss = bdrcGetLastLightLoss(m_bdrcSystem);
+        m_bdrcLastMaskLoss  = bdrcGetLastMaskLoss(m_bdrcSystem);
         m_bdrcEyeLossHistory  [m_bdrcEyeLossHistoryIdx]   = m_bdrcLastEyeLoss;
         m_bdrcLightLossHistory[m_bdrcLightLossHistoryIdx] = m_bdrcLastLightLoss;
+        m_bdrcMaskLossHistory [m_bdrcMaskLossHistoryIdx]  = m_bdrcLastMaskLoss;
         m_bdrcEyeLossHistoryIdx   = (m_bdrcEyeLossHistoryIdx   + 1) % NRC_LOSS_HISTORY;
         m_bdrcLightLossHistoryIdx = (m_bdrcLightLossHistoryIdx + 1) % NRC_LOSS_HISTORY;
+        m_bdrcMaskLossHistoryIdx  = (m_bdrcMaskLossHistoryIdx  + 1) % NRC_LOSS_HISTORY;
       }
       else if (m_nrc == 1 && m_nrcSystem)
       {
@@ -2326,7 +2329,16 @@ void Application::guiWindow()
     }
     if (m_bdrcDebugMode == 3)
     {
-      ImGui::TextDisabled("Mask uses DRE Brier loss (no scalar readout)");
+      const float* hist    = m_bdrcMaskLossHistory;
+      float        lossMax = *std::max_element(hist, hist + NRC_LOSS_HISTORY);
+      if (lossMax < 1e-6f) lossMax = 1e-6f;
+      char overlay[32];
+      snprintf(overlay, sizeof(overlay), "%.4f", m_bdrcLastMaskLoss);
+      ImGui::PlotLines("##BdrcMaskLoss", hist, NRC_LOSS_HISTORY, m_bdrcMaskLossHistoryIdx,
+                       overlay, 0.0f, lossMax * 1.1f, ImVec2(0, 40));
+      if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Mask cache DRE Brier loss — (sum_eye + sum_light) / n_eye — Phase 1 only");
+      ImGui::Text("Mask loss:  %.4f", m_bdrcLastMaskLoss);
     }
   }
 
@@ -2439,6 +2451,59 @@ void Application::guiWindow()
         }
         ImGui::EndCombo();
       }
+    }
+  }
+
+  if (ImGui::CollapsingHeader("Camera"))
+  {
+    dev::Camera& guiCam = m_cameras[m_indexCamera];
+
+    glm::vec3 pos    = guiCam.getPosition();
+    glm::vec3 lookat = guiCam.getLookat();
+    float     fovY   = guiCam.getFovY();
+
+    bool camChanged = false;
+
+    if (ImGui::DragFloat3("Position", &pos.x, 0.01f))
+    {
+      guiCam.setPosition(pos);
+      camChanged = true;
+    }
+
+    if (ImGui::DragFloat3("Look-at", &lookat.x, 0.01f))
+    {
+      guiCam.setLookat(lookat);
+      camChanged = true;
+    }
+
+    // Read-only view direction for reference.
+    glm::vec3 dir = guiCam.getDirection();
+    ImGui::LabelText("Direction", "%.3f  %.3f  %.3f", dir.x, dir.y, dir.z);
+
+    if (0.0f < fovY) // Perspective camera.
+    {
+      if (ImGui::DragFloat("FoV Y (deg)", &fovY, 0.5f, 1.0f, 179.0f))
+      {
+        guiCam.setFovY(fovY);
+        camChanged = true;
+      }
+    }
+    else // Orthographic camera.
+    {
+      glm::vec2 mag = guiCam.getMagnification();
+      if (ImGui::DragFloat2("Magnification", &mag.x, 0.001f, 0.001f, 1000.0f))
+      {
+        guiCam.setMagnification(mag);
+        camChanged = true;
+      }
+    }
+
+    if (camChanged)
+    {
+      guiCam.setIsDirty(true);
+      // Resync the trackball's longitude/latitude so the next mouse orbit
+      // continues from the new position without a jump.
+      m_trackball.reinitOrientationFromCamera();
     }
   }
 
@@ -4558,7 +4623,9 @@ void Application::initMeshLights()
                            cudaMemcpyHostToDevice) );
   }
 
-  m_isDirtyLights = false;
+  // Do NOT clear m_isDirtyLights here. The punctual light LightDefinition slots in
+  // m_lightDefinitions are still zero-initialized at this point — updateLights() must
+  // run on the first render frame to fill in typeLight, emission, and matrices.
 }
 
 
@@ -7186,7 +7253,7 @@ void Application::update()
         if (m_bdptDisplayMode == 1 && haveLightPath)
         {
           // Show only the BDPT light path contribution.
-          const float scaleLightPath = 1.0f / (static_cast<float>(m_iterationLightPath) * 100.0f);
+          const float scaleLightPath = 1.0f / (static_cast<float>(m_iterationLightPath) * 1.0f);
           for (int i = 0; i < numPixels; ++i)
           {
             m_bufferHost[i] = make_float4(m_bufferHostLightPath[i].x * scaleLightPath,
@@ -7205,7 +7272,7 @@ void Application::update()
           if (m_bdptDisplayMode == 2 && haveLightPath && !(m_nrc > 0 && m_nrcDebugMode != 0))
           {
             // Blend eye + light path contributions.
-            const float scaleLightPath = 1.0f / (static_cast<float>(m_iterationLightPath) * 100.0f);
+            const float scaleLightPath = 1.0f / (static_cast<float>(m_iterationLightPath) * 1.0f);
             for (int i = 0; i < numPixels; ++i)
             {
               m_bufferHost[i].x += m_bufferHostLightPath[i].x * scaleLightPath;
