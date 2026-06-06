@@ -12,6 +12,7 @@ static __global__ void k_nrc_accumulate(
     const float*        renderPrefix,
     const float*        renderThroughput,
     const float*        renderOutput,
+    const float*        renderReflectance,
     const unsigned int* renderValid,
     int                 numPixels,
     unsigned int        iteration)
@@ -21,9 +22,13 @@ static __global__ void k_nrc_accumulate(
     return;
 
   const int pixelIndex = 3 * i;
-  float r = renderPrefix[pixelIndex + 0] + renderThroughput[pixelIndex + 0] * renderOutput[pixelIndex + 0];
-  float g = renderPrefix[pixelIndex + 1] + renderThroughput[pixelIndex + 1] * renderOutput[pixelIndex + 1];
-  float b = renderPrefix[pixelIndex + 2] + renderThroughput[pixelIndex + 2] * renderOutput[pixelIndex + 2];
+  // Reflectance factorization: reconstruct L = f*(α+β). nullptr = no factorization (BDRC path).
+  const float r0 = (renderReflectance != nullptr) ? renderReflectance[pixelIndex + 0] : 1.0f;
+  const float r1 = (renderReflectance != nullptr) ? renderReflectance[pixelIndex + 1] : 1.0f;
+  const float r2 = (renderReflectance != nullptr) ? renderReflectance[pixelIndex + 2] : 1.0f;
+  float r = renderPrefix[pixelIndex + 0] + renderThroughput[pixelIndex + 0] * renderOutput[pixelIndex + 0] * r0;
+  float g = renderPrefix[pixelIndex + 1] + renderThroughput[pixelIndex + 1] * renderOutput[pixelIndex + 1] * r1;
+  float b = renderPrefix[pixelIndex + 2] + renderThroughput[pixelIndex + 2] * renderOutput[pixelIndex + 2] * r2;
 
   if (0 < iteration)
   {
@@ -47,32 +52,43 @@ static __global__ void k_nrc_debug_accumulate(
     float4*             bufferAccum,
     const float*        renderOutput,
     const float*        renderThroughput,
+    const float*        renderReflectance,
     const unsigned int* renderValid,
     int                 numPixels,
     int                 debugMode)
 {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= numPixels || renderValid[i] == 0u)
+  if (i >= numPixels)
     return;
+
+  // Non-terminated pixels write black so previous-frame accumulation doesn't bleed through.
+  if (renderValid[i] == 0u)
+  {
+    bufferAccum[i] = make_float4(0.0f, 0.0f, 0.0f, 1.0f);
+    return;
+  }
 
   const int pixelIndex = 3 * i;
   float r, g, b;
 
-  if (debugMode == 1) // cache-only: raw NRC output
+  const float q0 = (renderReflectance != nullptr) ? renderReflectance[pixelIndex + 0] : 1.0f;
+  const float q1 = (renderReflectance != nullptr) ? renderReflectance[pixelIndex + 1] : 1.0f;
+  const float q2 = (renderReflectance != nullptr) ? renderReflectance[pixelIndex + 2] : 1.0f;
+  if (debugMode == 1) // cache-only: reconstructed radiance = network_out * reflectance
   {
-    r = renderOutput[pixelIndex + 0];
-    g = renderOutput[pixelIndex + 1];
-    b = renderOutput[pixelIndex + 2];
+    r = renderOutput[pixelIndex + 0] * q0;
+    g = renderOutput[pixelIndex + 1] * q1;
+    b = renderOutput[pixelIndex + 2] * q2;
   }
   else if (debugMode == 2) // termination mask
   {
     r = g = b = 1.0f;
   }
-  else // debugMode == 3: indirect = throughput * nrcOutput
+  else // debugMode == 3: indirect = throughput * network_out * reflectance
   {
-    r = renderThroughput[pixelIndex + 0] * renderOutput[pixelIndex + 0];
-    g = renderThroughput[pixelIndex + 1] * renderOutput[pixelIndex + 1];
-    b = renderThroughput[pixelIndex + 2] * renderOutput[pixelIndex + 2];
+    r = renderThroughput[pixelIndex + 0] * renderOutput[pixelIndex + 0] * q0;
+    g = renderThroughput[pixelIndex + 1] * renderOutput[pixelIndex + 1] * q1;
+    b = renderThroughput[pixelIndex + 2] * renderOutput[pixelIndex + 2] * q2;
   }
 
   bufferAccum[i] = make_float4(r, g, b, 1.0f);
@@ -93,6 +109,7 @@ static __global__ void k_nrc_build_targets(
     const float*        trainSuffixThroughput,
     const float*        nrcNext,
     const float*        trainThroughputAtK,
+    const float*        trainReflectance,
     const unsigned int* trainNextValid,
     int                 numTrainSamples)
 {
@@ -100,9 +117,9 @@ static __global__ void k_nrc_build_targets(
   if (s >= numTrainSamples)
     return;
 
-  const int    pixelIndex     = 3 * s;
-  const bool   valid = (trainNextValid[s] != 0u);
-  const float  eps   = 1e-6f;
+  const int    pixelIndex = 3 * s;
+  const bool   valid      = (trainNextValid[s] != 0u);
+  const float  eps        = 1e-6f;
 
   #pragma unroll
   for (int c = 0; c < 3; ++c)
@@ -116,7 +133,12 @@ static __global__ void k_nrc_build_targets(
     float numer = trainSuffixScaled[pixelIndex + c];
     if (valid)
       numer += trainSuffixThroughput[pixelIndex + c] * nrcNext[pixelIndex + c];
-    trainTargets[pixelIndex + c] = numer / tpK;
+    // Reflectance factorization: divide by clamped (α+β) so the network learns
+    // f = L/(α+β) instead of L directly. nullptr = no factorization (BDRC eye cache).
+    const float refl = (trainReflectance != nullptr)
+                       ? fmaxf(trainReflectance[pixelIndex + c], 0.01f)
+                       : 1.0f;
+    trainTargets[pixelIndex + c] = (numer / tpK) / refl;
   }
 }
 
@@ -131,6 +153,7 @@ __host__ void device_nrc_accumulate(
     const float*        renderPrefix,
     const float*        renderThroughput,
     const float*        renderOutput,
+    const float*        renderReflectance,
     const unsigned int* renderValid,
     int                 numPixels,
     unsigned int        iteration)
@@ -138,8 +161,8 @@ __host__ void device_nrc_accumulate(
   const int block = 256;
   const int grid  = (numPixels + block - 1) / block;
   k_nrc_accumulate<<<grid, block, 0, cudaStream>>>(
-      bufferAccum, renderPrefix, renderThroughput, renderOutput, renderValid,
-      numPixels, iteration);
+      bufferAccum, renderPrefix, renderThroughput, renderOutput, renderReflectance,
+      renderValid, numPixels, iteration);
 }
 
 __host__ void device_nrc_debug_accumulate(
@@ -147,6 +170,7 @@ __host__ void device_nrc_debug_accumulate(
     float4*             bufferAccum,
     const float*        renderOutput,
     const float*        renderThroughput,
+    const float*        renderReflectance,
     const unsigned int* renderValid,
     int                 numPixels,
     unsigned int        /*iteration*/,
@@ -155,7 +179,7 @@ __host__ void device_nrc_debug_accumulate(
   const int block = 256;
   const int grid  = (numPixels + block - 1) / block;
   k_nrc_debug_accumulate<<<grid, block, 0, cudaStream>>>(
-      bufferAccum, renderOutput, renderThroughput, renderValid,
+      bufferAccum, renderOutput, renderThroughput, renderReflectance, renderValid,
       numPixels, debugMode);
 }
 
@@ -166,6 +190,7 @@ __host__ void device_nrc_build_targets(
     const float*        trainSuffixThroughput,
     const float*        nrcNext,
     const float*        trainThroughputAtK,
+    const float*        trainReflectance,
     const unsigned int* trainNextValid,
     int                 numTrainSamples)
 {
@@ -175,7 +200,7 @@ __host__ void device_nrc_build_targets(
   const int grid  = (numTrainSamples + block - 1) / block;
   k_nrc_build_targets<<<grid, block, 0, cudaStream>>>(
       trainTargets, trainSuffixScaled, trainSuffixThroughput, nrcNext,
-      trainThroughputAtK, trainNextValid, numTrainSamples);
+      trainThroughputAtK, trainReflectance, trainNextValid, numTrainSamples);
 }
 
 
@@ -250,7 +275,7 @@ __host__ void device_bdrc_composite(
 //   2 = light color cache output (ĉ_l)
 //   3 = mask cache output (α) as grayscale
 //   4 = combined ĉ_e + ĉ_l
-// Only valid pixels (renderValid[i] != 0) are written.
+// Valid pixels write the debug value; invalid pixels write black to avoid prior-frame bleed-through.
 static __global__ void k_bdrc_debug(
     float4*             bufferAccum,
     const float*        eyeOutput,
@@ -261,8 +286,14 @@ static __global__ void k_bdrc_debug(
     int                 debugMode)
 {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= numPixels || renderValid[i] == 0u)
+  if (i >= numPixels)
     return;
+
+  if (renderValid[i] == 0u)
+  {
+    bufferAccum[i] = make_float4(0.0f, 0.0f, 0.0f, 1.0f);
+    return;
+  }
 
   const int base3 = 3 * i;
   float r = 0.f, g = 0.f, b = 0.f;
@@ -338,7 +369,7 @@ static __global__ void k_bdrc_splat_endpoints(
     int                 iteration)
 {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= numPixels || validBuffer[i] == 0u)
+  if (i >= numPixels || (validBuffer != nullptr && validBuffer[i] == 0u))
     return;
 
   // Denormalize packed feature position → world space.

@@ -27,6 +27,7 @@ struct NrcSystem
   float*        d_renderThroughput    = nullptr; // [3 × batchSize]
   float*        d_renderPrefix        = nullptr; // [3 × batchSize]
   float*        d_renderOutput        = nullptr; // [3 × batchSize] filled by query()
+  float*        d_renderReflectance   = nullptr; // [3 × batchSize] clamp(α+β, 0.01) at K
   unsigned int* d_renderValid         = nullptr; // [batchSize]
 
   // ---- Forward NRC training buffers ----------------------------------------
@@ -43,7 +44,7 @@ struct NrcSystem
   unsigned int* d_trainCount          = nullptr; // [1] atomic counter
   unsigned int* d_trainPixelIndices   = nullptr; // [batchSize] pixel index per slot (diagnostic)
   float*        d_trainFeatures       = nullptr; // [NRC_INPUT_DIM × batchSize]  compact
-  float*        d_albedo              = nullptr; // [3 × batchSize] base color at NRC termination vertex
+  float*        d_trainReflectance    = nullptr; // [3 × batchSize] clamp(α+β, 0.01) per training slot
 
   // ---- Per-frame diagnostics ----------------------------------------------
   float        m_lastLoss        = 0.0f;
@@ -54,6 +55,7 @@ struct NrcSystem
     cudaFree(d_renderThroughput);    d_renderThroughput    = nullptr;
     cudaFree(d_renderPrefix);        d_renderPrefix        = nullptr;
     cudaFree(d_renderOutput);        d_renderOutput        = nullptr;
+    cudaFree(d_renderReflectance);   d_renderReflectance   = nullptr;
     cudaFree(d_renderValid);         d_renderValid         = nullptr;
   }
 
@@ -70,7 +72,7 @@ struct NrcSystem
     cudaFree(d_trainCount);          d_trainCount          = nullptr;
     cudaFree(d_trainPixelIndices);   d_trainPixelIndices   = nullptr;
     cudaFree(d_trainFeatures);       d_trainFeatures       = nullptr;
-    cudaFree(d_albedo);              d_albedo              = nullptr;
+    cudaFree(d_trainReflectance);    d_trainReflectance    = nullptr;
   }
 
   void freeAllBuffers()
@@ -121,6 +123,7 @@ void nrcAllocBuffers(NrcSystem* sys, uint32_t batchSize)
   cudaMalloc(reinterpret_cast<void**>(&sys->d_renderThroughput),    batchSize * 3u * sizeof(float));
   cudaMalloc(reinterpret_cast<void**>(&sys->d_renderPrefix),        batchSize * 3u * sizeof(float));
   cudaMalloc(reinterpret_cast<void**>(&sys->d_renderOutput),        batchSize * 3u * sizeof(float));
+  cudaMalloc(reinterpret_cast<void**>(&sys->d_renderReflectance),   batchSize * 3u * sizeof(float));
   cudaMalloc(reinterpret_cast<void**>(&sys->d_renderValid),         batchSize      * sizeof(unsigned int));
 
   // ---- Forward NRC buffers -------------------------------------------------
@@ -138,7 +141,7 @@ void nrcAllocBuffers(NrcSystem* sys, uint32_t batchSize)
   cudaMalloc(reinterpret_cast<void**>(&sys->d_trainCount),          sizeof(unsigned int));
   cudaMalloc(reinterpret_cast<void**>(&sys->d_trainPixelIndices),   batchSize * sizeof(unsigned int));
   cudaMalloc(reinterpret_cast<void**>(&sys->d_trainFeatures),       batchSize * fwdInputDim * sizeof(float));
-  cudaMalloc(reinterpret_cast<void**>(&sys->d_albedo),              batchSize * 3u          * sizeof(float));
+  cudaMalloc(reinterpret_cast<void**>(&sys->d_trainReflectance),    batchSize * 3u          * sizeof(float));
 
   // Zero-initialise all flags and the training counter.
   cudaMemset(sys->d_renderValid,    0, batchSize * sizeof(unsigned int));
@@ -151,6 +154,7 @@ void nrcAllocBuffers(NrcSystem* sys, uint32_t batchSize)
 float*        nrcRenderThroughput   (const NrcSystem* sys) { return sys->d_renderThroughput;    }
 float*        nrcRenderPrefix       (const NrcSystem* sys) { return sys->d_renderPrefix;        }
 float*        nrcRenderOutput       (const NrcSystem* sys) { return sys->d_renderOutput;        }
+float*        nrcRenderReflectance  (const NrcSystem* sys) { return sys->d_renderReflectance;   }
 unsigned int* nrcRenderValid        (const NrcSystem* sys) { return sys->d_renderValid;         }
 
 // ---- Forward NRC pointer accessors ------------------------------------------
@@ -167,7 +171,7 @@ unsigned int* nrcTrainNextValid     (const NrcSystem* sys) { return sys->d_train
 unsigned int* nrcTrainCount        (const NrcSystem* sys) { return sys->d_trainCount;         }
 unsigned int* nrcTrainPixelIndices (const NrcSystem* sys) { return sys->d_trainPixelIndices;  }
 float*        nrcTrainFeatures     (const NrcSystem* sys) { return sys->d_trainFeatures;      }
-float*        nrcAlbedo            (const NrcSystem* sys) { return sys->d_albedo;             }
+float*        nrcTrainReflectance  (const NrcSystem* sys) { return sys->d_trainReflectance;   }
 
 float        nrcGetLastLoss       (const NrcSystem* sys) { return sys->m_lastLoss;           }
 unsigned int nrcGetLastTrainCount (const NrcSystem* sys) { return sys->m_lastTrainCount;     }
@@ -229,15 +233,16 @@ void nrcDispatch(NrcSystem*   sys,
   {
     device_nrc_accumulate(
         stream, bufferAccum,
-        sys->d_renderPrefix, sys->d_renderThroughput, sys->d_renderOutput, sys->d_renderValid,
+        sys->d_renderPrefix, sys->d_renderThroughput, sys->d_renderOutput,
+        sys->d_renderReflectance, sys->d_renderValid,
         numPixels, iteration);
   }
   else
   {
     device_nrc_debug_accumulate(
         stream, bufferAccum,
-        sys->d_renderOutput, sys->d_renderThroughput, sys->d_renderValid,
-        numPixels, iteration, static_cast<int>(debugMode));
+        sys->d_renderOutput, sys->d_renderThroughput, sys->d_renderReflectance,
+        sys->d_renderValid, numPixels, iteration, static_cast<int>(debugMode));
   }
 
   // 4–6. Training: only runs if there are training samples and not in cache-only debug mode.
@@ -263,6 +268,7 @@ void nrcDispatch(NrcSystem*   sys,
         sys->d_trainSuffThroughput,
         sys->d_nrcNextOutput,
         sys->d_trainThroughputAtK,
+        sys->d_trainReflectance,
         sys->d_trainNextValid,
         static_cast<int>(trainCount));
 

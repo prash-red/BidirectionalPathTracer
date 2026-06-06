@@ -104,6 +104,9 @@ public:
     [[nodiscard]] size_t      numParams() const { return m_network ? m_network->n_params() : 0; }
     [[nodiscard]] std::string serialize(const std::string& name = "BaseNGPCache") const;
 
+    void saveWeights(const std::string& path) const;
+    bool loadWeights(const std::string& path, cudaStream_t stream);
+
     // Direct network access for advanced use (e.g. save/load weights)
     tcnn::NetworkWithInputEncoding<tcnn::network_precision_t>& network() { return *m_network; }
 

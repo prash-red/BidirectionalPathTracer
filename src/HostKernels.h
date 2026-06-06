@@ -71,13 +71,14 @@ extern __host__ void device_blend_to_surface(cudaStream_t        cudaStream,
                                              int                 height);
 
 // NRC: composite NRC-terminated pixels into bufferAccum (pixel-indexed, numPixels entries).
-// For each pixel where renderValid[i]==1: bufferAccum[i] = progressive_avg(prefix + throughput * renderOutput).
+// Applies reflectance factorization: bufferAccum[i] = progressive_avg(prefix + throughput * renderOutput * renderReflectance).
 extern __host__ void device_nrc_accumulate(
     cudaStream_t        cudaStream,
     float4*             bufferAccum,
     const float*        renderPrefix,
     const float*        renderThroughput,
     const float*        renderOutput,
+    const float*        renderReflectance,
     const unsigned int* renderValid,
     int                 numPixels,
     unsigned int        iteration);
@@ -88,13 +89,15 @@ extern __host__ void device_nrc_debug_accumulate(
     float4*             bufferAccum,
     const float*        renderOutput,
     const float*        renderThroughput,
+    const float*        renderReflectance,
     const unsigned int* renderValid,
     int                 numPixels,
     unsigned int        iteration,
     int                 debugMode);
 
 // NRC: build training targets from compact slot-indexed suffix data (numTrainSamples entries).
-// target[s] = (trainSuffixScaled[s] + trainSuffixThroughput[s] * nrcNext[s]) / trainThroughputAtK[s]
+// target[s] = (suffixScaled + suffixThroughput*nrcNext) / (trainThroughputAtK * trainReflectance)
+// trainReflectance[s] = clamp(α+β, 0.01) at vertex K — reflectance factorization denominator.
 extern __host__ void device_nrc_build_targets(
     cudaStream_t        cudaStream,
     float*              trainTargets,
@@ -102,6 +105,7 @@ extern __host__ void device_nrc_build_targets(
     const float*        trainSuffixThroughput,
     const float*        nrcNext,
     const float*        trainThroughputAtK,
+    const float*        trainReflectance,
     const unsigned int* trainNextValid,
     int                 numTrainSamples);
 

@@ -1413,10 +1413,21 @@ __forceinline__ __device__ void chRadiance()
   thePrd->flags |= FLAG_HIT; // Required to distinguish surface hits from random walk miss.
 
   thePrd->distance = optixGetRayTmax(); // Return the current path segment distance
-  
+
   // PRECISION Calculate this from the object space vertex positions and transform to world for better accuracy when needed.
   // Same as: thePrd->pos = optixGetWorldRayOrigin() + optixGetWorldRayDirection() * optixGetRayTmax();
   thePrd->pos += thePrd->wi * thePrd->distance;
+
+  // Compute GAS-local hit position for cache queries. This is stable for rigid-body node-transform
+  // animations: the same surface point maps to the same local coordinate regardless of the node's
+  // current world transform. For skinned/morphed meshes it removes the node-transform drift.
+  {
+    float4 objectToWorld[3], worldToObject[3];
+    getTransforms(optixGetTransformListHandle(0), objectToWorld, worldToObject);
+    thePrd->posLocal = transformPoint(worldToObject, thePrd->pos);
+  }
+  thePrd->localAabbMin = hitGroupData->localAabbMin;
+  thePrd->localAabbMax = hitGroupData->localAabbMax;
 
   if (0.0f <= theLaunchParameters.picking.x)
   {
@@ -1707,8 +1718,8 @@ __forceinline__ __device__ void chRadiance()
   // End of BXDF sampling
 
   // BDPT: Light path connection to the camera.
-  // On a light path, update bounce counters and attempt a camera connection at the first
-  // diffuse vertex that follows at least one specular bounce.
+  // On a light path, update bounce counters and attempt a camera connection at every
+  // diffuse vertex that follows at least one specular bounce (S*D+S*E paths).
   if (thePrd->flags & FLAG_LIGHT_PATH)
   {
     const bool is_diffuse = (lobe == LOBE_DIFFUSE_REFLECTION);
@@ -1722,10 +1733,10 @@ __forceinline__ __device__ void chRadiance()
       thePrd->lightDiffuseAfterSpecular++;
     }
 
-    // Connect to camera at the first diffuse bounce after at least one specular bounce.
+    // Connect to camera at every diffuse bounce after at least one specular bounce.
     if (is_diffuse
         && thePrd->lightSpecularCount >= 1
-        && thePrd->lightDiffuseAfterSpecular == 1
+        && thePrd->lightDiffuseAfterSpecular >= 1
         && theLaunchParameters.bufferAccumLightPath != nullptr
         && theLaunchParameters.cameraType == 1) // perspective only
     {
@@ -1776,10 +1787,10 @@ __forceinline__ __device__ void chRadiance()
 
             if (isVisible)
             {
-              // state.bsdf_over_pdf == tint for the Lambertian lobe (set by brdf_diffuse_sample):
-              //   f = albedo/pi,  pdf = cos(theta)/pi  =>  f/pdf = albedo  (direction-independent)
-              // Multiply by cos_theta for the Lambertian geometry term toward the camera direction.
-              const float3 contribution = throughput * state.bsdf_over_pdf * cos_theta;
+              // state.bsdf_over_pdf == albedo for the Lambertian lobe (f*cos/pdf = tint, cosines cancel).
+              // The actual BRDF is f = albedo/pi, so divide by pi to recover f from bsdf_over_pdf.
+              // Multiply by cos_theta for the geometry term toward the camera direction.
+              const float3 contribution = throughput * (state.bsdf_over_pdf / M_PIf) * cos_theta / (dist_to_cam * dist_to_cam);
 
               const unsigned int pixel_idx = static_cast<unsigned int>(theLaunchParameters.resolution.x * iy + ix);
 
@@ -1792,9 +1803,7 @@ __forceinline__ __device__ void chRadiance()
         }
       }
 
-      // Terminate path after connection attempt.
-      thePrd->typeEvent = BSDF_EVENT_ABSORB;
-      return; // Skip material stack update and NEE.
+      // Path continues — connection does not terminate the light path.
     }
   }
 

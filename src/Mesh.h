@@ -403,8 +403,10 @@ public:
       d_gas         = that.d_gas;
       key           = that.key;
       isDirty       = that.isDirty;
+      localAabbMin  = that.localAabbMin;
+      localAabbMax  = that.localAabbMax;
       primitives    = std::move(that.primitives); // Need to move these because they use DeviceBuffers.
-      
+
       that.gas     = 0;
       that.d_gas   = 0; // This makes sure the destructor on "that" is not freeing the copied d_gas.
 
@@ -418,6 +420,9 @@ public:
     KeyTuple key;
 
     bool isDirty; // true when the GAS needs to be rebuilt.
+
+    float3 localAabbMin{}; // GAS-local rest-pose AABB (set on build, not updated on update)
+    float3 localAabbMax{};
 
     /// If this vector is not empty, there are triangle primitives inside the mesh.
     std::vector<dev::DevicePrimitive> primitives;

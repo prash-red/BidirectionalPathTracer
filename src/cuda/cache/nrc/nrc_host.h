@@ -45,6 +45,7 @@ void nrcAllocBuffers(NrcSystem* sys, uint32_t batchSize);
 float*        nrcRenderThroughput   (const NrcSystem* sys);
 float*        nrcRenderPrefix       (const NrcSystem* sys);
 float*        nrcRenderOutput       (const NrcSystem* sys);
+float*        nrcRenderReflectance  (const NrcSystem* sys);
 unsigned int* nrcRenderValid        (const NrcSystem* sys);
 
 // ---- Forward NRC accessors ------------------------------------------------
@@ -59,7 +60,7 @@ unsigned int* nrcTrainNextValid     (const NrcSystem* sys);
 unsigned int* nrcTrainCount        (const NrcSystem* sys);
 unsigned int* nrcTrainPixelIndices (const NrcSystem* sys);
 float*        nrcTrainFeatures     (const NrcSystem* sys);
-float*        nrcAlbedo            (const NrcSystem* sys);
+float*        nrcTrainReflectance  (const NrcSystem* sys);
 
 // ---- Per-frame diagnostics -----------------------------------------------
 // Call after nrcDispatch() to read the loss and training sample count

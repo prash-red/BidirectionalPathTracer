@@ -65,6 +65,10 @@
 
 #include <MyAssert.h>
 
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+
 static const char* CUDA_PROGRAMS_PATH = "./GLTF_renderer_core/";
 
 // gltf node's transform
@@ -842,6 +846,7 @@ void Application::guiRender()
     // Platform windows can change the OpenGL context.
     glfwMakeContextCurrent(m_window);
   }
+
 }
 
 
@@ -1356,9 +1361,9 @@ void Application::updateBuffers()
   updateDenoiserBuffers();
 
   // NRC buffer allocation: reallocate whenever resolution changes.
+  const uint32_t numPixels = static_cast<uint32_t>(numElementsResolution);
   if (m_nrc > 0 && m_nrcSystem) {
     constexpr uint32_t NRC_GRAN = 256u; // tcnn BATCH_SIZE_GRANULARITY
-    const uint32_t numPixels    = static_cast<uint32_t>(numElementsResolution);
     m_nrcBatchSize = (numPixels + NRC_GRAN - 1u) / NRC_GRAN * NRC_GRAN;
 
     nrcAllocBuffers(m_nrcSystem, m_nrcBatchSize);
@@ -1370,6 +1375,7 @@ void Application::updateBuffers()
     nrcBuf.renderThroughput          = nrcRenderThroughput(m_nrcSystem);
     nrcBuf.renderPrefix              = nrcRenderPrefix(m_nrcSystem);
     nrcBuf.renderOutput              = nrcRenderOutput(m_nrcSystem);
+    nrcBuf.renderReflectance         = nrcRenderReflectance(m_nrcSystem);
     nrcBuf.renderValid               = nrcRenderValid(m_nrcSystem);
 
     // Forward NRC buffers.
@@ -1383,12 +1389,12 @@ void Application::updateBuffers()
     nrcBuf.trainCount                = nrcTrainCount(m_nrcSystem);
     nrcBuf.trainPixelIndices         = nrcTrainPixelIndices(m_nrcSystem);
     nrcBuf.trainFeatures             = nrcTrainFeatures(m_nrcSystem);
-    nrcBuf.albedo                    = nrcAlbedo(m_nrcSystem);
+    nrcBuf.trainReflectance          = nrcTrainReflectance(m_nrcSystem);
   }
 
   if (m_nrc == 2 && m_bdrcSystem)
   {
-    bdrcAllocBuffers(m_bdrcSystem, m_nrcBatchSize);
+    bdrcAllocBuffers(m_bdrcSystem, numPixels);
 
     // Wire all BDRC buffer pointers into NrcLaunchBuffers for raygen.
     NrcLaunchBuffers& nrcBuf         = m_launchParameters.nrc;
@@ -1403,15 +1409,15 @@ void Application::updateBuffers()
     nrcBuf.trainSuffixThroughput = bdrcTrainSuffThroughput(m_bdrcSystem);
     nrcBuf.trainThroughputAtK    = bdrcTrainThroughputAtK(m_bdrcSystem);
     nrcBuf.trainNextValid        = bdrcTrainNextValid(m_bdrcSystem);
-    nrcBuf.albedo                = bdrcAlbedo(m_bdrcSystem);
+    nrcBuf.renderReflectance     = nullptr;  // BDRC eye cache: no reflectance factorization
+    nrcBuf.trainReflectance      = nullptr;
 
-    nrcBuf.lightEndpoints        = bdrcLightEndpoints(m_bdrcSystem);
-    nrcBuf.lightTargets          = bdrcLightTargets(m_bdrcSystem);
-    nrcBuf.lightValid            = bdrcLightValid(m_bdrcSystem);
-    nrcBuf.light_p_sa            = bdrcLight_p_sa(m_bdrcSystem);
-    nrcBuf.light_p_e_area        = bdrcLight_p_e_area(m_bdrcSystem);
-    nrcBuf.lightCount            = bdrcLightCount(m_bdrcSystem);
-    nrcBuf.lightOutput           = bdrcLightOutput(m_bdrcSystem);
+    nrcBuf.lightEndpoints  = bdrcLightEndpoints(m_bdrcSystem);
+    nrcBuf.lightTargets    = bdrcLightTargets(m_bdrcSystem);
+    nrcBuf.light_p_e_area  = bdrcLight_p_e_area(m_bdrcSystem);
+    nrcBuf.lightEyeTp      = bdrcLightEyeTp(m_bdrcSystem);
+    nrcBuf.lightValid      = bdrcLightValid(m_bdrcSystem);
+    nrcBuf.lightOutput     = bdrcLightOutput(m_bdrcSystem);
 
     nrcBuf.eyeVertexPos          = bdrcEyeVertexPos(m_bdrcSystem);
     nrcBuf.eyeVertexNormals      = bdrcEyeVertexNormals(m_bdrcSystem);
@@ -1559,6 +1565,9 @@ bool Application::render()
     //
     // RENDERING
     //
+    if (!m_accumulate)
+      m_launchParameters.iteration = 0u;
+
     unsigned int iteration = m_launchParameters.iteration;
 
     // BDPT: When the eye path accumulation restarts, also clear the light path sum buffer.
@@ -2119,6 +2128,10 @@ void Application::guiWindow()
     {
       m_launchParameters.iteration = 0u; // Restart accumulation.
     }
+    if (ImGui::DragInt("Light Path Depth", &m_launchParameters.lightPathMaxDepth, 1.0f, 1, 100))
+    {
+      m_launchParameters.iteration = 0u;
+    }
     if (ImGui::DragFloat("Scene Epsilon", &m_epsilonFactor, 1.0f, 0.0f, 10000.0f))
     {
       m_launchParameters.sceneEpsilon = m_epsilonFactor * SCENE_EPSILON_SCALE;
@@ -2145,6 +2158,12 @@ void Application::guiWindow()
     {
       m_launchParameters.showEnvironment = (m_showEnvironment) ? 1 : 0;
       m_launchParameters.iteration = 0u; // Restart accumulation.
+    }
+    ImGui::Checkbox("Accumulate", &m_accumulate);
+    if (ImGui::IsItemHovered())
+    {
+      ImGui::SetTooltip("When disabled, each frame shows a fresh 1-sample-per-pixel image\n"
+                        "without progressive averaging.");
     }
 
     // BDPT display controls.
@@ -2279,7 +2298,7 @@ void Application::guiWindow()
     ImGui::Text("Phase: %s (training frame %u / warmup %d)",
                 m_bdrcPhase == 0 ? "1-Mask warmup" : "2-Color caches",
                 m_nrcTrainingIteration, m_bdrcWarmup);
-    ImGui::SliderInt("BDRC Warmup Frames", &m_bdrcWarmup, 200, 5000);
+    ImGui::SliderInt("BDRC Warmup Frames", &m_bdrcWarmup, 0, 10000 );
 
     static const char* bdrcDebugItems[] = {
       "Normal",
@@ -2339,6 +2358,37 @@ void Application::guiWindow()
       if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Mask cache DRE Brier loss — (sum_eye + sum_light) / n_eye — Phase 1 only");
       ImGui::Text("Mask loss:  %.4f", m_bdrcLastMaskLoss);
+    }
+  }
+
+  if (m_nrc == 2 && m_bdrcSystem != nullptr && ImGui::CollapsingHeader("Cache Weights"))
+  {
+    static char weightPrefix[512] = "bdrc_weights";
+    ImGui::InputText("Path prefix", weightPrefix, sizeof(weightPrefix));
+    ImGui::SameLine();
+    ImGui::TextDisabled("(saves _eye.bin / _light.bin / _mask.bin)");
+
+    if (ImGui::Button("Save"))
+    {
+      const std::string p = weightPrefix;
+      try
+      {
+        bdrcSaveWeights(m_bdrcSystem, p + "_eye.bin", p + "_light.bin", p + "_mask.bin");
+        std::cout << "BDRC weights saved to prefix '" << p << "'\n";
+      }
+      catch (const std::exception& e)
+      {
+        std::cerr << "bdrcSaveWeights failed: " << e.what() << "\n";
+      }
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Load"))
+    {
+      const std::string p = weightPrefix;
+      if (!bdrcLoadWeights(m_bdrcSystem, m_cudaStream, p + "_eye.bin", p + "_light.bin", p + "_mask.bin"))
+        std::cerr << "bdrcLoadWeights: failed to load from prefix '" << p << "'\n";
+      else
+        std::cout << "BDRC weights loaded from prefix '" << p << "'\n";
     }
   }
 
@@ -2482,7 +2532,7 @@ void Application::guiWindow()
 
     if (0.0f < fovY) // Perspective camera.
     {
-      if (ImGui::DragFloat("FoV Y (deg)", &fovY, 0.5f, 1.0f, 179.0f))
+      if (ImGui::DragFloat("FoV Y (deg)", &fovY, 0.5f, 0.0f, 179.0f))
       {
         guiCam.setFovY(fovY);
         camChanged = true;
@@ -5890,16 +5940,20 @@ void Application::buildDeviceMeshAccel(const int indexDeviceMesh, const bool reb
     {
       CUdeviceptr d_gas; // Must be aligned to OPTIX_ACCEL_BUFFER_BYTE_ALIGNMENT.
 
-      CUDA_CHECK( cudaMalloc(reinterpret_cast<void**>(&d_gas), accelBufferSizes.outputSizeInBytes) ); 
+      CUDA_CHECK( cudaMalloc(reinterpret_cast<void**>(&d_gas), accelBufferSizes.outputSizeInBytes) );
 
       CUdeviceptr d_temp; // Must be aligned to OPTIX_ACCEL_BUFFER_BYTE_ALIGNMENT.
 
       CUDA_CHECK( cudaMalloc(reinterpret_cast<void**>(&d_temp), accelBufferSizes.tempSizeInBytes) );
 
-      OptixAccelEmitDesc accelEmit = {};
+      // Emit both compacted size and AABB in a single build call.
+      OptixAccelEmitDesc accelEmits[2] = {};
 
-      CUDA_CHECK( cudaMalloc(reinterpret_cast<void**>(&accelEmit.result), 8) ); // Room for size_t for the compacted size.
-      accelEmit.type = OPTIX_PROPERTY_TYPE_COMPACTED_SIZE;
+      CUDA_CHECK( cudaMalloc(reinterpret_cast<void**>(&accelEmits[0].result), 8) ); // Room for size_t for the compacted size.
+      accelEmits[0].type = OPTIX_PROPERTY_TYPE_COMPACTED_SIZE;
+
+      CUDA_CHECK( cudaMalloc(reinterpret_cast<void**>(&accelEmits[1].result), 6 * sizeof(float)) ); // Room for float3 min + float3 max.
+      accelEmits[1].type = OPTIX_PROPERTY_TYPE_AABBS;
 
       OPTIX_CHECK( m_api.optixAccelBuild(m_optixContext,
                                          m_cudaStream,
@@ -5907,16 +5961,22 @@ void Application::buildDeviceMeshAccel(const int indexDeviceMesh, const bool reb
                                          buildInputs.data(),
                                          static_cast<unsigned int>(buildInputs.size()),
                                          d_temp, accelBufferSizes.tempSizeInBytes,
-                                         d_gas, accelBufferSizes.outputSizeInBytes, 
+                                         d_gas, accelBufferSizes.outputSizeInBytes,
                                          &deviceMesh.gas,
-                                         &accelEmit, // Emitted property: compacted size
-                                         1) );       // Number of emitted properties.
+                                         accelEmits, 2) );
 
       size_t sizeCompact;
 
-      CUDA_CHECK( cudaMemcpy(reinterpret_cast<void*>(&sizeCompact), (const void*) accelEmit.result, sizeof(size_t), cudaMemcpyDeviceToHost) );
+      CUDA_CHECK( cudaMemcpy(reinterpret_cast<void*>(&sizeCompact), (const void*) accelEmits[0].result, sizeof(size_t), cudaMemcpyDeviceToHost) );
 
-      CUDA_CHECK( cudaFree(reinterpret_cast<void*>(accelEmit.result)) );
+      // Store the GAS-local rest-pose AABB for cache query normalization.
+      float aabbData[6];
+      CUDA_CHECK( cudaMemcpy(aabbData, reinterpret_cast<const void*>(accelEmits[1].result), 6 * sizeof(float), cudaMemcpyDeviceToHost) );
+      deviceMesh.localAabbMin = make_float3(aabbData[0], aabbData[1], aabbData[2]);
+      deviceMesh.localAabbMax = make_float3(aabbData[3], aabbData[4], aabbData[5]);
+
+      CUDA_CHECK( cudaFree(reinterpret_cast<void*>(accelEmits[0].result)) );
+      CUDA_CHECK( cudaFree(reinterpret_cast<void*>(accelEmits[1].result)) );
 
       CUDA_CHECK( cudaFree(reinterpret_cast<void*>(d_temp)) );
 
@@ -5958,6 +6018,17 @@ void Application::buildDeviceMeshAccel(const int indexDeviceMesh, const bool reb
 
       CUDA_CHECK( cudaMalloc(reinterpret_cast<void**>(&d_temp), sizeTemp) );
 
+      // On initial build, emit and store the GAS-local rest-pose AABB for cache normalization.
+      // On update (animated frames), skip: keep the rest-pose bounds so normalization is stable.
+      CUdeviceptr d_aabb = 0;
+      OptixAccelEmitDesc emitAABB = {};
+      if (rebuild)
+      {
+        CUDA_CHECK( cudaMalloc(reinterpret_cast<void**>(&d_aabb), 6 * sizeof(float)) );
+        emitAABB.result = d_aabb;
+        emitAABB.type   = OPTIX_PROPERTY_TYPE_AABBS;
+      }
+
       OPTIX_CHECK( m_api.optixAccelBuild(m_optixContext,
                                          m_cudaStream,
                                          &accelBuildOptions,
@@ -5966,10 +6037,19 @@ void Application::buildDeviceMeshAccel(const int indexDeviceMesh, const bool reb
                                          d_temp, sizeTemp,
                                          deviceMesh.d_gas, accelBufferSizes.outputSizeInBytes,
                                          &deviceMesh.gas,
-                                         nullptr,
-                                         0) );
+                                         d_aabb ? &emitAABB : nullptr,
+                                         d_aabb ? 1u : 0u) );
 
       CUDA_CHECK( cudaFree(reinterpret_cast<void*>(d_temp)) );
+
+      if (d_aabb)
+      {
+        float aabbData[6];
+        CUDA_CHECK( cudaMemcpy(aabbData, reinterpret_cast<const void*>(d_aabb), 6 * sizeof(float), cudaMemcpyDeviceToHost) );
+        deviceMesh.localAabbMin = make_float3(aabbData[0], aabbData[1], aabbData[2]);
+        deviceMesh.localAabbMax = make_float3(aabbData[3], aabbData[4], aabbData[5]);
+        CUDA_CHECK( cudaFree(reinterpret_cast<void*>(d_aabb)) );
+      }
     }
   }
 
@@ -6462,6 +6542,10 @@ void Application::initSBT()
           auto it = m_meshLightLookup.find({instanceIdx, primIdx});
           rec.data.lightDefinitionIndex = (it != m_meshLightLookup.end()) ? it->second : -1;
         }
+
+        // GAS-local rest-pose AABB for cache query normalization (stable across rigid-body animation).
+        rec.data.localAabbMin = deviceMesh.localAabbMin;
+        rec.data.localAabbMax = deviceMesh.localAabbMax;
 
         //std::cout << "\tDevice Primitive " << devicePrim.name << ", type " << devicePrim.getPrimitiveType() << std::endl;
 
@@ -7063,6 +7147,7 @@ void Application::initLaunchParameters()
   m_launchParameters.resolution       = m_resolution; // Independent of the window client area.
   m_launchParameters.picking          = make_float2(-1.0f); // No picking ray.
   m_launchParameters.pathLengths      = make_int2(2, 6);
+  m_launchParameters.lightPathMaxDepth = 6;
   m_launchParameters.iteration        = 0u;              // Sub-frame number for the progressive accumulation of results.
   m_launchParameters.sceneEpsilon     = m_epsilonFactor * SCENE_EPSILON_SCALE;
   m_launchParameters.directLighting   = (m_useDirectLighting)   ? 1 : 0;
@@ -7287,6 +7372,8 @@ void Application::update()
       glActiveTexture(GL_TEXTURE0);
       glBindTexture(GL_TEXTURE_2D, m_hdrTexture);
       glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei) m_resolution.x, (GLsizei) m_resolution.y, GL_RGBA, GL_FLOAT, m_bufferHost); // RGBA32F
+      // Note: recording will capture the final framebuffer after GUI rendering to ensure
+      // overlays and tonemapping are included. We don't write here to avoid duplicate frames.
       break;
     }
 
@@ -7455,7 +7542,6 @@ bool Application::screenshot(const bool tonemap)
 
   return false;
 }
-
 
 // Init (if needed) and scale the font depending on screen DPI.
 void Application::updateFonts()

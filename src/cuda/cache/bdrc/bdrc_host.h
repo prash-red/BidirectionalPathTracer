@@ -7,6 +7,7 @@
 
 #include <cuda_runtime.h>
 #include <cstdint>
+#include <string>
 
 struct BdrcSystem; // opaque, defined in BdrcHost.cu
 
@@ -15,16 +16,10 @@ BdrcSystem* bdrcCreate(cudaStream_t stream);
 void        bdrcDestroy(BdrcSystem* sys);
 
 // Allocate (or reallocate) all BDRC device buffers.
-// batchSize must be a multiple of 256.
-void bdrcAllocBuffers(BdrcSystem* sys, uint32_t batchSize);
+// numPixels is the total pixel count (batchSize is computed internally).
+void bdrcAllocBuffers(BdrcSystem* sys, uint32_t numPixels);
 
 // Buffer accessors — for wiring into NrcLaunchBuffers in Application.cpp
-float*        bdrcLightEndpoints    (const BdrcSystem* sys);
-float*        bdrcLightTargets      (const BdrcSystem* sys);
-unsigned int* bdrcLightValid        (const BdrcSystem* sys);
-float*        bdrcLight_p_sa        (const BdrcSystem* sys);
-float*        bdrcLight_p_e_area    (const BdrcSystem* sys);
-unsigned int* bdrcLightCount        (const BdrcSystem* sys);
 float*        bdrcLightOutput       (const BdrcSystem* sys);
 float*        bdrcMaskOutput        (const BdrcSystem* sys);
 float*        bdrcRenderFeatures    (const BdrcSystem* sys);
@@ -44,10 +39,11 @@ float*        bdrcResampledEndpoints(const BdrcSystem* sys);
 unsigned int* bdrcResampledValid    (const BdrcSystem* sys);
 float*        bdrcResampled_p_sa         (const BdrcSystem* sys);
 float*        bdrcResampled_p_e_area     (const BdrcSystem* sys);
-float*        bdrcCompactLightEndpoints  (const BdrcSystem* sys);
-float*        bdrcCompactLightTargets    (const BdrcSystem* sys);
-unsigned int* bdrcCompactLightCount      (const BdrcSystem* sys);
-float*        bdrcCompactLight_p_e_area  (const BdrcSystem* sys);
+float*        bdrcLightEndpoints         (const BdrcSystem* sys);
+float*        bdrcLightTargets           (const BdrcSystem* sys);
+float*        bdrcLight_p_e_area         (const BdrcSystem* sys);
+float*        bdrcLightEyeTp             (const BdrcSystem* sys);
+unsigned int* bdrcLightValid             (const BdrcSystem* sys);
 float*        bdrcCompactResampledEndpoints(const BdrcSystem* sys);
 unsigned int* bdrcCompactResampledCount  (const BdrcSystem* sys);
 float*        bdrcCompactResampled_p_e_area(const BdrcSystem* sys);
@@ -55,6 +51,18 @@ float         bdrcGetLastEyeLoss  (const BdrcSystem* sys);
 float         bdrcGetLastLightLoss(const BdrcSystem* sys);
 float         bdrcGetLastMaskLoss (const BdrcSystem* sys);
 float*        bdrcRenderOutput    (const BdrcSystem* sys);
+
+// Save/load inference weights for all three caches.
+// File format: 4-byte magic + 4-byte param count + raw half-precision weights.
+void bdrcSaveWeights(const BdrcSystem* sys,
+                     const std::string& eyePath,
+                     const std::string& lightPath,
+                     const std::string& maskPath);
+bool bdrcLoadWeights(BdrcSystem*        sys,
+                     cudaStream_t       stream,
+                     const std::string& eyePath,
+                     const std::string& lightPath,
+                     const std::string& maskPath);
 
 // Per-frame dispatch. Call after both eye and light raygen launches complete.
 // All eye-path and light-path buffers are owned by BdrcSystem.

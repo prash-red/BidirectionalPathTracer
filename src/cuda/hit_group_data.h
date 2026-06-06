@@ -40,7 +40,9 @@ struct HitGroupData
 {
   GeometryData geometryData;
   MaterialData materialData;
-  int lightDefinitionIndex; // Index into lightDefinitions[]; -1 if not a mesh light
+  int          lightDefinitionIndex; // Index into lightDefinitions[]; -1 if not a mesh light
+  float3       localAabbMin;         // GAS-local rest-pose bounding box (stable across rigid-body animation)
+  float3       localAabbMax;
 };
 
 #endif // HIT_GROUP_DATA_h

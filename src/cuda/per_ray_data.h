@@ -109,6 +109,9 @@ struct PerRayData
   
   float3 pos;         // Current surface hit point or volume sample point, in world space
   float  distance;    // Distance from the ray origin to the current position, in world space. Needed for absorption of nested materials.
+  float3 posLocal;    // Hit position in GAS-local space (written by closest-hit; stable across rigid-body animation)
+  float3 localAabbMin; // GAS-local rest-pose AABB min (from HitGroupData, for cache normalization)
+  float3 localAabbMax; // GAS-local rest-pose AABB max
   
   float3 wo;          // Outgoing direction, to observer, in world space.
   float3 wi;          // Incoming direction, to light, in world space.

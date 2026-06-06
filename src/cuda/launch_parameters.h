@@ -42,6 +42,10 @@ enum NrcType {
     BDRC
 };
 
+// Maximum number of diffuse-after-specular connections stored per light path.
+// Controls the size of the depth-strided light buffer: BDRC_MAX_LIGHT_DEPTH × numPixels.
+constexpr int BDRC_MAX_LIGHT_DEPTH = 6;
+
 // Device buffers used by the NRC path-termination and self-training loop.
 // All float* and unsigned int* are device pointers.
 // When enabled == 0, all pointers may be nullptr and no NRC code executes.
@@ -52,6 +56,7 @@ struct NrcLaunchBuffers
   float*        renderThroughput;      // [3 × numPixels]  throughput at vertex K
   float*        renderPrefix;          // [3 × numPixels]  accumulated direct radiance up to K
   float*        renderOutput;          // [3 × numPixels]  filled by nrc.query() on host
+  float*        renderReflectance;     // [3 × numPixels]  clamp(α+β, 0.01) at K — reflectance factorization
   unsigned int* renderValid;           // [numPixels] 0 / 1
 
   // ---- Forward NRC buffers -------------------------------------------------
@@ -61,7 +66,7 @@ struct NrcLaunchBuffers
   float*        trainSuffixThroughput; // [3 × batchSize]  slot-indexed: throughput at last suffix vertex
   float*        trainThroughputAtK;    // [3 × batchSize]  slot-indexed: T_{K+1} at termination vertex
   unsigned int* trainNextValid;        // [batchSize] 0 / 1  (slot-indexed)
-  float*        albedo;                // [3 × batchSize]
+  float*        trainReflectance;      // [3 × batchSize]  clamp(α+β, 0.01) per training slot
 
   // ---- Compact training batch (Option B: stream compaction via atomicAdd) ----
   // raygen writes training pixels into a compact slot array; only slot-indexed
@@ -71,14 +76,15 @@ struct NrcLaunchBuffers
   unsigned int* trainPixelIndices; // [batchSize] pixel index for each training slot (unused by kernels, diagnostic)
   float*        trainFeatures;     // [NRC_INPUT_DIM × batchSize] compact slot-indexed train features
 
-  // ---- BDRC light-path buffers (null when bdrcEnabled == 0) -----------------
-  float*        lightEndpoints;        // [3 × numPixels]  Y pos (light caustic floor), normalized
-  float*        lightTargets;          // [3 × numPixels]  tp_Y_pre * f_Y_toward_S
-  unsigned int* lightValid;            // [numPixels]  1 if light path found a valid specular-diffuse Y
-  float*        light_p_sa;            // [numPixels]  Hemisphere pdf at Y for the sampled light path - analytic
-  float*        light_p_e_area;        // [numPixels]  Eye-path area PDF at Y: p_e_sa * cos_Y / dist_YS²
-  unsigned int* lightCount;            // [1] atomic counter: valid caustic samples this frame
-  float*        lightOutput;           // [3 × numPixels]  filled by bdrcDispatch() on host side
+  // ---- BDRC light-path depth-strided buffers — written by bdrcLightIntegrator.
+  // Slot for depth d, pixel p: s = d * numPixels + p.  No atomics needed.
+  // Total size: BDRC_MAX_LIGHT_DEPTH × numPixels per array.
+  float*        lightEndpoints;        // [3 × BDRC_MAX_LIGHT_DEPTH × numPixels]  Y pos (AABB-normalized)
+  float*        lightTargets;          // [3 × BDRC_MAX_LIGHT_DEPTH × numPixels]  tp_Y_pre * f_Y_toward_S
+  float*        light_p_e_area;        // [BDRC_MAX_LIGHT_DEPTH × numPixels]      eye-path area PDF at Y
+  float*        lightEyeTp;            // [3 × BDRC_MAX_LIGHT_DEPTH × numPixels]  eye-vertex throughput RGB (compacted to luminance by dispatch)
+  unsigned int* lightValid;            // [BDRC_MAX_LIGHT_DEPTH × numPixels]      1 if slot is valid
+  float*        lightOutput;           // [3 × numPixels]  inference output (unchanged)
 
   // ---- BDRC eye-path supervision buffers (written by eye integrator) ---------
   float*        eyeVertexPos;          // [3 × numPixels]  S pos (last specular before D, or camera)
@@ -129,7 +135,8 @@ struct LaunchParameters
   int2   resolution; // Rendering resolution. Usually matches optixGetLaunchDimensions, except when picking!
   float2 picking;    // Screen space coordinate of the picking ray inside the resolution
   
-  int2 pathLengths;  // .x == minimum path length before Russian Roulette starts, .y = maximum path length.
+  int2 pathLengths;       // .x == minimum path length before Russian Roulette starts, .y = maximum path length (eye paths).
+  int  lightPathMaxDepth; // Maximum bounce depth for light paths (both BDPT and BDRC integrators).
 
   // 4 byte alignment
   //unsigned int width;

@@ -10,7 +10,10 @@
 
 #include <cmath>
 #include <cstdio>
+#include <fstream>
+#include <iostream>
 #include <stdexcept>
+#include <vector>
 
 // ---- Gradient clipping (global L2 norm) ------------------------------------
 
@@ -373,4 +376,74 @@ std::string base_ngp_cache::serialize(const std::string& name) const {
 		m_outputDim,
 		m_emaActive ? " [EMA active]" : "");
 	return {buf};
+}
+
+static constexpr uint32_t WEIGHT_FILE_MAGIC = 0xBD4C0001u;
+
+void base_ngp_cache::saveWeights(const std::string& path) const
+{
+	const size_t n = m_network->n_params();
+
+	// Use EMA shadow if available — that's what query() uses for inference.
+	// Warn if EMA is enabled but not yet initialized (would save raw training weights instead).
+	if (m_emaActive && !m_emaInitialized)
+		std::cerr << "saveWeights: EMA enabled but not yet initialized for '" << path
+		          << "' — saving raw training weights; load will use these as EMA.\n";
+
+	const tcnn::network_precision_t* src =
+		(m_emaActive && m_emaInitialized) ? m_emaParamsBuf.data() : m_params;
+
+	std::vector<tcnn::network_precision_t> cpu(n);
+	CUDA_CHECK_THROW(cudaMemcpy(cpu.data(), src,
+	                            sizeof(tcnn::network_precision_t) * n,
+	                            cudaMemcpyDeviceToHost));
+
+	std::ofstream f(path, std::ios::binary);
+	if (!f) throw std::runtime_error("saveWeights: cannot open " + path);
+
+	const uint32_t n32 = static_cast<uint32_t>(n);
+	f.write(reinterpret_cast<const char*>(&WEIGHT_FILE_MAGIC), sizeof(WEIGHT_FILE_MAGIC));
+	f.write(reinterpret_cast<const char*>(&n32),               sizeof(n32));
+	f.write(reinterpret_cast<const char*>(cpu.data()),         sizeof(tcnn::network_precision_t) * n);
+}
+
+bool base_ngp_cache::loadWeights(const std::string& path, cudaStream_t stream)
+{
+	std::ifstream f(path, std::ios::binary);
+	if (!f) return false;
+
+	uint32_t magic = 0, n32 = 0;
+	f.read(reinterpret_cast<char*>(&magic), sizeof(magic));
+	f.read(reinterpret_cast<char*>(&n32),   sizeof(n32));
+	if (!f || magic != WEIGHT_FILE_MAGIC) return false;
+
+	const size_t n = m_network->n_params();
+	if (n32 != static_cast<uint32_t>(n)) return false;
+
+	std::vector<tcnn::network_precision_t> cpu(n);
+	f.read(reinterpret_cast<char*>(cpu.data()), sizeof(tcnn::network_precision_t) * n);
+	if (!f) return false;
+
+	// Write into training weights.
+	CUDA_CHECK_THROW(cudaMemcpyAsync(m_params, cpu.data(),
+	                                 sizeof(tcnn::network_precision_t) * n,
+	                                 cudaMemcpyHostToDevice, stream));
+
+	// Mirror into EMA shadow so inference is consistent regardless of EMA state.
+	if (m_emaActive) {
+		if (m_emaParamsBuf.size() != n) m_emaParamsBuf.resize(n);
+		CUDA_CHECK_THROW(cudaMemcpyAsync(m_emaParamsBuf.data(), cpu.data(),
+		                                 sizeof(tcnn::network_precision_t) * n,
+		                                 cudaMemcpyHostToDevice, stream));
+		m_emaInitialized = true;
+		// Place the EMA counter in the stable exponential regime so subsequent
+		// updateEma() calls use a small coeffNew (≈ 1-decay) rather than the
+		// aggressive early-step blending of the ADS formula. Without this, a
+		// fresh session (m_emaUpdateCount=0) would 50%-dilute the loaded EMA
+		// weights on frame 2 and wash them out within ~10 frames.
+		m_emaUpdateCount = 10000;
+	}
+
+	CUDA_CHECK_THROW(cudaStreamSynchronize(stream));
+	return true;
 }

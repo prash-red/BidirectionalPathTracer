@@ -10,9 +10,9 @@ ngp_config makeMaskConfig()
 {
 	ngp_config cfg;
 	cfg.outputActivation = "Softplus";
-	cfg.ema.enabled = false;
-	cfg.lr = 5e-5f;
-	cfg.gradClip = 5.0f;
+	cfg.ema.enabled = true;
+	cfg.lr = 1e-5;
+	cfg.gradClip = 0.05f;
 	return cfg;
 }
 

@@ -87,12 +87,13 @@ __device__ __forceinline__ void bdrcPackFeatures(
     float* d = buf + pixelIdx * BDRC_INPUT_DIM;
 
     // [0,1,2] world-space position normalized to scene AABB
-    const float rx = aabbMax.x - aabbMin.x;
-    const float ry = aabbMax.y - aabbMin.y;
-    const float rz = aabbMax.z - aabbMin.z;
-    d[0] = fminf(fmaxf((pos.x - aabbMin.x) / (rx > 0.f ? rx : 1.f), 0.f), 1.f);
-    d[1] = fminf(fmaxf((pos.y - aabbMin.y) / (ry > 0.f ? ry : 1.f), 0.f), 1.f);
-    d[2] = fminf(fmaxf((pos.z - aabbMin.z) / (rz > 0.f ? rz : 1.f), 0.f), 1.f);
+    const float pad = 0.f;
+    const float rx = aabbMax.x - aabbMin.x + 2 * pad;
+    const float ry = aabbMax.y - aabbMin.y + 2 * pad;
+    const float rz = aabbMax.z - aabbMin.z + 2 * pad;
+    d[0] = fminf(fmaxf((pos.x - (aabbMin.x - pad)) / (rx > 0.f ? rx : 1.f), 0.f), 1.f);
+    d[1] = fminf(fmaxf((pos.y - (aabbMin.y - pad)) / (ry > 0.f ? ry : 1.f), 0.f), 1.f);
+    d[2] = fminf(fmaxf((pos.z - (aabbMin.z - pad)) / (rz > 0.f ? rz : 1.f), 0.f), 1.f);
 }
 
 #endif // NRC_FEATURES_H

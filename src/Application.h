@@ -466,6 +466,7 @@ private:
                                       // This affects only diffuse and glossy (metal) reflections inside the renderer and only environment lights.
   bool m_showEnvironment     = true;  // Toggle the display of the environment for primary camera rays, shows black instead.
   bool m_forceUnlit          = false; // Force renderer to handle all materials as unlit. Useful in case the scene is not modeled correctly for global illumination (like VirtualCity.gltf).
+  bool m_accumulate          = true;  // When false, each frame shows a fresh 1-sample-per-pixel image (no progressive averaging).
 
   // OpenGL resources used inside the VBO path.
   GLuint m_vboAttributes = 0;

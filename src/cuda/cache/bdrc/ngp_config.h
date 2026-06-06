@@ -38,15 +38,13 @@ struct ngp_config
     bool        lamb        = false;
 
     // Precision and gradient-scaling controls.
-    bool  gradScaler             = true;
+    bool  gradScaler             = false;
     float gradScalerInitScale    = 65536.0f;
     float gradScalerGrowthFactor = 2.0f;
-    bool  gradScalerGrowth       = true;
+    bool  gradScalerGrowth       = false;
 
     // Gradient clipping and regularization controls.
     float gradClip       = 0.0f;
-    float weightDecayMlp = 0.0f;
-    float weightDecayEnc = 0.0f;
 
     EMAConfig ema;
 
