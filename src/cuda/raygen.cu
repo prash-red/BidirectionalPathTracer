@@ -489,6 +489,7 @@ __forceinline__ __device__ float3 integrator(PerRayData& prd, const uint2 theLau
   prd.nrcTerminated = false;
   prd.eyePathFoundDiffuse    = false;
   prd.eyePathInSpecularChain = false;
+  prd.virtEmitDepth = 0;
 
   // NRC area-spread tracking (Mueller et al. 2021, Section 3.4).
   // All local to the integrator; no need to store in PRD.

@@ -34,6 +34,7 @@
 #include "shader_common.h"
 #include "random.h"
 #include "bxdf_common.h"
+#include "cache/nrc_features.h"
 
 
 // DEBUG
@@ -1530,6 +1531,40 @@ __forceinline__ __device__ void chRadiance()
                                   && theLaunchParameters.nrc.nrcType == BDRC
                                   && thePrd->eyePathFoundDiffuse
                                   && thePrd->eyePathInSpecularChain);
+
+  // Virtual light emitter: when direct emission is suppressed here to avoid
+  // double-counting the caustic already captured by the light cache (see
+  // validForEyeCache above), record this vertex so the host can later query
+  // the frozen (EMA) light-color cache here and add the missing radiance into
+  // the EYE CACHE'S TRAINING TARGET ONLY (never into the live rendered frame —
+  // the eye cache is queried once, at its own first-diffuse vertex, at render
+  // time, so compensating its training target is sufficient and correct).
+  if (!validForEyeCache && theLaunchParameters.nrc.enabled
+      && theLaunchParameters.nrc.nrcType == BDRC
+      && thePrd->virtEmitDepth < VIRT_EMIT_MAX_DEPTH)
+  {
+    const unsigned int pixelIdx = theLaunchParameters.resolution.x * optixGetLaunchIndex().y
+                                 + optixGetLaunchIndex().x;
+    const unsigned int numPix   = theLaunchParameters.resolution.x * theLaunchParameters.resolution.y;
+    const unsigned int slot     = static_cast<unsigned int>(thePrd->virtEmitDepth) * numPix + pixelIdx;
+    const NrcLaunchBuffers& nrc = theLaunchParameters.nrc;
+
+    bdrcPackFeatures(nrc.virtEmitPos, slot, thePrd->posLocal, thePrd->localAabbMin, thePrd->localAabbMax);
+
+    // Retro-BSDF response toward the incoming eye-path direction, times the
+    // throughput arriving at this vertex (pre-local-BSDF), so multiplying by
+    // the light cache's stored radiance at this point gives this vertex's
+    // contribution to the pixel's accumulated radiance in the same units as
+    // every other term already summed into prd.radiance.
+    const float3 f_retro = state.baseColor * (fmaxf(dot(state.N, thePrd->wo), 0.0f) * M_1_PIf);
+    const float3 w       = thePrd->throughputPreBsdf * f_retro;
+    nrc.virtEmitThroughput[3*slot+0] = w.x;
+    nrc.virtEmitThroughput[3*slot+1] = w.y;
+    nrc.virtEmitThroughput[3*slot+2] = w.z;
+    nrc.virtEmitValid[slot] = 1u;
+
+    thePrd->virtEmitDepth += 1;
+  }
 
   // FIXME Implement arbitrary mesh lights. This only handles geometry emission on implicit hits.
   // Unfortunately many emission textures in glTF models are applied to the whole models 
