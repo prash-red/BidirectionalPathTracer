@@ -7252,6 +7252,11 @@ void Application::initLaunchParameters()
   m_launchParameters.lightDefinitions = reinterpret_cast<LightDefinition*>(m_d_lightDefinitions);
   m_launchParameters.numLights        = static_cast<int>(m_lightDefinitions.size());
 
+  m_launchParameters.surfaceRef.positions    = reinterpret_cast<float3*>(m_surfaceRefPositions);
+  m_launchParameters.surfaceRef.cdf          = reinterpret_cast<float*>(m_surfaceRefCdf);
+  m_launchParameters.surfaceRef.triCount     = m_surfaceRefTriCount;
+  m_launchParameters.surfaceRef.invTotalArea = m_surfaceRefInvTotalArea;
+
   m_launchParameters.sceneSphereCenter = make_float3(0.0f);
   m_launchParameters.sceneSphereRadius = 1.0f;
 
@@ -7274,6 +7279,11 @@ void Application::updateLaunchParameters()
 
   m_launchParameters.lightDefinitions = reinterpret_cast<LightDefinition*>(m_d_lightDefinitions);
   m_launchParameters.numLights        = static_cast<int>(m_lightDefinitions.size());
+
+  m_launchParameters.surfaceRef.positions    = reinterpret_cast<float3*>(m_surfaceRefPositions);
+  m_launchParameters.surfaceRef.cdf          = reinterpret_cast<float*>(m_surfaceRefCdf);
+  m_launchParameters.surfaceRef.triCount     = m_surfaceRefTriCount;
+  m_launchParameters.surfaceRef.invTotalArea = m_surfaceRefInvTotalArea;
 
   // Update scene bounding sphere for BDPT environment light sampling.
   if (m_sceneExtent.isValid())

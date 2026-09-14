@@ -46,6 +46,19 @@ enum NrcType {
 // Controls the size of the depth-strided light buffer: BDRC_MAX_LIGHT_DEPTH × numPixels.
 constexpr int BDRC_MAX_LIGHT_DEPTH = 6;
 
+// Global diffuse-surface reference table for CPM/NCE mask-cache training.
+// Density at ANY point on this surface set is the single scalar invTotalArea
+// (pure area-uniform reference — the a_eff=0 case of the Python project's
+// surface_mixture reference distribution). Built once at scene load; never
+// depends on the camera or the current eye path.
+struct SurfaceReferenceTable
+{
+  float3*      positions;    // [3 * triCount] world-space triangle verts (v0,v1,v2 per tri)
+  float*       cdf;          // [triCount + 1] normalized cumulative-area CDF
+  unsigned int triCount;
+  float        invTotalArea; // 1 / total surface area — the known reference density
+};
+
 // Device buffers used by the NRC path-termination and self-training loop.
 // All float* and unsigned int* are device pointers.
 // When enabled == 0, all pointers may be nullptr and no NRC code executes.
@@ -131,6 +144,8 @@ struct LaunchParameters
 
   float3 sceneSphereCenter; // World-space center of the scene bounding sphere (for env-light path sampling).
   float  sceneSphereRadius; // Radius of the scene bounding sphere.
+
+  SurfaceReferenceTable surfaceRef;
 
   int2   resolution; // Rendering resolution. Usually matches optixGetLaunchDimensions, except when picking!
   float2 picking;    // Screen space coordinate of the picking ray inside the resolution
