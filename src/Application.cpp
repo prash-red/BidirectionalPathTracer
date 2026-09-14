@@ -393,6 +393,7 @@ void Application::initRenderer(const bool first)
   buildInstanceAccel(true/*rebuild*/);
 
   initMeshLights();
+  initSurfaceReferenceTable();
 
   if (first)
   {
@@ -1442,6 +1443,7 @@ void Application::updateRenderGraph()
     updateScene(true);        // Rebuild the m_instances vector from instances reachable by the current scene.
     buildInstanceAccel(true); // Rebuild the top-level IAS.
     initMeshLights();
+    initSurfaceReferenceTable();
     updateSBT();              // Rebuild the hit records according to the m_instances of the current scene.
     updateLaunchParameters(); // This sets the root m_ias and restarts the accumulation.
  
@@ -4557,6 +4559,96 @@ void Application::freeMeshLights()
 }
 
 
+void Application::freeSurfaceReferenceTable()
+{
+  if (m_surfaceRefPositions) { cudaFree(reinterpret_cast<void*>(m_surfaceRefPositions)); m_surfaceRefPositions = 0; }
+  if (m_surfaceRefCdf)       { cudaFree(reinterpret_cast<void*>(m_surfaceRefCdf));       m_surfaceRefCdf       = 0; }
+  m_surfaceRefTriCount     = 0;
+  m_surfaceRefTotalArea    = 0.0f;
+  m_surfaceRefInvTotalArea = 0.0f;
+}
+
+
+void Application::initSurfaceReferenceTable()
+{
+  freeSurfaceReferenceTable();
+
+  std::vector<float3> worldPositions;
+  std::vector<float>  triAreas;
+
+  for (size_t instanceIdx = 0; instanceIdx < m_instances.size(); ++instanceIdx)
+  {
+    const dev::Instance&   instance   = m_instances[instanceIdx];
+    const dev::DeviceMesh& deviceMesh = m_deviceMeshes[instance.indexDeviceMesh];
+    const dev::HostMesh&   hostMesh   = m_hostMeshes[deviceMesh.key.idxHostMesh];
+
+    for (size_t primIdx = 0; primIdx < hostMesh.primitives.size(); ++primIdx)
+    {
+      const dev::HostPrimitive& hostPrim = hostMesh.primitives[primIdx];
+      if (hostPrim.indices.count == 0)
+        continue;
+
+      const unsigned int* indexData    = reinterpret_cast<const unsigned int*>(hostPrim.indices.h_ptr);
+      const float3*       posData      = reinterpret_cast<const float3*>(hostPrim.positions.h_ptr);
+      const size_t        numTriangles = hostPrim.indices.count / 3;
+      const glm::mat4x4&  xform        = instance.transform;
+
+      for (size_t t = 0; t < numTriangles; ++t)
+      {
+        const unsigned int i0 = indexData[3 * t + 0];
+        const unsigned int i1 = indexData[3 * t + 1];
+        const unsigned int i2 = indexData[3 * t + 2];
+
+        const glm::vec4 p0w = xform * glm::vec4(posData[i0].x, posData[i0].y, posData[i0].z, 1.0f);
+        const glm::vec4 p1w = xform * glm::vec4(posData[i1].x, posData[i1].y, posData[i1].z, 1.0f);
+        const glm::vec4 p2w = xform * glm::vec4(posData[i2].x, posData[i2].y, posData[i2].z, 1.0f);
+
+        const float3 w0 = make_float3(p0w.x, p0w.y, p0w.z);
+        const float3 w1 = make_float3(p1w.x, p1w.y, p1w.z);
+        const float3 w2 = make_float3(p2w.x, p2w.y, p2w.z);
+
+        const float3 cr      = cross(w1 - w0, w2 - w0);
+        const float  triArea = 0.5f * sqrtf(dot(cr, cr));
+        if (triArea <= 0.0f)
+          continue;
+
+        worldPositions.push_back(w0);
+        worldPositions.push_back(w1);
+        worldPositions.push_back(w2);
+        triAreas.push_back(triArea);
+      }
+    }
+  }
+
+  const size_t numTriangles = triAreas.size();
+  if (numTriangles == 0)
+    return;
+
+  std::vector<float> cdf(numTriangles + 1, 0.0f);
+  for (size_t t = 0; t < numTriangles; ++t)
+    cdf[t + 1] = cdf[t] + triAreas[t];
+  const float totalArea = cdf[numTriangles];
+  if (totalArea <= 0.0f)
+    return;
+  const float invTotal = 1.0f / totalArea;
+  for (size_t t = 1; t <= numTriangles; ++t)
+    cdf[t] *= invTotal;
+  cdf[numTriangles] = 1.0f;
+
+  const size_t posBytes = worldPositions.size() * sizeof(float3);
+  CUDA_CHECK( cudaMalloc(reinterpret_cast<void**>(&m_surfaceRefPositions), posBytes) );
+  CUDA_CHECK( cudaMemcpy(reinterpret_cast<void*>(m_surfaceRefPositions), worldPositions.data(), posBytes, cudaMemcpyHostToDevice) );
+
+  const size_t cdfBytes = cdf.size() * sizeof(float);
+  CUDA_CHECK( cudaMalloc(reinterpret_cast<void**>(&m_surfaceRefCdf), cdfBytes) );
+  CUDA_CHECK( cudaMemcpy(reinterpret_cast<void*>(m_surfaceRefCdf), cdf.data(), cdfBytes, cudaMemcpyHostToDevice) );
+
+  m_surfaceRefTriCount     = static_cast<uint32_t>(numTriangles);
+  m_surfaceRefTotalArea    = totalArea;
+  m_surfaceRefInvTotalArea = invTotal;
+}
+
+
 void Application::initMeshLights()
 {
   freeMeshLights();
@@ -5775,6 +5867,7 @@ void Application::cleanup()
   }
 
   freeMeshLights();
+  freeSurfaceReferenceTable();
 
   if (m_d_lightDefinitions != 0)
   {

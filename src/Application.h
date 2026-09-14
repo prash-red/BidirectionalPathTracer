@@ -321,6 +321,8 @@ private:
   void initLights(const bool first);
   void initMeshLights();
   void freeMeshLights();
+  void initSurfaceReferenceTable();
+  void freeSurfaceReferenceTable();
   void initCameras();
   void initAnimations();
   void initSceneExtent();
@@ -574,6 +576,16 @@ private:
 
   std::vector<CUdeviceptr>                  m_meshLightBuffers;
   std::map<std::pair<size_t, size_t>, int>  m_meshLightLookup;
+
+  // ---- Global diffuse-surface reference table (CPM/NCE mask-cache reference) ----
+  // Flat world-space triangle list + cumulative-area CDF over every diffuse-capable
+  // mesh instance in the scene (NOT just emitters). Built once at scene load.
+  // Density at any point on this surface set is the single scalar 1/m_surfaceRefTotalArea.
+  CUdeviceptr  m_surfaceRefPositions   = 0;  // float3[3 * m_surfaceRefTriCount], world space
+  CUdeviceptr  m_surfaceRefCdf         = 0;  // float[m_surfaceRefTriCount + 1], normalized to [0,1]
+  uint32_t     m_surfaceRefTriCount    = 0;
+  float        m_surfaceRefTotalArea   = 0.0f;
+  float        m_surfaceRefInvTotalArea = 0.0f;
   
   // Data which is kept intact for faster animations:
   size_t m_indexInstance = 0; // Global index into m_instances which is tracked in traverseNode() when just updating the instances.
