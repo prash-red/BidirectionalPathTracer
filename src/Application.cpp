@@ -4561,8 +4561,8 @@ void Application::freeMeshLights()
 
 void Application::freeSurfaceReferenceTable()
 {
-  if (m_surfaceRefPositions) { cudaFree(reinterpret_cast<void*>(m_surfaceRefPositions)); m_surfaceRefPositions = 0; }
-  if (m_surfaceRefCdf)       { cudaFree(reinterpret_cast<void*>(m_surfaceRefCdf));       m_surfaceRefCdf       = 0; }
+  if (m_surfaceRefPositions) { CUDA_CHECK( cudaFree(reinterpret_cast<void*>(m_surfaceRefPositions)) ); m_surfaceRefPositions = 0; }
+  if (m_surfaceRefCdf)       { CUDA_CHECK( cudaFree(reinterpret_cast<void*>(m_surfaceRefCdf)) );       m_surfaceRefCdf       = 0; }
   m_surfaceRefTriCount     = 0;
   m_surfaceRefTotalArea    = 0.0f;
   m_surfaceRefInvTotalArea = 0.0f;
