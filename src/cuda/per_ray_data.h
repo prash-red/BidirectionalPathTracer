@@ -157,6 +157,7 @@ struct PerRayData
   // double-counted with the light cache's light→specular→diffuse caustic paths.
   bool eyePathFoundDiffuse;    // latches True once any diffuse vertex is hit
   bool eyePathInSpecularChain; // True if the previous BSDF bounce was specular
+  int  virtEmitDepth;          // Count of virtual-emission vertices recorded this path (caps at VIRT_EMIT_MAX_DEPTH)
 };
 
 

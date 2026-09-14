@@ -76,6 +76,16 @@ struct BdrcSystem
     float*        d_compactResampled_p_e_area    = nullptr; // [batchSize]  compacted eye-area PDF at R
     float*        d_debugTargetMatrix          = nullptr; // [3 × batchsize]
 
+    // Virtual light emitter buffers (Task 9 — unwired plumbing for Tasks 10-11).
+    float*        d_virtEmitPos        = nullptr; // [3 × VIRT_EMIT_MAX_DEPTH × batchSize]
+    float*        d_virtEmitThroughput = nullptr; // [3 × VIRT_EMIT_MAX_DEPTH × batchSize]
+    unsigned int* d_virtEmitValid      = nullptr; // [VIRT_EMIT_MAX_DEPTH × batchSize]
+    float*        d_compactVirtEmitPos        = nullptr; // [3 × VIRT_EMIT_MAX_DEPTH × batchSize]
+    float*        d_compactVirtEmitThroughput = nullptr; // [3 × VIRT_EMIT_MAX_DEPTH × batchSize]
+    unsigned int* d_compactVirtEmitCount       = nullptr; // [1]
+    float*        d_virtEmitOutput            = nullptr; // [3 × VIRT_EMIT_MAX_DEPTH × batchSize] lightNrc EMA query result
+    float*        d_virtEmitContribSum        = nullptr; // [3 × batchSize] per-training-slot summed compensation
+
     void freeAllBuffers()
     {
         cudaFree(d_lightOutput);         d_lightOutput         = nullptr;
@@ -115,6 +125,15 @@ struct BdrcSystem
         cudaFree(d_compactResampledCount);           d_compactResampledCount           = nullptr;
         cudaFree(d_compactResampled_p_e_area);       d_compactResampled_p_e_area       = nullptr;
         cudaFree(d_debugTargetMatrix);           d_debugTargetMatrix           = nullptr;
+
+        cudaFree(d_virtEmitPos);                 d_virtEmitPos                 = nullptr;
+        cudaFree(d_virtEmitThroughput);           d_virtEmitThroughput          = nullptr;
+        cudaFree(d_virtEmitValid);                d_virtEmitValid               = nullptr;
+        cudaFree(d_compactVirtEmitPos);           d_compactVirtEmitPos          = nullptr;
+        cudaFree(d_compactVirtEmitThroughput);    d_compactVirtEmitThroughput   = nullptr;
+        cudaFree(d_compactVirtEmitCount);         d_compactVirtEmitCount        = nullptr;
+        cudaFree(d_virtEmitOutput);               d_virtEmitOutput              = nullptr;
+        cudaFree(d_virtEmitContribSum);           d_virtEmitContribSum          = nullptr;
     }
 
     ~BdrcSystem() { freeAllBuffers(); }
@@ -223,6 +242,16 @@ void bdrcAllocBuffers(BdrcSystem* sys, uint32_t numPixels)
     cudaMalloc(reinterpret_cast<void**>(&sys->d_compactResampled_p_e_area),    batchSize      * sizeof(float));
     cudaMalloc(reinterpret_cast<void**>(&sys->d_debugTargetMatrix),          batchSize * 3u * sizeof(float));
 
+    // Virtual light emitter buffers (Task 9 — unwired plumbing for Tasks 10-11).
+    cudaMalloc(reinterpret_cast<void**>(&sys->d_virtEmitPos),                VIRT_EMIT_MAX_DEPTH * batchSize * 3u * sizeof(float));
+    cudaMalloc(reinterpret_cast<void**>(&sys->d_virtEmitThroughput),         VIRT_EMIT_MAX_DEPTH * batchSize * 3u * sizeof(float));
+    cudaMalloc(reinterpret_cast<void**>(&sys->d_virtEmitValid),              VIRT_EMIT_MAX_DEPTH * batchSize      * sizeof(unsigned int));
+    cudaMalloc(reinterpret_cast<void**>(&sys->d_compactVirtEmitPos),         VIRT_EMIT_MAX_DEPTH * batchSize * 3u * sizeof(float));
+    cudaMalloc(reinterpret_cast<void**>(&sys->d_compactVirtEmitThroughput),  VIRT_EMIT_MAX_DEPTH * batchSize * 3u * sizeof(float));
+    cudaMalloc(reinterpret_cast<void**>(&sys->d_compactVirtEmitCount),                       1u              * sizeof(unsigned int));
+    cudaMalloc(reinterpret_cast<void**>(&sys->d_virtEmitOutput),             VIRT_EMIT_MAX_DEPTH * batchSize * 3u * sizeof(float));
+    cudaMalloc(reinterpret_cast<void**>(&sys->d_virtEmitContribSum),         batchSize * 3u * sizeof(float));
+
     // Zero-init valid flags, counters, and zero-target buffers
     cudaMemset(sys->d_lightValid,               0, batchSize  * sizeof(unsigned int));
     cudaMemset(sys->d_compactLightCount,        0,          1u * sizeof(unsigned int));
@@ -235,6 +264,8 @@ void bdrcAllocBuffers(BdrcSystem* sys, uint32_t numPixels)
     cudaMemset(sys->d_resampled_p_e_area,       0, batchSize * sizeof(float));
     cudaMemset(sys->d_compactLight_p_e_area,    0, batchSize * sizeof(float));
     cudaMemset(sys->d_compactResampled_p_e_area,0, batchSize * sizeof(float));
+    cudaMemset(sys->d_virtEmitValid,            0, VIRT_EMIT_MAX_DEPTH * batchSize * sizeof(unsigned int));
+    cudaMemset(sys->d_compactVirtEmitCount,     0,          1u * sizeof(unsigned int));
 
     // Fill d_oneTargets1 with 1.0f (sized for batchSize to cover compact light training)
     std::vector<float> ones(batchSize, 1.0f);
@@ -284,6 +315,9 @@ float         bdrcGetLastEyeLoss  (const BdrcSystem* sys) { return sys->m_lastEy
 float         bdrcGetLastLightLoss(const BdrcSystem* sys) { return sys->m_lastLightLoss; }
 float         bdrcGetLastMaskLoss (const BdrcSystem* sys) { return sys->m_lastMaskLoss;  }
 float*        bdrcRenderOutput    (const BdrcSystem* sys) { return sys->d_renderOutput;  }
+float*        bdrcVirtEmitPos        (const BdrcSystem* sys) { return sys->d_virtEmitPos;        }
+float*        bdrcVirtEmitThroughput (const BdrcSystem* sys) { return sys->d_virtEmitThroughput; }
+unsigned int* bdrcVirtEmitValid      (const BdrcSystem* sys) { return sys->d_virtEmitValid;       }
 
 // ---- Compaction kernels -----------------------------------------------------
 //

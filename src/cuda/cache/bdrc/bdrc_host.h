@@ -50,6 +50,9 @@ float         bdrcGetLastEyeLoss  (const BdrcSystem* sys);
 float         bdrcGetLastLightLoss(const BdrcSystem* sys);
 float         bdrcGetLastMaskLoss (const BdrcSystem* sys);
 float*        bdrcRenderOutput    (const BdrcSystem* sys);
+float*        bdrcVirtEmitPos          (const BdrcSystem* sys);
+float*        bdrcVirtEmitThroughput   (const BdrcSystem* sys);
+unsigned int* bdrcVirtEmitValid        (const BdrcSystem* sys);
 
 // Save/load inference weights for all three caches.
 // File format: 4-byte magic + 4-byte param count + raw half-precision weights.

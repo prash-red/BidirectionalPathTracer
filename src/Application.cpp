@@ -1427,6 +1427,10 @@ void Application::updateBuffers()
     nrcBuf.resampled_p_sa        = bdrcResampled_p_sa(m_bdrcSystem);
     nrcBuf.resampled_p_e_area    = bdrcResampled_p_e_area(m_bdrcSystem);
 
+    nrcBuf.virtEmitPos        = bdrcVirtEmitPos(m_bdrcSystem);
+    nrcBuf.virtEmitThroughput = bdrcVirtEmitThroughput(m_bdrcSystem);
+    nrcBuf.virtEmitValid      = bdrcVirtEmitValid(m_bdrcSystem);
+
     nrcBuf.bdrcPhase             = m_bdrcPhase;
   }
 }

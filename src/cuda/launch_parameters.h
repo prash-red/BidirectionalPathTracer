@@ -46,6 +46,12 @@ enum NrcType {
 // Controls the size of the depth-strided light buffer: BDRC_MAX_LIGHT_DEPTH × numPixels.
 constexpr int BDRC_MAX_LIGHT_DEPTH = 6;
 
+// Max virtual-light-emitter recordings per eye path's training suffix. A suffix
+// can re-enter a specular chain after its first diffuse vertex multiple times
+// (e.g. diffuse -> mirror -> diffuse -> mirror -> diffuse); this caps how many
+// of those re-entries contribute a virtual-emission correction.
+constexpr int VIRT_EMIT_MAX_DEPTH = 4;
+
 // Global diffuse-surface reference table for CPM/NCE mask-cache training.
 // Density at ANY point on this surface set is the single scalar invTotalArea
 // (pure area-uniform reference — the a_eff=0 case of the Python project's
@@ -97,6 +103,16 @@ struct NrcLaunchBuffers
   float*        light_p_e_area;        // [numPixels]      known reference density at the hit (== surfaceRef.invTotalArea)
   unsigned int* lightValid;            // [numPixels]      1 if a photon landed this frame
   float*        lightOutput;           // [3 × numPixels]  inference output (unchanged)
+
+  // ---- Virtual light emitter buffers — written by hit.cu at every diffuse
+  // vertex reached after the eye path's first diffuse vertex, when that vertex
+  // is in a specular chain (i.e. exactly where validForEyeCache suppresses
+  // direct emission). Depth-strided: slot for depth d, training slot s is
+  // d * batchSize + s. Consumed by bdrc_host.cu Phase 2 to compensate the eye
+  // cache's training target for the transport family L S+ D [any]+.
+  float*        virtEmitPos;          // [3 × VIRT_EMIT_MAX_DEPTH × batchSize] world-space position (AABB-normalized)
+  float*        virtEmitThroughput;   // [3 × VIRT_EMIT_MAX_DEPTH × batchSize] throughput * retro-BSDF-eval at that vertex
+  unsigned int* virtEmitValid;        // [VIRT_EMIT_MAX_DEPTH × batchSize]     1 if slot is valid
 
   // ---- BDRC eye-path supervision buffers (written by eye integrator) ---------
   float*        eyeVertexPos;          // [3 × numPixels]  S pos (last specular before D, or camera)
