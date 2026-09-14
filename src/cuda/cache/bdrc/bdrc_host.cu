@@ -508,9 +508,9 @@ void bdrcDispatch(
                 printf("[bdrc] iter=%u phase=%d freeze=%d resampled=%u light=%u train=%u\n",
                     iteration, bdrcPhase, (int)freezeTraining, resampledCount, lightCount, trainCount);
 
-            // Both eye and light passes use normBatch = n_eye so the composite loss is
+            // Both eye and light passes use normBatch = n_eye (resampledCount, the true
+            // anchor/reference count this frame) so the composite loss is
             //   total = (sum_eye_terms + sum_light_terms) / n_eye
-            const uint32_t normCount = (uint32_t)(resolutionX * resolutionY);
             bool didAccumGrad = false;
             float eyeLossSum   = 0.0f;
             float lightLossSum = 0.0f;
@@ -524,7 +524,7 @@ void bdrcDispatch(
                                                        tcnn::MatrixLayout::ColumnMajor);
                 eyeLossSum = sys->maskNrc->dreLossAccumGrad(stream, inputMat,
                                                sys->d_compactResampled_p_e_area, 0,
-                                               normCount,
+                                               resampledCount > 0u ? resampledCount : 1u,
                                                nullptr,
                                                tcnn::GradientMode::Overwrite);
                 didAccumGrad = true;
@@ -537,9 +537,12 @@ void bdrcDispatch(
                                     (paddedLightCount - lightCount) * sizeof(float), stream);
                 tcnn::GPUMatrixDynamic<float> inputMat(sys->d_compactLightEndpoints, 3u, paddedLightCount,
                                                        tcnn::MatrixLayout::ColumnMajor);
+                // normBatch = resampledCount (NOT lightCount, NOT a hard-coded constant):
+                // the composite loss total = (sum_ref_terms + sum_pos_terms) / n_eye_anchors,
+                // matching Python's alpha*mean(ref) + beta*(n_light/n_eye)*mean(pos) decomposition.
                 lightLossSum = sys->maskNrc->dreLossAccumGrad(stream, inputMat,
                                                sys->d_compactLight_p_e_area, 1,
-                                               normCount / 100000,
+                                               resampledCount > 0u ? resampledCount : 1u,
                                                nullptr,
                                                didAccumGrad ? tcnn::GradientMode::Accumulate
                                                             : tcnn::GradientMode::Overwrite);
@@ -549,7 +552,8 @@ void bdrcDispatch(
             if (didAccumGrad)
             {
                 sys->maskNrc->optimizerStep(stream);
-                sys->m_lastMaskLoss = (eyeLossSum + lightLossSum) / (float)normCount;
+                sys->m_lastMaskLoss = (eyeLossSum + lightLossSum) /
+                                      (float)(resampledCount > 0u ? resampledCount : 1u);
             }
 
             // 2. maskNrc EMA update
