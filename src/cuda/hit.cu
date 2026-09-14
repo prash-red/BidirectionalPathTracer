@@ -1557,7 +1557,7 @@ __forceinline__ __device__ void chRadiance()
     // contribution to the pixel's accumulated radiance in the same units as
     // every other term already summed into prd.radiance.
     const float3 f_retro = state.baseColor * (fmaxf(dot(state.N, thePrd->wo), 0.0f) * M_1_PIf);
-    const float3 w       = thePrd->throughputPreBsdf * f_retro;
+    const float3 w       = throughput * f_retro;
     nrc.virtEmitThroughput[3*slot+0] = w.x;
     nrc.virtEmitThroughput[3*slot+1] = w.y;
     nrc.virtEmitThroughput[3*slot+2] = w.z;
