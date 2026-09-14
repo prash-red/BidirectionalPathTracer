@@ -836,9 +836,14 @@ void bdrcDispatch(
 
                 if (virtCount > 0u)
                 {
-                    tcnn::GPUMatrixDynamic<float> inp(sys->d_compactVirtEmitPos, 3u, virtCount,
+                    const uint32_t paddedVirtCount = padTo256(virtCount);
+                    if (paddedVirtCount > virtCount)
+                        cudaMemsetAsync(sys->d_compactVirtEmitPos + 3u * virtCount, 0,
+                                        (paddedVirtCount - virtCount) * 3u * sizeof(float), stream);
+
+                    tcnn::GPUMatrixDynamic<float> inp(sys->d_compactVirtEmitPos, 3u, paddedVirtCount,
                                                       tcnn::MatrixLayout::ColumnMajor);
-                    tcnn::GPUMatrix<float> out(sys->d_virtEmitOutput, 3u, virtCount);
+                    tcnn::GPUMatrix<float> out(sys->d_virtEmitOutput, 3u, paddedVirtCount);
                     sys->lightNrc->query(stream, inp, out, /*useEmaWeights=*/true);
 
                     cudaMemsetAsync(sys->d_pixelToTrainSlot, 0xFF, (uint32_t)numPixels * sizeof(unsigned int), stream);
