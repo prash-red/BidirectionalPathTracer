@@ -36,6 +36,7 @@
 #include "shader_common.h"
 #include "vector_math.h"
 #include "cache/nrc_features.h"
+#include "surface_reference.h"
 
 extern "C" {
   __constant__ LaunchParameters theLaunchParameters;
@@ -612,121 +613,30 @@ __forceinline__ __device__ float3 integrator(PerRayData& prd, const uint2 theLau
       nrc.eyeVertexThroughput[3*px+1] = prd.throughputPreBsdf.y;
       nrc.eyeVertexThroughput[3*px+2] = prd.throughputPreBsdf.z;
 
-      // Resampled position R for mask label-0 and light cache zero supervision.
-      if (hasSpecular)
+      // Resampled position R for mask label-0 (reference/anchor stream).
+      // Exact area-uniform sample over ALL diffuse-capable scene surfaces —
+      // camera-independent, no probe ray, no visibility test. This is the
+      // pure-uniform case of the Python project's surface_mixture reference
+      // distribution: density is the single known scalar invTotalArea
+      // everywhere, so no per-point density lookup is needed.
       {
-        // Cosine-hemisphere sample from S using lastSpecNormal as the axis.
-        float3 w;
-        float  hemiPdf;
-        unitSquareToCosineHemisphere(rng2(prd.seed), lastSpecNormal, w, hemiPdf);
+        float3 refPos, refNormal;
+        sampleSurfaceUniform(prd.seed, theLaunchParameters.surfaceRef, refPos, refNormal);
 
-        // Probe ray from S to find R.
-        // radiance/occlusion/sigma_t initialized so chRadiance accumulates NEE cleanly at R.
-        PerRayData probePrd;
-        probePrd.pos        = lastSpecPos;
-        probePrd.wo         = -w;
-        probePrd.distance   = RT_DEFAULT_MAX;
-        probePrd.flags      = 0;
-        probePrd.seed       = prd.seed;
-        probePrd.idxStack   = 0;
-        probePrd.stack[0].absorption_ior = make_float4(0.0f, 0.0f, 0.0f, 1.0f);
-        probePrd.throughput = make_float3(1.0f);
-        probePrd.typeEvent  = BSDF_EVENT_ABSORB;
-        probePrd.radiance   = make_float3(0.0f);
-        probePrd.occlusion  = 1.0f;
-        probePrd.sigma_t    = make_float3(0.0f);
-        probePrd.eyePathFoundDiffuse    = false;
-        probePrd.eyePathInSpecularChain = false;
+        // Reuse posLocal/localAabbMin/localAabbMax packing: the reference
+        // sample has no GAS-local frame of its own (it isn't a ray hit), so
+        // pack it directly in world space against the same global AABB used
+        // to normalize all other cache queries (nrc.aabbMin/aabbMax).
+        bdrcPackFeatures(nrc.resampledEndpoints, px, refPos,
+                         theLaunchParameters.nrc.aabbMin,
+                         theLaunchParameters.nrc.aabbMax);
+        nrc.resampledValid[px]     = 1u;
+        nrc.resampled_p_sa[px]     = 0.0f;  // no longer a solid-angle PDF; unused downstream
+        nrc.resampled_p_e_area[px] = theLaunchParameters.surfaceRef.invTotalArea;
 
-        uint2 probePay = splitPointer(&probePrd);
-        optixTrace(theLaunchParameters.handle,
-                   lastSpecPos, w,
-                   theLaunchParameters.sceneEpsilon, RT_DEFAULT_MAX, 0.0f,
-                   OptixVisibilityMask(0xFF),
-                   OPTIX_RAY_FLAG_CULL_BACK_FACING_TRIANGLES,
-                   TYPE_RAY_RADIANCE, NUM_RAY_TYPES, TYPE_RAY_RADIANCE,
-                   probePay.x, probePay.y);
-
-        prd.seed = probePrd.seed;
-
-        if (probePrd.flags & FLAG_HIT)
-        {
-          bdrcPackFeatures(nrc.resampledEndpoints, px, probePrd.posLocal, probePrd.localAabbMin, probePrd.localAabbMax);
-          nrc.resampledValid[px] = 1u;
-          nrc.resampled_p_sa[px] = hemiPdf;
-          {
-            // p_e_area(R) = hemiPdf * cos_R / dist_SR²  (solid-angle → area at R)
-            const float3 vecSR     = probePrd.pos - lastSpecPos;
-            const float  distSR_sq = dot(vecSR, vecSR);
-            const float  cos_R     = (distSR_sq > 1e-12f)
-                ? fmaxf(dot(probePrd.nrcN, -vecSR * rsqrtf(distSR_sq)), 0.0f)
-                : 0.0f;
-            nrc.resampled_p_e_area[px] = (distSR_sq > 1e-12f)
-                ? hemiPdf * cos_R / distSR_sq
-                : 0.0f;
-          }
-          nrc.eyeVertexNormals[3*px+0] = lastSpecNormal.x;
-          nrc.eyeVertexNormals[3*px+1] = lastSpecNormal.y;
-          nrc.eyeVertexNormals[3*px+2] = lastSpecNormal.z;
-
-          // Debug mode 5: chRadiance computed NEE at R into probePrd.radiance.
-          // Store it for the host-side splat-to-camera visualization.
-          if (theLaunchParameters.nrc.nrcDebugMode == 5)
-          {
-            // nrc.renderOutput[3*px+0] = probePrd.radiance.x;
-            // nrc.renderOutput[3*px+1] = probePrd.radiance.y;
-            // nrc.renderOutput[3*px+2] = probePrd.radiance.z;
-            nrc.renderOutput[3*px+0] = 1;
-            nrc.renderOutput[3*px+1] = 1;
-            nrc.renderOutput[3*px+2] = 1;
-          }
-        }
-        else
-        {
-          nrc.resampledValid[px] = 0u;
-        }
-      }
-      else
-      {
-        // No specular before D: Python exact fallback — R = D position directly.
-        bdrcPackFeatures(nrc.resampledEndpoints, px, prd.posLocal, prd.localAabbMin, prd.localAabbMax);
-        nrc.resampledValid[px] = 1u;
-        {
-          const float p_sa = bdrcPerspectivePeSa(
-            prd.pos,
-            prd.nrcN,
-            theLaunchParameters.cameraP,
-            theLaunchParameters.cameraU,
-            theLaunchParameters.cameraV,
-            theLaunchParameters.cameraW,
-            1e-4f,
-            theLaunchParameters.cameraType);
-          nrc.resampled_p_sa[px] = p_sa;
-          // p_e_area(R=D) = p_e_sa * cos_D / dist_camD²  (solid-angle → area at D)
-          const float3 vecDcam    = theLaunchParameters.cameraP - prd.pos;
-          const float  distDcam_sq = dot(vecDcam, vecDcam);
-          const float  cos_D      = (distDcam_sq > 1e-12f)
-              ? fmaxf(dot(prd.nrcN, vecDcam * rsqrtf(distDcam_sq)), 0.0f)
-              : 0.0f;
-          nrc.resampled_p_e_area[px] = (distDcam_sq > 1e-12f)
-              ? p_sa * cos_D / distDcam_sq
-              : 0.0f;
-        }
-        nrc.eyeVertexNormals[3*px+0] = lastSpecNormal.x;
-        nrc.eyeVertexNormals[3*px+1] = lastSpecNormal.y;
-        nrc.eyeVertexNormals[3*px+2] = lastSpecNormal.z;
-
-        // Debug mode 5 (R=D fallback): prd.radiance holds NEE at D (depth 0, no prior bounces).
-        // Capture before handleBdrcCacheLogic extends it with the suffix path.
-        if (theLaunchParameters.nrc.nrcDebugMode == 5)
-        {
-          // nrc.renderOutput[3*px+0] = prd.radiance.x;
-          // nrc.renderOutput[3*px+1] = prd.radiance.y;
-          // nrc.renderOutput[3*px+2] = prd.radiance.z;
-          nrc.renderOutput[3*px+0] = 1;
-          nrc.renderOutput[3*px+1] = 1;
-          nrc.renderOutput[3*px+2] = 1;
-        }
+        nrc.eyeVertexNormals[3*px+0] = refNormal.x;
+        nrc.eyeVertexNormals[3*px+1] = refNormal.y;
+        nrc.eyeVertexNormals[3*px+2] = refNormal.z;
       }
 
       if (handleBdrcCacheLogic(prd, theLaunchIndex, payload, radianceBeforeTrace))
