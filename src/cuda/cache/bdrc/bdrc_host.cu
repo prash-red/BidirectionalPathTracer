@@ -85,6 +85,8 @@ struct BdrcSystem
     unsigned int* d_compactVirtEmitCount       = nullptr; // [1]
     float*        d_virtEmitOutput            = nullptr; // [3 × VIRT_EMIT_MAX_DEPTH × batchSize] lightNrc EMA query result
     float*        d_virtEmitContribSum        = nullptr; // [3 × batchSize] per-training-slot summed compensation
+    unsigned int* d_pixelToTrainSlot          = nullptr; // [numPixels] inverse map: pixel -> training slot, 0xFFFFFFFF if none
+    unsigned int* d_virtEmitPixelIdx          = nullptr; // [VIRT_EMIT_MAX_DEPTH * batchSize] compact output: pixel index per compacted virt-emit entry
 
     void freeAllBuffers()
     {
@@ -134,6 +136,8 @@ struct BdrcSystem
         cudaFree(d_compactVirtEmitCount);         d_compactVirtEmitCount        = nullptr;
         cudaFree(d_virtEmitOutput);               d_virtEmitOutput              = nullptr;
         cudaFree(d_virtEmitContribSum);           d_virtEmitContribSum          = nullptr;
+        cudaFree(d_pixelToTrainSlot);              d_pixelToTrainSlot            = nullptr;
+        cudaFree(d_virtEmitPixelIdx);               d_virtEmitPixelIdx           = nullptr;
     }
 
     ~BdrcSystem() { freeAllBuffers(); }
@@ -251,6 +255,8 @@ void bdrcAllocBuffers(BdrcSystem* sys, uint32_t numPixels)
     cudaMalloc(reinterpret_cast<void**>(&sys->d_compactVirtEmitCount),                       1u              * sizeof(unsigned int));
     cudaMalloc(reinterpret_cast<void**>(&sys->d_virtEmitOutput),             VIRT_EMIT_MAX_DEPTH * batchSize * 3u * sizeof(float));
     cudaMalloc(reinterpret_cast<void**>(&sys->d_virtEmitContribSum),         batchSize * 3u * sizeof(float));
+    cudaMalloc(reinterpret_cast<void**>(&sys->d_pixelToTrainSlot),           numPixels * sizeof(unsigned int));
+    cudaMalloc(reinterpret_cast<void**>(&sys->d_virtEmitPixelIdx),          VIRT_EMIT_MAX_DEPTH * batchSize * sizeof(unsigned int));
 
     // Zero-init valid flags, counters, and zero-target buffers
     cudaMemset(sys->d_lightValid,               0, batchSize  * sizeof(unsigned int));
@@ -365,6 +371,69 @@ static __global__ void bdrc_compact_resampled_kernel(
     compactPeArea[slot] = sparsePeArea[i];
 }
 
+// Compact the depth-strided virtual-emission buffer into a dense array,
+// remembering which pixel each compacted entry maps back to so the
+// scatter-add step can find the right eye-training-target slot.
+static __global__ void bdrc_compact_virt_emit_kernel(
+    float*              compactPos,          // [3 x cap] AoS output
+    float*              compactWeight,       // [3 x cap] AoS output
+    unsigned int*       compactPixelIdx,     // [cap] output - pixel index this entry belongs to
+    unsigned int*       compactCount,        // [1] must be 0 before launch
+    const float*        sparsePos,           // [3 x VIRT_EMIT_MAX_DEPTH x numPixels] input
+    const float*        sparseWeight,        // [3 x VIRT_EMIT_MAX_DEPTH x numPixels] input
+    const unsigned int* sparseValid,         // [VIRT_EMIT_MAX_DEPTH x numPixels] input
+    uint32_t             numPixels,
+    uint32_t             totalSlots)         // VIRT_EMIT_MAX_DEPTH * numPixels
+{
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= totalSlots || !sparseValid[i]) return;
+    const uint32_t slot = atomicAdd(compactCount, 1u);
+    compactPos[3u*slot+0u]    = sparsePos[3u*i+0u];
+    compactPos[3u*slot+1u]    = sparsePos[3u*i+1u];
+    compactPos[3u*slot+2u]    = sparsePos[3u*i+2u];
+    compactWeight[3u*slot+0u] = sparseWeight[3u*i+0u];
+    compactWeight[3u*slot+1u] = sparseWeight[3u*i+1u];
+    compactWeight[3u*slot+2u] = sparseWeight[3u*i+2u];
+    compactPixelIdx[slot]     = i % numPixels; // depth-strided: slot d*numPixels+p -> pixel p
+}
+
+// Build inverse map: pixel -> training slot. (The forward map trainPixelIndices
+// maps training slot -> pixel; this inverts it for O(1) lookup by pixel.)
+static __global__ void bdrc_build_pixel_to_train_slot_kernel(
+    unsigned int*       pixelToTrainSlot,   // [numPixels] output, init to 0xFFFFFFFF before launch
+    const unsigned int* trainPixelIndices,  // [trainCount] input
+    unsigned int        trainCount)
+{
+    const uint32_t s = blockIdx.x * blockDim.x + threadIdx.x;
+    if (s >= trainCount) return;
+    pixelToTrainSlot[trainPixelIndices[s]] = s;
+}
+
+// Scatter compensation = lightOutput * weight into the eye training target for
+// the pixel each compacted entry belongs to. Multiple virtual-emission entries
+// can belong to the same pixel (one per re-entered specular chain along the
+// suffix), so this uses atomicAdd.
+static __global__ void bdrc_add_virt_emission_kernel(
+    float*              trainSuffixScaled,  // [3 x batchSize] eye training target, slot-indexed
+    const unsigned int* pixelToTrainSlot,   // [numPixels] inverse map, 0xFFFFFFFF if none
+    const float*        compactWeight,      // [3 x compactCount]
+    const float*        lightOutput,        // [3 x compactCount] EMA lightNrc query result
+    const unsigned int* compactPixelIdx,    // [compactCount]
+    unsigned int         compactCount)
+{
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= compactCount) return;
+    const unsigned int px = compactPixelIdx[i];
+    const unsigned int trainSlot = pixelToTrainSlot[px];
+    if (trainSlot == 0xFFFFFFFFu) return;
+
+    for (int c = 0; c < 3; ++c)
+    {
+        const float contrib = compactWeight[3u*i + c] * lightOutput[3u*i + c];
+        atomicAdd(&trainSuffixScaled[3u*trainSlot + c], contrib);
+    }
+}
+
 static void device_bdrc_compact_light(
     cudaStream_t        stream,
     float*              compactEndpoints,
@@ -414,6 +483,7 @@ void bdrcDispatch(
     int           debugMode,
     unsigned int* d_trainCount,
     float*        d_trainFeatures,
+    const unsigned int* d_trainPixelIndices,
     bool          freezeTraining,
     float3        aabbMin,
     float3        aabbMax,
@@ -744,6 +814,47 @@ void bdrcDispatch(
                                                        tcnn::MatrixLayout::ColumnMajor);
                 tcnn::GPUMatrix<float> outputMat(sys->d_nrcNextOutput, 3u, paddedTrainCount);
                 sys->eyeNrc->query(stream, inputMat, outputMat, /*useEmaWeights=*/true);
+            }
+
+            // ---- Virtual light emitter: compensate the eye training target for
+            // ---- the L S+ D [any]+ family that validForEyeCache suppressed.
+            {
+                const uint32_t totalVirtSlots = static_cast<uint32_t>(VIRT_EMIT_MAX_DEPTH) * (uint32_t)numPixels;
+                cudaMemsetAsync(sys->d_compactVirtEmitCount, 0, sizeof(unsigned int), stream);
+                constexpr uint32_t THREADS = 256u;
+                uint32_t blocks = (totalVirtSlots + THREADS - 1u) / THREADS;
+                bdrc_compact_virt_emit_kernel<<<blocks, THREADS, 0, stream>>>(
+                    sys->d_compactVirtEmitPos, sys->d_compactVirtEmitThroughput,
+                    sys->d_virtEmitPixelIdx,
+                    sys->d_compactVirtEmitCount,
+                    sys->d_virtEmitPos, sys->d_virtEmitThroughput, sys->d_virtEmitValid,
+                    (uint32_t)numPixels, totalVirtSlots);
+
+                cudaStreamSynchronize(stream);
+                unsigned int virtCount = 0;
+                cudaMemcpy(&virtCount, sys->d_compactVirtEmitCount, sizeof(unsigned int), cudaMemcpyDeviceToHost);
+
+                if (virtCount > 0u)
+                {
+                    tcnn::GPUMatrixDynamic<float> inp(sys->d_compactVirtEmitPos, 3u, virtCount,
+                                                      tcnn::MatrixLayout::ColumnMajor);
+                    tcnn::GPUMatrix<float> out(sys->d_virtEmitOutput, 3u, virtCount);
+                    sys->lightNrc->query(stream, inp, out, /*useEmaWeights=*/true);
+
+                    cudaMemsetAsync(sys->d_pixelToTrainSlot, 0xFF, (uint32_t)numPixels * sizeof(unsigned int), stream);
+                    if (trainCount > 0u)
+                    {
+                        blocks = (trainCount + THREADS - 1u) / THREADS;
+                        bdrc_build_pixel_to_train_slot_kernel<<<blocks, THREADS, 0, stream>>>(
+                            sys->d_pixelToTrainSlot, d_trainPixelIndices, trainCount);
+                    }
+
+                    blocks = (virtCount + THREADS - 1u) / THREADS;
+                    bdrc_add_virt_emission_kernel<<<blocks, THREADS, 0, stream>>>(
+                        sys->d_trainSuffixScaled, sys->d_pixelToTrainSlot,
+                        sys->d_compactVirtEmitThroughput, sys->d_virtEmitOutput,
+                        sys->d_virtEmitPixelIdx, virtCount);
+                }
             }
 
             // 6b. Build eye training targets — valid slots only.

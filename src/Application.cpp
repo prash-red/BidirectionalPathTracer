@@ -1679,6 +1679,7 @@ bool Application::render()
                      m_bdrcDebugMode,
                      nrcTrainCount(m_nrcSystem),
                      nrcTrainFeatures(m_nrcSystem),
+                     nrcTrainPixelIndices(m_nrcSystem),
                      m_bdrcFreezeTraining,
                      m_launchParameters.nrc.aabbMin,
                      m_launchParameters.nrc.aabbMax,

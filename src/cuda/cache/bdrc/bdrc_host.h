@@ -87,6 +87,7 @@ void bdrcDispatch(
     // Compact training batch (from NRC system)
     unsigned int* d_trainCount,
     float*        d_trainFeatures,
+    const unsigned int* d_trainPixelIndices,
     bool          freezeTraining,
     // Camera and scene AABB — required for debug modes 5 and 6 (endpoint splatting)
     float3        aabbMin,
