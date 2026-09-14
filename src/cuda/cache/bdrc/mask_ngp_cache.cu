@@ -16,30 +16,20 @@ ngp_config makeMaskConfig()
 	return cfg;
 }
 
-// Brier-score DRE gradient kernel.
+// Logistic-NCE gradient kernel — same physical fixed point as the Brier form
+// it replaces (u* = p_l_area), but matches the current Python production
+// density_loss="logistic": -log(sigma) for positives, -log(1-sigma) for
+// references, where sigma = p_l / (p_l + p_e). Logistic damps the gradient
+// less aggressively near the saturated caustic peak than Brier does, which
+// the Python project measured as a +0.1-0.33 dB gain.
 //
-// For each sample i, the network outputs p_l_area (post-Softplus, in column i of
-// networkOut).  Given the per-sample p_e_area and the sample label, the analytic
-// gradient of the Brier loss w.r.t. p_l_area is:
+// label=0 (reference/eye anchor): loss = -log(p_e / (p_l + p_e))
+//   dL/d(p_l) = 1 / (p_l + p_e)
+// label=1 (light/positive):       loss = -log(p_l / (p_l + p_e))
+//   dL/d(p_l) = -p_e / (p_l * (p_l + p_e))
 //
-//   label=0 (eye):    dL/d(p_l) =  2 * p_l * p_e / (p_l + p_e)³
-//   label=1 (light):  dL/d(p_l) = -2 * p_e²     / (p_l + p_e)³
-//
-// gradScale = lossScale / (paddedWidth * normBatch) is pre-computed by the caller.
-// Both eye and light passes use normBatch = n_eye so that the composite loss
-//   total = (sum_eye_terms + sum_light_terms) / n_eye
-//
-// d_throughputWeights: per-sample eye-vertex throughput luminance (nullptr = uniform 1.0).
-//   Applied to both eye and light passes to match Python's throughput weighting.
-//
-// lossOut: [batchSize] per-sample throughput-weighted Brier loss value
-//   (tw * alpha^2 for eye, tw * (alpha-1)^2 for light).
-//   Padding samples (p_e_area == 0) contribute 0.
-//
-// networkOut : [paddedWidth × batchSize] half, column-major — row 0 = p_l_area
-// p_e_area   : [batchSize] float — area-measure eye PDF per sample
-// dLdOut     : [paddedWidth × batchSize] half, column-major — filled in-place
-__global__ void k_dre_brier_grad(
+// gradScale = lossScale / (paddedWidth * normBatch), same convention as before.
+__global__ void k_dre_logistic_grad(
     const tcnn::network_precision_t* __restrict__ networkOut,
     const float*                     __restrict__ p_e_area,
     const float*                     __restrict__ throughputWeights,
@@ -53,13 +43,12 @@ __global__ void k_dre_brier_grad(
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= batchSize) return;
 
-    const uint32_t base = i * paddedWidth;  // column-major: col i starts here
+    const uint32_t base = i * paddedWidth;
 
     const float p_l = networkOut[base];
     const float p_e = p_e_area[i];
     const float tw  = throughputWeights ? throughputWeights[i] : 1.0f;
 
-    // Padding guard: p_e == 0 means this slot was zero-padded; contribute nothing.
     if (p_e < 1e-10f) {
         for (uint32_t r = 0u; r < paddedWidth; ++r)
             dLdOut[base + r] = static_cast<tcnn::network_precision_t>(0.0f);
@@ -67,21 +56,20 @@ __global__ void k_dre_brier_grad(
         return;
     }
 
-    const float denom    = p_l + p_e + 1e-8f;
-    const float denom_cu = denom * denom * denom;
+    const float p_l_safe = fmaxf(p_l, 1e-20f);
+    const float denom    = fmaxf(p_l + p_e, 1e-10f);
 
-    float grad;
+    float grad, lv;
     if (label == 0) {
-        grad = 2.0f * p_l * p_e / denom_cu;
+        grad = 1.0f / denom;
+        lv   = -logf(p_e / denom);
     } else {
-        grad = -2.0f * p_e * p_e / denom_cu;
+        grad = -p_e / (p_l_safe * denom);
+        lv   = -logf(p_l_safe / denom);
     }
 
     grad *= gradScale * tw;
 
-    // Per-sample throughput-weighted Brier loss
-    const float alpha = p_l / denom;
-    const float lv    = (label == 0) ? (alpha * alpha) : ((alpha - 1.0f) * (alpha - 1.0f));
     lossOut[i] = tw * lv;
 
     dLdOut[base] = static_cast<tcnn::network_precision_t>(grad);
@@ -121,7 +109,7 @@ float mask_ngp_cache::dreLossAccumGrad(
 	const float lossScale = m_gradScaler.currentScale();
 	const float gradScale = lossScale / (float)(paddedWidth * normBatch);
 	const uint32_t blocks = (batchSize + tcnn::N_THREADS_LINEAR - 1u) / tcnn::N_THREADS_LINEAR;
-	k_dre_brier_grad<<<blocks, tcnn::N_THREADS_LINEAR, 0, stream>>>(
+	k_dre_logistic_grad<<<blocks, tcnn::N_THREADS_LINEAR, 0, stream>>>(
 	    networkOut.data(),
 	    d_p_e_area,
 	    d_throughputWeights,
