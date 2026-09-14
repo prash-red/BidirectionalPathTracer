@@ -89,14 +89,13 @@ struct NrcLaunchBuffers
   unsigned int* trainPixelIndices; // [batchSize] pixel index for each training slot (unused by kernels, diagnostic)
   float*        trainFeatures;     // [NRC_INPUT_DIM × batchSize] compact slot-indexed train features
 
-  // ---- BDRC light-path depth-strided buffers — written by bdrcLightIntegrator.
-  // Slot for depth d, pixel p: s = d * numPixels + p.  No atomics needed.
-  // Total size: BDRC_MAX_LIGHT_DEPTH × numPixels per array.
-  float*        lightEndpoints;        // [3 × BDRC_MAX_LIGHT_DEPTH × numPixels]  Y pos (AABB-normalized)
-  float*        lightTargets;          // [3 × BDRC_MAX_LIGHT_DEPTH × numPixels]  tp_Y_pre * f_Y_toward_S
-  float*        light_p_e_area;        // [BDRC_MAX_LIGHT_DEPTH × numPixels]      eye-path area PDF at Y
-  float*        lightEyeTp;            // [3 × BDRC_MAX_LIGHT_DEPTH × numPixels]  eye-vertex throughput RGB (compacted to luminance by dispatch)
-  unsigned int* lightValid;            // [BDRC_MAX_LIGHT_DEPTH × numPixels]      1 if slot is valid
+  // ---- BDRC light-path buffers — written by bdrcLightIntegrator, one slot per pixel.
+  // The light-path grammar stores AT MOST ONE sample per path (the first diffuse
+  // vertex reached after >=1 specular bounce), so no depth-striding is needed.
+  float*        lightEndpoints;        // [3 × numPixels]  photon-hit position (AABB-normalized)
+  float*        lightTargets;          // [3 × numPixels]  photon power * BSDF-eval toward query dir
+  float*        light_p_e_area;        // [numPixels]      known reference density at the hit (== surfaceRef.invTotalArea)
+  unsigned int* lightValid;            // [numPixels]      1 if a photon landed this frame
   float*        lightOutput;           // [3 × numPixels]  inference output (unchanged)
 
   // ---- BDRC eye-path supervision buffers (written by eye integrator) ---------

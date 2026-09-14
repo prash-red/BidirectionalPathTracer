@@ -959,10 +959,15 @@ __forceinline__ __device__ void lightPathIntegrator(PerRayData& prd, const uint2
 }
 
 
-// BDRC light path integrator.
-// Traces a path from a light source through specular bounces, connecting to the eye vertex
-// at every diffuse vertex encountered after at least one specular bounce (S*D+S*E paths).
-// Writes each valid connection directly to the compact atomic slot buffers in NrcLaunchBuffers.
+// BDRC light path integrator — the L S⁺ D grammar (ungated, single store-and-terminate).
+// Traces a path from a light source through specular bounces; stores exactly ONE
+// sample at the FIRST diffuse vertex reached after >=1 specular bounce, then
+// terminates. No shadow ray to any eye vertex, no dependence on the current
+// camera view, no continuation past the stored vertex — this matches the current
+// production Python design (trace_photons(caustic_only=True)), replacing the
+// project's own earlier shadow-ray-gated, multi-connection design which measurably
+// dropped a large fraction of caustic vertices/flux by requiring visibility to a
+// specific eye-path vertex.
 __forceinline__ __device__ void bdrcLightIntegrator(PerRayData& prd, const uint2 theLaunchIndex)
 {
   prd.radiance  = make_float3(0.0f);
@@ -974,7 +979,6 @@ __forceinline__ __device__ void bdrcLightIntegrator(PerRayData& prd, const uint2
   prd.eyePathFoundDiffuse    = false;
   prd.eyePathInSpecularChain = false;
 
-  // Initialize IOR material stack to vacuum — required for correct glass refraction.
   prd.idxStack = 0;
   prd.stack[0].absorption_ior = make_float4(0.0f, 0.0f, 0.0f, 1.0f);
 
@@ -982,13 +986,10 @@ __forceinline__ __device__ void bdrcLightIntegrator(PerRayData& prd, const uint2
   const unsigned int pixelIdx = theLaunchParameters.resolution.x * theLaunchIndex.y
                                 + theLaunchIndex.x;
 
-  // Requires a valid eye vertex written by the eye-path integrator this frame.
-  if (!nrc.renderValid[pixelIdx])
-    return;
+  nrc.lightValid[pixelIdx] = 0u;
 
   float3 origin;
   float3 direction;
-
   if (!sampleEmitterRay(prd, origin, direction))
     return;
 
@@ -997,9 +998,8 @@ __forceinline__ __device__ void bdrcLightIntegrator(PerRayData& prd, const uint2
 
   uint2 payload = splitPointer(&prd);
 
-  int  depth        = 0;
-  int  diffuseDepth = 0;    // counts accepted diffuse-after-specular connections (depth index into light buffer)
-  bool hasSpecular  = false; // require at least one specular bounce before accepting diffuse
+  int  depth       = 0;
+  bool hasSpecular = false;
 
   while (depth < theLaunchParameters.lightPathMaxDepth)
   {
@@ -1027,83 +1027,34 @@ __forceinline__ __device__ void bdrcLightIntegrator(PerRayData& prd, const uint2
     {
       if (hasSpecular)
       {
-        // Read S (last specular vertex on the eye path, or camera default).
-        const float3 S = make_float3(
-            nrc.eyeVertexPos[3*pixelIdx+0],
-            nrc.eyeVertexPos[3*pixelIdx+1],
-            nrc.eyeVertexPos[3*pixelIdx+2]);
+        // First diffuse-after-specular hit: store and terminate. tp_Y_pre is the
+        // light-path throughput arriving at this vertex BEFORE the local BSDF
+        // response (matches the Python "photons" stream's stored quantity:
+        // photon_power, with the BSDF applied toward the query direction later).
+        // Here we bake the BSDF response toward the surface normal's cosine-weighted
+        // outgoing hemisphere approximation is NOT needed: store raw pre-BSDF
+        // throughput * Lambertian-albedo/pi response using the vertex's own
+        // base color, matching the existing renderer's Lambertian diffuse term.
+        const float3 tp_Y_pre = prd.throughputPreBsdf;
+        const float3 target   = tp_Y_pre * prd.nrcBaseColor * M_1_PIf;
 
-        const float3 vecYS  = S - prd.pos;
-        const float  distYS = length(vecYS);
-
-        if (distYS > theLaunchParameters.sceneEpsilon)
-        {
-          const float3 dir_Y_to_S = vecYS / distYS;
-
-          // Shadow ray: Y → S (full OptiX visibility test).
-          unsigned int isVisible  = 0;
-          unsigned int shadowSeed = prd.seed;
-          optixTrace(theLaunchParameters.handle,
-                     prd.pos, dir_Y_to_S,
-                     theLaunchParameters.sceneEpsilon,
-                     distYS - theLaunchParameters.sceneEpsilon,
-                     0.0f,
-                     OptixVisibilityMask(0xFF),
-                     OPTIX_RAY_FLAG_DISABLE_CLOSESTHIT | OPTIX_RAY_FLAG_TERMINATE_ON_FIRST_HIT,
-                     TYPE_RAY_SHADOW, NUM_RAY_TYPES, TYPE_RAY_SHADOW,
-                     isVisible, shadowSeed);
-          prd.seed = shadowSeed;
-
-          if (isVisible && diffuseDepth < BDRC_MAX_LIGHT_DEPTH)  // shadow miss == Y can see S
-          {
-            // target = tp_Y_pre × f_Y_toward_S
-            // tp_Y_pre: light path throughput at Y BEFORE bsdf_over_pdf (view-independent)
-            // f_Y_toward_S: Lambertian BSDF at Y toward S = albedo × (cosθ / π)
-            const float3 tp_Y_pre     = prd.throughputPreBsdf;
-            const float  cos_Y        = fmaxf(dot(prd.nrcN, dir_Y_to_S), 0.0f);
-            const float3 f_Y_toward_S = prd.nrcBaseColor * (cos_Y * M_1_PIf);
-            const float3 target       = tp_Y_pre * f_Y_toward_S;
-
-            const float3 eyeVertexNormal = make_float3(
-              nrc.eyeVertexNormals[3*pixelIdx+0],
-              nrc.eyeVertexNormals[3*pixelIdx+1],
-              nrc.eyeVertexNormals[3*pixelIdx+2]);
-
-            // p_e_sa = cos(angle between S-direction and hemisphere axis) / pi
-            const float p_e_sa = fmaxf(dot(dir_Y_to_S, eyeVertexNormal), 0.0f) * M_1_PIf;
-            // p_e_area(Y) = p_e_sa * cos_Y / dist_YS²  (solid-angle → area conversion at Y)
-            const float p_e_area = p_e_sa * cos_Y / fmaxf(distYS * distYS, 1e-8f);
-
-            // Depth-strided slot: d * numPixels + pixelIdx.  No atomics needed.
-            const unsigned int numPix = static_cast<unsigned int>(
-                theLaunchParameters.resolution.x * theLaunchParameters.resolution.y);
-            const unsigned int slot = static_cast<unsigned int>(diffuseDepth) * numPix + pixelIdx;
-            bdrcPackFeatures(nrc.lightEndpoints, slot, prd.posLocal, prd.localAabbMin, prd.localAabbMax);
-            nrc.lightTargets[3*slot+0] = target.x;
-            nrc.lightTargets[3*slot+1] = target.y;
-            nrc.lightTargets[3*slot+2] = target.z;
-            nrc.light_p_e_area[slot]   = p_e_area;
-            const float3 eyeTp = make_float3(
-                nrc.eyeVertexThroughput[3*pixelIdx+0],
-                nrc.eyeVertexThroughput[3*pixelIdx+1],
-                nrc.eyeVertexThroughput[3*pixelIdx+2]);
-            nrc.lightEyeTp[3*slot+0] = eyeTp.x;
-            nrc.lightEyeTp[3*slot+1] = eyeTp.y;
-            nrc.lightEyeTp[3*slot+2] = eyeTp.z;
-            nrc.lightValid[slot]  = 1u;
-            ++diffuseDepth;
-          }
-        }
+        bdrcPackFeatures(nrc.lightEndpoints, pixelIdx, prd.posLocal, prd.localAabbMin, prd.localAabbMax);
+        nrc.lightTargets[3*pixelIdx+0] = target.x;
+        nrc.lightTargets[3*pixelIdx+1] = target.y;
+        nrc.lightTargets[3*pixelIdx+2] = target.z;
+        // Known reference density at this photon's landing position: the SAME
+        // constant scalar used by the reference/anchor stream (Task 3) — both
+        // streams share one area-uniform measure over the same surface set.
+        nrc.light_p_e_area[pixelIdx] = theLaunchParameters.surfaceRef.invTotalArea;
+        nrc.lightValid[pixelIdx]     = 1u;
       }
-      // Continue tracing from this diffuse vertex — captures S*D+S*E paths.
-    }
-    else
-    {
-      // Specular/transmissive bounce: mark and continue.
-      hasSpecular = true;
+      break; // Terminate here regardless of hasSpecular — a diffuse hit with no
+             // prior specular bounce is a dead end for this grammar (matches
+             // the Python trace_photons termination clause 3).
     }
 
-    // Russian Roulette applies to all bounces (diffuse and specular).
+    hasSpecular = true;
+
     if (theLaunchParameters.pathLengths.x <= depth)
     {
       const float probability = fmaxf(prd.throughput.x, fmaxf(prd.throughput.y, prd.throughput.z));
@@ -1114,7 +1065,6 @@ __forceinline__ __device__ void bdrcLightIntegrator(PerRayData& prd, const uint2
 
     ++depth;
   }
-  // No stale-data zeroing needed: all writes go to compact atomic slots.
 }
 
 
