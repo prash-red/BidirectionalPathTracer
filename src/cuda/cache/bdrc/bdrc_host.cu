@@ -34,14 +34,12 @@ struct BdrcSystem
     // BDRC light-path buffers
     float*        d_lightOutput     = nullptr; // [3 × batchSize]
     float*        d_maskOutput      = nullptr; // [1 × batchSize]
-    uint32_t      m_numPixels       = 0;       // exact pixel count (stride for depth-strided buffers)
-    // Depth-strided light buffers — written by raygen, no atomics.
-    // Slot for depth d, pixel p: d * m_numPixels + p.  Total: BDRC_MAX_LIGHT_DEPTH × m_numPixels.
-    float*        d_lightEndpoints  = nullptr; // [3 × BDRC_MAX_LIGHT_DEPTH × numPixels]
-    float*        d_lightTargets    = nullptr; // [3 × BDRC_MAX_LIGHT_DEPTH × numPixels]
-    float*        d_light_p_e_area  = nullptr; // [BDRC_MAX_LIGHT_DEPTH × numPixels]
-    float*        d_lightEyeTp      = nullptr; // [3 × BDRC_MAX_LIGHT_DEPTH × numPixels]  RGB (compacted to lum by kernel)
-    unsigned int* d_lightValid      = nullptr; // [BDRC_MAX_LIGHT_DEPTH × numPixels]  reset each frame
+    uint32_t      m_numPixels       = 0;       // exact pixel count
+    // Light-path buffers — one slot per pixel (no depth striding; see Task 5).
+    float*        d_lightEndpoints  = nullptr; // [3 × batchSize]
+    float*        d_lightTargets    = nullptr; // [3 × batchSize]
+    float*        d_light_p_e_area  = nullptr; // [batchSize]
+    unsigned int* d_lightValid      = nullptr; // [batchSize]  reset each frame
     // Constant label buffers
     float*        d_zeroTargets3    = nullptr; // [3 × batchSize] zeros
     float*        d_oneTargets1     = nullptr; // [1 × batchSize] ones
@@ -73,11 +71,9 @@ struct BdrcSystem
     float*        d_compactLightTargets      = nullptr; // [3 × batchSize]
     unsigned int* d_compactLightCount        = nullptr; // [1] reset + filled by compaction kernel
     float*        d_compactLight_p_e_area    = nullptr; // [batchSize]  compacted eye-area PDF at Y
-    float*        d_compactLight_throughput  = nullptr; // [batchSize]  compacted eye-vertex throughput luminance
     float*        d_compactResampledEndpoints    = nullptr; // [3 × batchSize]
     unsigned int* d_compactResampledCount        = nullptr; // [1] reset + filled by compaction kernel
     float*        d_compactResampled_p_e_area    = nullptr; // [batchSize]  compacted eye-area PDF at R
-    float*        d_compactResampled_throughput  = nullptr; // [batchSize]  compacted eye-vertex throughput luminance
     float*        d_debugTargetMatrix          = nullptr; // [3 × batchsize]
 
     void freeAllBuffers()
@@ -87,7 +83,6 @@ struct BdrcSystem
         cudaFree(d_lightEndpoints);      d_lightEndpoints      = nullptr;
         cudaFree(d_lightTargets);        d_lightTargets        = nullptr;
         cudaFree(d_light_p_e_area);      d_light_p_e_area      = nullptr;
-        cudaFree(d_lightEyeTp);          d_lightEyeTp          = nullptr;
         cudaFree(d_lightValid);          d_lightValid          = nullptr;
         cudaFree(d_zeroTargets3);        d_zeroTargets3        = nullptr;
         cudaFree(d_oneTargets1);         d_oneTargets1         = nullptr;
@@ -116,11 +111,9 @@ struct BdrcSystem
         cudaFree(d_compactLightTargets);         d_compactLightTargets         = nullptr;
         cudaFree(d_compactLightCount);           d_compactLightCount           = nullptr;
         cudaFree(d_compactLight_p_e_area);       d_compactLight_p_e_area       = nullptr;
-        cudaFree(d_compactLight_throughput);     d_compactLight_throughput     = nullptr;
         cudaFree(d_compactResampledEndpoints);       d_compactResampledEndpoints       = nullptr;
         cudaFree(d_compactResampledCount);           d_compactResampledCount           = nullptr;
         cudaFree(d_compactResampled_p_e_area);       d_compactResampled_p_e_area       = nullptr;
-        cudaFree(d_compactResampled_throughput);     d_compactResampled_throughput     = nullptr;
         cudaFree(d_debugTargetMatrix);           d_debugTargetMatrix           = nullptr;
     }
 
@@ -182,7 +175,6 @@ void bdrcAllocBuffers(BdrcSystem* sys, uint32_t numPixels)
 
     const uint32_t inputDim  = static_cast<uint32_t>(ngp_config().inputDim); // 3 (position only)
     const uint32_t batchSize = (numPixels + 255u) / 256u * 256u;
-    const uint32_t lightSlots = static_cast<uint32_t>(BDRC_MAX_LIGHT_DEPTH) * batchSize;
     sys->m_numPixels = numPixels;
 
     // Light-path output buffers
@@ -191,7 +183,7 @@ void bdrcAllocBuffers(BdrcSystem* sys, uint32_t numPixels)
 
     // Constant label buffers
     cudaMalloc(reinterpret_cast<void**>(&sys->d_zeroTargets3), batchSize  * 3u * sizeof(float));
-    cudaMalloc(reinterpret_cast<void**>(&sys->d_oneTargets1),  lightSlots * 1u * sizeof(float));  // needs to cover lightSlots for mask training
+    cudaMalloc(reinterpret_cast<void**>(&sys->d_oneTargets1),  batchSize  * 1u * sizeof(float));  // needs to cover batchSize for mask training
     cudaMalloc(reinterpret_cast<void**>(&sys->d_zeroTargets1), batchSize  * 1u * sizeof(float));
 
     // Eye-cache output buffers
@@ -217,26 +209,22 @@ void bdrcAllocBuffers(BdrcSystem* sys, uint32_t numPixels)
     cudaMalloc(reinterpret_cast<void**>(&sys->d_resampledValid),             batchSize      * sizeof(unsigned int));
     cudaMalloc(reinterpret_cast<void**>(&sys->d_resampled_p_sa),             batchSize      * sizeof(float));
     cudaMalloc(reinterpret_cast<void**>(&sys->d_resampled_p_e_area),         batchSize      * sizeof(float));
-    // Depth-strided light buffers — written by raygen (no atomics); size = BDRC_MAX_LIGHT_DEPTH × numPixels.
-    // Compact buffers (internal, for tcnn training) sized to cover lightSlots = BDRC_MAX_LIGHT_DEPTH × batchSize.
-    cudaMalloc(reinterpret_cast<void**>(&sys->d_lightEndpoints),             lightSlots * inputDim * sizeof(float));
-    cudaMalloc(reinterpret_cast<void**>(&sys->d_lightTargets),               lightSlots * 3u       * sizeof(float));
-    cudaMalloc(reinterpret_cast<void**>(&sys->d_light_p_e_area),             lightSlots            * sizeof(float));
-    cudaMalloc(reinterpret_cast<void**>(&sys->d_lightEyeTp),                 lightSlots * 3u       * sizeof(float));
-    cudaMalloc(reinterpret_cast<void**>(&sys->d_lightValid),                 lightSlots            * sizeof(unsigned int));
-    cudaMalloc(reinterpret_cast<void**>(&sys->d_compactLightEndpoints),      lightSlots * inputDim * sizeof(float));
-    cudaMalloc(reinterpret_cast<void**>(&sys->d_compactLightTargets),        lightSlots * 3u       * sizeof(float));
+    // Light-path buffers — one slot per pixel (no depth striding; see Task 5).
+    cudaMalloc(reinterpret_cast<void**>(&sys->d_lightEndpoints),             batchSize * inputDim * sizeof(float));
+    cudaMalloc(reinterpret_cast<void**>(&sys->d_lightTargets),               batchSize * 3u       * sizeof(float));
+    cudaMalloc(reinterpret_cast<void**>(&sys->d_light_p_e_area),             batchSize            * sizeof(float));
+    cudaMalloc(reinterpret_cast<void**>(&sys->d_lightValid),                 batchSize            * sizeof(unsigned int));
+    cudaMalloc(reinterpret_cast<void**>(&sys->d_compactLightEndpoints),      batchSize * inputDim * sizeof(float));
+    cudaMalloc(reinterpret_cast<void**>(&sys->d_compactLightTargets),        batchSize * 3u       * sizeof(float));
     cudaMalloc(reinterpret_cast<void**>(&sys->d_compactLightCount),                    1u          * sizeof(unsigned int));
-    cudaMalloc(reinterpret_cast<void**>(&sys->d_compactLight_p_e_area),      lightSlots            * sizeof(float));
-    cudaMalloc(reinterpret_cast<void**>(&sys->d_compactLight_throughput),    lightSlots            * sizeof(float));
+    cudaMalloc(reinterpret_cast<void**>(&sys->d_compactLight_p_e_area),      batchSize            * sizeof(float));
     cudaMalloc(reinterpret_cast<void**>(&sys->d_compactResampledEndpoints),      batchSize * 3u * sizeof(float));
     cudaMalloc(reinterpret_cast<void**>(&sys->d_compactResampledCount),                1u       * sizeof(unsigned int));
     cudaMalloc(reinterpret_cast<void**>(&sys->d_compactResampled_p_e_area),    batchSize      * sizeof(float));
-    cudaMalloc(reinterpret_cast<void**>(&sys->d_compactResampled_throughput),  batchSize      * sizeof(float));
     cudaMalloc(reinterpret_cast<void**>(&sys->d_debugTargetMatrix),          batchSize * 3u * sizeof(float));
 
     // Zero-init valid flags, counters, and zero-target buffers
-    cudaMemset(sys->d_lightValid,               0, lightSlots  * sizeof(unsigned int));
+    cudaMemset(sys->d_lightValid,               0, batchSize  * sizeof(unsigned int));
     cudaMemset(sys->d_compactLightCount,        0,          1u * sizeof(unsigned int));
     cudaMemset(sys->d_zeroTargets3,             0, batchSize * 3u * sizeof(float));
     cudaMemset(sys->d_zeroTargets1,             0, batchSize * 1u * sizeof(float));
@@ -245,12 +233,12 @@ void bdrcAllocBuffers(BdrcSystem* sys, uint32_t numPixels)
     cudaMemset(sys->d_resampledValid,           0, batchSize * sizeof(unsigned int));
     cudaMemset(sys->d_resampled_p_sa,           0, batchSize * sizeof(float));
     cudaMemset(sys->d_resampled_p_e_area,       0, batchSize * sizeof(float));
-    cudaMemset(sys->d_compactLight_p_e_area,    0, lightSlots * sizeof(float));
+    cudaMemset(sys->d_compactLight_p_e_area,    0, batchSize * sizeof(float));
     cudaMemset(sys->d_compactResampled_p_e_area,0, batchSize * sizeof(float));
 
-    // Fill d_oneTargets1 with 1.0f (sized for lightSlots to cover compact light training)
-    std::vector<float> ones(lightSlots, 1.0f);
-    cudaMemcpy(sys->d_oneTargets1, ones.data(), lightSlots * sizeof(float), cudaMemcpyHostToDevice);
+    // Fill d_oneTargets1 with 1.0f (sized for batchSize to cover compact light training)
+    std::vector<float> ones(batchSize, 1.0f);
+    cudaMemcpy(sys->d_oneTargets1, ones.data(), batchSize * sizeof(float), cudaMemcpyHostToDevice);
 
     // fill debugTargetMatrix with blue values
     {
@@ -288,7 +276,6 @@ float*        bdrcResampled_p_e_area     (const BdrcSystem* sys) { return sys->d
 float*        bdrcLightEndpoints         (const BdrcSystem* sys) { return sys->d_lightEndpoints;             }
 float*        bdrcLightTargets           (const BdrcSystem* sys) { return sys->d_lightTargets;               }
 float*        bdrcLight_p_e_area         (const BdrcSystem* sys) { return sys->d_light_p_e_area;             }
-float*        bdrcLightEyeTp             (const BdrcSystem* sys) { return sys->d_lightEyeTp;                 }
 unsigned int* bdrcLightValid             (const BdrcSystem* sys) { return sys->d_lightValid;                 }
 float*        bdrcCompactResampledEndpoints(const BdrcSystem* sys){ return sys->d_compactResampledEndpoints; }
 unsigned int* bdrcCompactResampledCount  (const BdrcSystem* sys) { return sys->d_compactResampledCount;      }
@@ -307,12 +294,10 @@ static __global__ void bdrc_compact_light_kernel(
     float*              compactEndpoints,   // [3 × batchSize] AoS output
     float*              compactTargets,     // [3 × batchSize] AoS output
     float*              compactPeArea,      // [batchSize] output
-    float*              compactTpLum,       // [batchSize] output — eye-vertex throughput luminance
     unsigned int*       compactCount,       // [1] must be 0 before launch
     const float*        sparseEndpoints,    // [3 × batchSize] AoS input
     const float*        sparseTargets,      // [3 × batchSize] AoS input
     const float*        sparsePeArea,       // [batchSize] input
-    const float*        sparseThroughput,   // [3 × batchSize] AoS input — eye vertex throughput at D
     const unsigned int* valid,              // [batchSize]
     uint32_t            batchSize)
 {
@@ -326,20 +311,14 @@ static __global__ void bdrc_compact_light_kernel(
     compactTargets  [3u * slot + 1u] = sparseTargets  [3u * i + 1u];
     compactTargets  [3u * slot + 2u] = sparseTargets  [3u * i + 2u];
     compactPeArea   [slot]            = sparsePeArea  [i];
-    const float r = sparseThroughput[3u * i + 0u];
-    const float g = sparseThroughput[3u * i + 1u];
-    const float b = sparseThroughput[3u * i + 2u];
-    compactTpLum    [slot]            = (r + g + b) * (1.0f / 3.0f);
 }
 
 static __global__ void bdrc_compact_resampled_kernel(
     float*              compact,              // [3 × batchSize] AoS output
     float*              compactPeArea,        // [batchSize] output
-    float*              compactTpLum,         // [batchSize] output — eye-vertex throughput luminance
     unsigned int*       compactCount,         // [1] must be 0 before launch
     const float*        sparse,               // [3 × batchSize] AoS input
     const float*        sparsePeArea,         // [batchSize] input
-    const float*        sparseThroughput,     // [3 × batchSize] AoS input — eye vertex throughput
     const unsigned int* valid,                // [batchSize]
     uint32_t            batchSize)
 {
@@ -350,10 +329,6 @@ static __global__ void bdrc_compact_resampled_kernel(
     compact[3u * slot + 1u] = sparse[3u * i + 1u];
     compact[3u * slot + 2u] = sparse[3u * i + 2u];
     compactPeArea[slot] = sparsePeArea[i];
-    const float r = sparseThroughput[3u * i + 0u];
-    const float g = sparseThroughput[3u * i + 1u];
-    const float b = sparseThroughput[3u * i + 2u];
-    compactTpLum[slot] = (r + g + b) * (1.0f / 3.0f);
 }
 
 static void device_bdrc_compact_light(
@@ -361,39 +336,35 @@ static void device_bdrc_compact_light(
     float*              compactEndpoints,
     float*              compactTargets,
     float*              compactPeArea,
-    float*              compactTpLum,
     unsigned int*       compactCount,
     const float*        sparseEndpoints,
     const float*        sparseTargets,
     const float*        sparsePeArea,
-    const float*        sparseThroughput,
     const unsigned int* valid,
     uint32_t            batchSize)
 {
     constexpr uint32_t THREADS = 256u;
     const uint32_t blocks = (batchSize + THREADS - 1u) / THREADS;
     bdrc_compact_light_kernel<<<blocks, THREADS, 0, stream>>>(
-        compactEndpoints, compactTargets, compactPeArea, compactTpLum, compactCount,
-        sparseEndpoints, sparseTargets, sparsePeArea, sparseThroughput, valid, batchSize);
+        compactEndpoints, compactTargets, compactPeArea, compactCount,
+        sparseEndpoints, sparseTargets, sparsePeArea, valid, batchSize);
 }
 
 static void device_bdrc_compact_resampled(
     cudaStream_t        stream,
     float*              compact,
     float*              compactPeArea,
-    float*              compactTpLum,
     unsigned int*       compactCount,
     const float*        sparse,
     const float*        sparsePeArea,
-    const float*        sparseThroughput,
     const unsigned int* valid,
     uint32_t            batchSize)
 {
     constexpr uint32_t THREADS = 256u;
     const uint32_t blocks = (batchSize + THREADS - 1u) / THREADS;
     bdrc_compact_resampled_kernel<<<blocks, THREADS, 0, stream>>>(
-        compact, compactPeArea, compactTpLum, compactCount,
-        sparse, sparsePeArea, sparseThroughput, valid, batchSize);
+        compact, compactPeArea, compactCount,
+        sparse, sparsePeArea, valid, batchSize);
 }
 
 // ---- Per-frame dispatch -----------------------------------------------------
@@ -442,16 +413,15 @@ void bdrcDispatch(
         }
         else // debugMode == 6
         {
-            // Compact depth-strided light buffer, then splat the dense result.
-            const uint32_t lightSrc6 = static_cast<uint32_t>(BDRC_MAX_LIGHT_DEPTH) * batchSize;
+            // Compact per-pixel light buffer, then splat the dense result.
             cudaMemsetAsync(sys->d_compactLightCount, 0, sizeof(unsigned int), stream);
             device_bdrc_compact_light(stream,
                 sys->d_compactLightEndpoints, sys->d_compactLightTargets,
-                sys->d_compactLight_p_e_area, sys->d_compactLight_throughput,
+                sys->d_compactLight_p_e_area,
                 sys->d_compactLightCount,
                 sys->d_lightEndpoints, sys->d_lightTargets,
-                sys->d_light_p_e_area, sys->d_lightEyeTp,
-                sys->d_lightValid, lightSrc6);
+                sys->d_light_p_e_area,
+                sys->d_lightValid, batchSize);
             cudaStreamSynchronize(stream);
             unsigned int lightCount6 = 0;
             cudaMemcpy(&lightCount6, sys->d_compactLightCount, sizeof(unsigned int), cudaMemcpyDeviceToHost);
@@ -465,36 +435,29 @@ void bdrcDispatch(
         // Clear all valid flags and training counter (same as normal dispatch).
         cudaMemsetAsync(sys->d_renderValid,       0, batchSize * sizeof(unsigned int), stream);
         cudaMemsetAsync(sys->d_trainNextValid,     0, batchSize * sizeof(unsigned int), stream);
-        const uint32_t lightSlotsDebug = static_cast<uint32_t>(BDRC_MAX_LIGHT_DEPTH) * batchSize;
-        cudaMemsetAsync(sys->d_lightValid,         0, lightSlotsDebug * sizeof(unsigned int), stream);
+        cudaMemsetAsync(sys->d_lightValid,         0, batchSize * sizeof(unsigned int), stream);
         cudaMemsetAsync(sys->d_resampledValid,     0, batchSize * sizeof(unsigned int), stream);
         cudaMemsetAsync(d_trainCount,              0, sizeof(unsigned int),             stream);
         cudaStreamSynchronize(stream);
         return;
     }
 
-    // Compact depth-strided light buffers (written by raygen) → dense for tcnn training.
-    // Reset counter first, then compact from the full BDRC_MAX_LIGHT_DEPTH × batchSize source.
+    // Compact per-pixel light buffers (written by raygen) → dense for tcnn training.
     cudaMemsetAsync(sys->d_compactLightCount, 0, sizeof(unsigned int), stream);
-    {
-        const uint32_t lightSrc = static_cast<uint32_t>(BDRC_MAX_LIGHT_DEPTH) * batchSize;
-        device_bdrc_compact_light(stream,
-            sys->d_compactLightEndpoints, sys->d_compactLightTargets,
-            sys->d_compactLight_p_e_area, sys->d_compactLight_throughput,
-            sys->d_compactLightCount,
-            sys->d_lightEndpoints, sys->d_lightTargets,
-            sys->d_light_p_e_area, sys->d_lightEyeTp,
-            sys->d_lightValid, lightSrc);
-    }
+    device_bdrc_compact_light(stream,
+        sys->d_compactLightEndpoints, sys->d_compactLightTargets,
+        sys->d_compactLight_p_e_area,
+        sys->d_compactLightCount,
+        sys->d_lightEndpoints, sys->d_lightTargets,
+        sys->d_light_p_e_area,
+        sys->d_lightValid, batchSize);
 
     // Compact sparse pixel-indexed resampled (eye-side) buffers.
     cudaMemsetAsync(sys->d_compactResampledCount, 0, sizeof(unsigned int), stream);
     device_bdrc_compact_resampled(stream,
         sys->d_compactResampledEndpoints, sys->d_compactResampled_p_e_area,
-        sys->d_compactResampled_throughput,
         sys->d_compactResampledCount,
         sys->d_resampledEndpoints, sys->d_resampled_p_e_area,
-        sys->d_eyeVertexThroughput,
         sys->d_resampledValid, batchSize);
 
     // Sync stream then batch-read all training counts in one pass.
@@ -522,9 +485,8 @@ void bdrcDispatch(
         return n > 0u ? (n + GRAN - 1u) / GRAN * GRAN : 0u;
     };
     const uint32_t paddedTrainCount     = padTo256(trainCount);
-    const uint32_t maxLightSlots = static_cast<uint32_t>(BDRC_MAX_LIGHT_DEPTH) * batchSize;
     uint32_t       paddedLightCount = padTo256(lightCount);
-    if (paddedLightCount > maxLightSlots) paddedLightCount = maxLightSlots;
+    if (paddedLightCount > batchSize) paddedLightCount = batchSize;
     const uint32_t paddedResampledCount = padTo256(resampledCount);
 
     if (bdrcPhase == 0)
@@ -563,7 +525,7 @@ void bdrcDispatch(
                 eyeLossSum = sys->maskNrc->dreLossAccumGrad(stream, inputMat,
                                                sys->d_compactResampled_p_e_area, 0,
                                                normCount,
-                                               sys->d_compactResampled_throughput,
+                                               nullptr,
                                                tcnn::GradientMode::Overwrite);
                 didAccumGrad = true;
             }
@@ -578,7 +540,7 @@ void bdrcDispatch(
                 lightLossSum = sys->maskNrc->dreLossAccumGrad(stream, inputMat,
                                                sys->d_compactLight_p_e_area, 1,
                                                normCount / 100000,
-                                               sys->d_compactLight_throughput,
+                                               nullptr,
                                                didAccumGrad ? tcnn::GradientMode::Accumulate
                                                             : tcnn::GradientMode::Overwrite);
                 didAccumGrad = true;
@@ -657,7 +619,7 @@ void bdrcDispatch(
         // 7. Clear valid flags and training counter
         cudaMemsetAsync(sys->d_renderValid,   0, batchSize * sizeof(unsigned int), stream);
         cudaMemsetAsync(sys->d_trainNextValid, 0, batchSize * sizeof(unsigned int), stream);
-        cudaMemsetAsync(sys->d_lightValid,    0, static_cast<uint32_t>(BDRC_MAX_LIGHT_DEPTH) * batchSize * sizeof(unsigned int), stream);
+        cudaMemsetAsync(sys->d_lightValid,    0, batchSize * sizeof(unsigned int), stream);
         cudaMemsetAsync(sys->d_resampledValid, 0, batchSize * sizeof(unsigned int), stream);
         cudaMemsetAsync(d_trainCount,          0, sizeof(unsigned int),             stream);
         cudaStreamSynchronize(stream);
@@ -806,7 +768,7 @@ void bdrcDispatch(
         // 11. Clear valid flags and training counter
         cudaMemsetAsync(sys->d_renderValid,    0, batchSize * sizeof(unsigned int), stream);
         cudaMemsetAsync(sys->d_trainNextValid,  0, batchSize * sizeof(unsigned int), stream);
-        cudaMemsetAsync(sys->d_lightValid,     0, static_cast<uint32_t>(BDRC_MAX_LIGHT_DEPTH) * batchSize * sizeof(unsigned int), stream);
+        cudaMemsetAsync(sys->d_lightValid,     0, batchSize * sizeof(unsigned int), stream);
         cudaMemsetAsync(sys->d_resampledValid,  0, batchSize * sizeof(unsigned int), stream);
         cudaMemsetAsync(d_trainCount,           0, sizeof(unsigned int),             stream);
         cudaStreamSynchronize(stream);

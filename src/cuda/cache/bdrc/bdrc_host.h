@@ -42,7 +42,6 @@ float*        bdrcResampled_p_e_area     (const BdrcSystem* sys);
 float*        bdrcLightEndpoints         (const BdrcSystem* sys);
 float*        bdrcLightTargets           (const BdrcSystem* sys);
 float*        bdrcLight_p_e_area         (const BdrcSystem* sys);
-float*        bdrcLightEyeTp             (const BdrcSystem* sys);
 unsigned int* bdrcLightValid             (const BdrcSystem* sys);
 float*        bdrcCompactResampledEndpoints(const BdrcSystem* sys);
 unsigned int* bdrcCompactResampledCount  (const BdrcSystem* sys);

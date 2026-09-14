@@ -1416,7 +1416,6 @@ void Application::updateBuffers()
     nrcBuf.lightEndpoints  = bdrcLightEndpoints(m_bdrcSystem);
     nrcBuf.lightTargets    = bdrcLightTargets(m_bdrcSystem);
     nrcBuf.light_p_e_area  = bdrcLight_p_e_area(m_bdrcSystem);
-    nrcBuf.lightEyeTp      = bdrcLightEyeTp(m_bdrcSystem);
     nrcBuf.lightValid      = bdrcLightValid(m_bdrcSystem);
     nrcBuf.lightOutput     = bdrcLightOutput(m_bdrcSystem);
 
