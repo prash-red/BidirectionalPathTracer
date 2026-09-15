@@ -59,8 +59,11 @@ constexpr int VIRT_EMIT_MAX_DEPTH = 4;
 // depends on the camera or the current eye path.
 struct SurfaceReferenceTable
 {
-  float3*      positions;    // [3 * triCount] world-space triangle verts (v0,v1,v2 per tri)
-  float*       cdf;          // [triCount + 1] normalized cumulative-area CDF
+  float3*      positions;    // [3 * triCount] GAS-local-space triangle verts (v0,v1,v2 per tri) —
+                              // same local frame every other BDRC feature buffer uses
+  float*       cdf;          // [triCount + 1] normalized cumulative-area CDF (area computed in world space)
+  float3*      localAabbMin; // [triCount] owning mesh's GAS-local rest-pose AABB min, per triangle
+  float3*      localAabbMax; // [triCount] owning mesh's GAS-local rest-pose AABB max, per triangle
   unsigned int triCount;
   float        invTotalArea; // 1 / total surface area — the known reference density
 };

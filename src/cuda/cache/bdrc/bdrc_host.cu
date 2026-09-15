@@ -84,6 +84,7 @@ struct BdrcSystem
     float*        d_compactVirtEmitThroughput = nullptr; // [3 × VIRT_EMIT_MAX_DEPTH × batchSize]
     unsigned int* d_compactVirtEmitCount       = nullptr; // [1]
     float*        d_virtEmitOutput            = nullptr; // [3 × VIRT_EMIT_MAX_DEPTH × batchSize] lightNrc EMA query result
+    float*        d_virtEmitMask              = nullptr; // [1 × VIRT_EMIT_MAX_DEPTH × batchSize] maskNrc EMA query result at compacted virt-emit positions
     float*        d_virtEmitContribSum        = nullptr; // [3 × batchSize] per-training-slot summed compensation
     unsigned int* d_pixelToTrainSlot          = nullptr; // [numPixels] inverse map: pixel -> training slot, 0xFFFFFFFF if none
     unsigned int* d_virtEmitPixelIdx          = nullptr; // [VIRT_EMIT_MAX_DEPTH * batchSize] compact output: pixel index per compacted virt-emit entry
@@ -135,6 +136,7 @@ struct BdrcSystem
         cudaFree(d_compactVirtEmitThroughput);    d_compactVirtEmitThroughput   = nullptr;
         cudaFree(d_compactVirtEmitCount);         d_compactVirtEmitCount        = nullptr;
         cudaFree(d_virtEmitOutput);               d_virtEmitOutput              = nullptr;
+        cudaFree(d_virtEmitMask);                 d_virtEmitMask                = nullptr;
         cudaFree(d_virtEmitContribSum);           d_virtEmitContribSum          = nullptr;
         cudaFree(d_pixelToTrainSlot);              d_pixelToTrainSlot            = nullptr;
         cudaFree(d_virtEmitPixelIdx);               d_virtEmitPixelIdx           = nullptr;
@@ -254,6 +256,7 @@ void bdrcAllocBuffers(BdrcSystem* sys, uint32_t numPixels)
     cudaMalloc(reinterpret_cast<void**>(&sys->d_compactVirtEmitThroughput),  VIRT_EMIT_MAX_DEPTH * batchSize * 3u * sizeof(float));
     cudaMalloc(reinterpret_cast<void**>(&sys->d_compactVirtEmitCount),                       1u              * sizeof(unsigned int));
     cudaMalloc(reinterpret_cast<void**>(&sys->d_virtEmitOutput),             VIRT_EMIT_MAX_DEPTH * batchSize * 3u * sizeof(float));
+    cudaMalloc(reinterpret_cast<void**>(&sys->d_virtEmitMask),               VIRT_EMIT_MAX_DEPTH * batchSize * 1u * sizeof(float));
     cudaMalloc(reinterpret_cast<void**>(&sys->d_virtEmitContribSum),         batchSize * 3u * sizeof(float));
     cudaMalloc(reinterpret_cast<void**>(&sys->d_pixelToTrainSlot),           numPixels * sizeof(unsigned int));
     cudaMalloc(reinterpret_cast<void**>(&sys->d_virtEmitPixelIdx),          VIRT_EMIT_MAX_DEPTH * batchSize * sizeof(unsigned int));
@@ -418,6 +421,7 @@ static __global__ void bdrc_add_virt_emission_kernel(
     const unsigned int* pixelToTrainSlot,   // [numPixels] inverse map, 0xFFFFFFFF if none
     const float*        compactWeight,      // [3 x compactCount]
     const float*        lightOutput,        // [3 x compactCount] EMA lightNrc query result
+    const float*        mask,               // [compactCount] EMA maskNrc query result, p_l_area(x)
     const unsigned int* compactPixelIdx,    // [compactCount]
     unsigned int         compactCount)
 {
@@ -427,9 +431,10 @@ static __global__ void bdrc_add_virt_emission_kernel(
     const unsigned int trainSlot = pixelToTrainSlot[px];
     if (trainSlot == 0xFFFFFFFFu) return;
 
+    const float m = mask[i];
     for (int c = 0; c < 3; ++c)
     {
-        const float contrib = compactWeight[3u*i + c] * lightOutput[3u*i + c];
+        const float contrib = compactWeight[3u*i + c] * lightOutput[3u*i + c] * m;
         atomicAdd(&trainSuffixScaled[3u*trainSlot + c], contrib);
     }
 }
@@ -541,6 +546,8 @@ void bdrcDispatch(
         cudaMemsetAsync(sys->d_trainNextValid,     0, batchSize * sizeof(unsigned int), stream);
         cudaMemsetAsync(sys->d_lightValid,         0, batchSize * sizeof(unsigned int), stream);
         cudaMemsetAsync(sys->d_resampledValid,     0, batchSize * sizeof(unsigned int), stream);
+        cudaMemsetAsync(sys->d_virtEmitValid, 0,
+                         static_cast<uint32_t>(VIRT_EMIT_MAX_DEPTH) * batchSize * sizeof(unsigned int), stream);
         cudaMemsetAsync(d_trainCount,              0, sizeof(unsigned int),             stream);
         cudaStreamSynchronize(stream);
         return;
@@ -729,6 +736,8 @@ void bdrcDispatch(
         cudaMemsetAsync(sys->d_trainNextValid, 0, batchSize * sizeof(unsigned int), stream);
         cudaMemsetAsync(sys->d_lightValid,    0, batchSize * sizeof(unsigned int), stream);
         cudaMemsetAsync(sys->d_resampledValid, 0, batchSize * sizeof(unsigned int), stream);
+        cudaMemsetAsync(sys->d_virtEmitValid, 0,
+                         static_cast<uint32_t>(VIRT_EMIT_MAX_DEPTH) * batchSize * sizeof(unsigned int), stream);
         cudaMemsetAsync(d_trainCount,          0, sizeof(unsigned int),             stream);
         cudaStreamSynchronize(stream);
     }
@@ -846,6 +855,9 @@ void bdrcDispatch(
                     tcnn::GPUMatrix<float> out(sys->d_virtEmitOutput, 3u, paddedVirtCount);
                     sys->lightNrc->query(stream, inp, out, /*useEmaWeights=*/true);
 
+                    tcnn::GPUMatrix<float> maskOut(sys->d_virtEmitMask, 1u, paddedVirtCount);
+                    sys->maskNrc->query(stream, inp, maskOut, /*useEmaWeights=*/true);
+
                     cudaMemsetAsync(sys->d_pixelToTrainSlot, 0xFF, (uint32_t)numPixels * sizeof(unsigned int), stream);
                     if (trainCount > 0u)
                     {
@@ -858,6 +870,7 @@ void bdrcDispatch(
                     bdrc_add_virt_emission_kernel<<<blocks, THREADS, 0, stream>>>(
                         sys->d_trainSuffixScaled, sys->d_pixelToTrainSlot,
                         sys->d_compactVirtEmitThroughput, sys->d_virtEmitOutput,
+                        sys->d_virtEmitMask,
                         sys->d_virtEmitPixelIdx, virtCount);
                 }
             }
@@ -924,6 +937,8 @@ void bdrcDispatch(
         cudaMemsetAsync(sys->d_trainNextValid,  0, batchSize * sizeof(unsigned int), stream);
         cudaMemsetAsync(sys->d_lightValid,     0, batchSize * sizeof(unsigned int), stream);
         cudaMemsetAsync(sys->d_resampledValid,  0, batchSize * sizeof(unsigned int), stream);
+        cudaMemsetAsync(sys->d_virtEmitValid, 0,
+                         static_cast<uint32_t>(VIRT_EMIT_MAX_DEPTH) * batchSize * sizeof(unsigned int), stream);
         cudaMemsetAsync(d_trainCount,           0, sizeof(unsigned int),             stream);
         cudaStreamSynchronize(stream);
     }

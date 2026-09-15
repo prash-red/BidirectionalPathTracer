@@ -621,23 +621,29 @@ __forceinline__ __device__ float3 integrator(PerRayData& prd, const uint2 theLau
       // distribution: density is the single known scalar invTotalArea
       // everywhere, so no per-point density lookup is needed.
       {
-        float3 refPos, refNormal;
-        sampleSurfaceUniform(prd.seed, theLaunchParameters.surfaceRef, refPos, refNormal);
+        float3 refPos, refNormal, refLocalAabbMin, refLocalAabbMax;
+        if (sampleSurfaceUniform(prd.seed, theLaunchParameters.surfaceRef,
+                                  refPos, refNormal, refLocalAabbMin, refLocalAabbMax))
+        {
+          // refPos/refLocalAabbMin/refLocalAabbMax are already in the SAME
+          // GAS-local frame convention as every other BDRC feature buffer
+          // (posLocal + the owning mesh's own localAabbMin/Max), so this
+          // reference/anchor stream and the render-time query at D share one
+          // normalization domain — required for the mask cache's NCE loss to
+          // have a meaningful fixed point.
+          bdrcPackFeatures(nrc.resampledEndpoints, px, refPos, refLocalAabbMin, refLocalAabbMax);
+          nrc.resampledValid[px]     = 1u;
+          nrc.resampled_p_sa[px]     = 0.0f;  // no longer a solid-angle PDF; unused downstream
+          nrc.resampled_p_e_area[px] = theLaunchParameters.surfaceRef.invTotalArea;
 
-        // Reuse posLocal/localAabbMin/localAabbMax packing: the reference
-        // sample has no GAS-local frame of its own (it isn't a ray hit), so
-        // pack it directly in world space against the same global AABB used
-        // to normalize all other cache queries (nrc.aabbMin/aabbMax).
-        bdrcPackFeatures(nrc.resampledEndpoints, px, refPos,
-                         theLaunchParameters.nrc.aabbMin,
-                         theLaunchParameters.nrc.aabbMax);
-        nrc.resampledValid[px]     = 1u;
-        nrc.resampled_p_sa[px]     = 0.0f;  // no longer a solid-angle PDF; unused downstream
-        nrc.resampled_p_e_area[px] = theLaunchParameters.surfaceRef.invTotalArea;
-
-        nrc.eyeVertexNormals[3*px+0] = refNormal.x;
-        nrc.eyeVertexNormals[3*px+1] = refNormal.y;
-        nrc.eyeVertexNormals[3*px+2] = refNormal.z;
+          nrc.eyeVertexNormals[3*px+0] = refNormal.x;
+          nrc.eyeVertexNormals[3*px+1] = refNormal.y;
+          nrc.eyeVertexNormals[3*px+2] = refNormal.z;
+        }
+        // else: empty reference table (degenerate scene, no triangle geometry).
+        // resampledValid[px] was already cleared to 0 this frame by the host's
+        // per-frame memset, so this pixel simply contributes no mask-cache
+        // reference sample this frame — correct, not an error.
       }
 
       if (handleBdrcCacheLogic(prd, theLaunchIndex, payload, radianceBeforeTrace))

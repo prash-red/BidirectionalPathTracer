@@ -69,6 +69,7 @@ __global__ void k_dre_logistic_grad(
     }
 
     grad *= gradScale * tw;
+    grad  = fmaxf(fminf(grad, 1.0e4f), -1.0e4f); // guard against half-precision overflow at p_l->0
 
     lossOut[i] = tw * lv;
 

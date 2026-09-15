@@ -27,11 +27,19 @@ __forceinline__ __device__ unsigned int surfaceRefBinarySearchCDF(
 // The returned position's exact per-unit-area density is tbl.invTotalArea —
 // the SAME scalar for every point in the scene, so no per-point density lookup
 // is ever needed (this is the pure-uniform case; there is no shape/NDC mixture
-// in this port). outNormal is the (unnormalized-safe, already-normalized) face
-// normal of the sampled triangle.
-__forceinline__ __device__ void sampleSurfaceUniform(
-    unsigned int& seed, const SurfaceReferenceTable& tbl, float3& outPos, float3& outNormal)
+// in this port). outPos/outLocalAabbMin/outLocalAabbMax are in the SAME
+// GAS-local coordinate convention as every other BDRC feature buffer (the
+// owning mesh's own local AABB), so this reference stream and the render-time
+// query normalize into the same domain. outNormal is the (already-normalized)
+// face normal of the sampled triangle. Returns false (no output written) if
+// the table is empty — callers must check the return value.
+__forceinline__ __device__ bool sampleSurfaceUniform(
+    unsigned int& seed, const SurfaceReferenceTable& tbl,
+    float3& outPos, float3& outNormal, float3& outLocalAabbMin, float3& outLocalAabbMax)
 {
+  if (tbl.triCount == 0u || tbl.cdf == nullptr)
+    return false;
+
   const float u0 = rng(seed);
   const unsigned int triIdx = surfaceRefBinarySearchCDF(tbl.cdf, tbl.triCount, u0);
 
@@ -48,9 +56,12 @@ __forceinline__ __device__ void sampleSurfaceUniform(
   const float b1 = su * (1.0f - u2);
   const float b2 = su * u2;
 
-  outPos    = b0 * v0 + b1 * v1 + b2 * v2;
+  outPos          = b0 * v0 + b1 * v1 + b2 * v2;
   const float3 cr = cross(v1 - v0, v2 - v0);
-  outNormal = normalize(cr);
+  outNormal       = normalize(cr);
+  outLocalAabbMin = tbl.localAabbMin[triIdx];
+  outLocalAabbMax = tbl.localAabbMax[triIdx];
+  return true;
 }
 
 #endif // GLTF_RENDERER_SURFACE_REFERENCE_H

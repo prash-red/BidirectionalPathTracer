@@ -8,12 +8,12 @@ class mask_ngp_cache : public base_ngp_cache
 public:
     explicit mask_ngp_cache(cudaStream_t stream = nullptr);
 
-    // Brier-score DRE loss with correct p_e_area in the denominator.
+    // Logistic NCE loss (density-ratio estimation) with correct p_e_area in the denominator.
     //
-    // Trains p_l_area(x) directly:
-    //   alpha(x) = p_l_area(x) / (p_l_area(x) + p_e_area(x))
-    //   label=0 (eye):   L = alpha²,        dL/d(p_l) =  2*p_l*p_e / (p_l+p_e)³
-    //   label=1 (light): L = (alpha-1)²,    dL/d(p_l) = -2*p_e²    / (p_l+p_e)³
+    // Trains p_l_area(x) directly via a binary logistic classifier between eye/reference
+    // samples (label=0) and light/caustic samples (label=1):
+    //   label=0 (eye):   L = -log(p_e / (p_l+p_e)),  dL/d(p_l) =  1 / (p_l+p_e)
+    //   label=1 (light): L = -log(p_l / (p_l+p_e)),  dL/d(p_l) = -p_e / (p_l*(p_l+p_e))
     //
     // d_p_e_area: [batchSize] device buffer, one area-measure PDF per sample.
     // label: 0 = eye/resampled samples, 1 = light samples.
@@ -25,14 +25,16 @@ public:
 
     // Accumulate DRE gradients without taking an optimizer step.
     //
-    // normBatch: gradient normalizer — use n_eye (resolutionX*resolutionY) for BOTH eye
-    //   and light passes so the composite loss total = (sum_eye + sum_light) / n_eye
-    //   matches Python: eye_loss + (n_light/n_eye) * light_loss.
-    // d_throughputWeights: [batchSize] per-sample eye-vertex throughput luminance; nullptr = uniform 1.0.
-    //   Pass for both eye (label=0) and light (label=1) passes to match Python's throughput weighting.
+    // normBatch: gradient normalizer — pass the shared resampled/anchor-sample count
+    //   (resampledCount, clamped to >= 1) for BOTH eye and light passes, so the composite
+    //   loss total = (sum_eye + sum_light) / resampledCount matches Python's
+    //   alpha*mean(ref) + beta*(n_light/n_eye)*mean(pos) class-balance ratio.
+    // d_throughputWeights: [batchSize] per-sample eye-vertex throughput luminance. This loss
+    //   is intentionally unweighted by throughput — always pass nullptr for both eye
+    //   (label=0) and light (label=1) passes.
     // gradMode: GradientMode::Overwrite for first pass, Accumulate for subsequent passes.
     //
-    // Returns the sum of per-sample throughput-weighted Brier loss values for this batch.
+    // Returns the sum of per-sample logistic-NCE loss values for this batch.
     // Call optimizerStep() once after all dreLossAccumGrad() calls for the frame.
     float dreLossAccumGrad(
         cudaStream_t                         stream,

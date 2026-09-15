@@ -1551,13 +1551,15 @@ __forceinline__ __device__ void chRadiance()
 
     bdrcPackFeatures(nrc.virtEmitPos, slot, thePrd->posLocal, thePrd->localAabbMin, thePrd->localAabbMax);
 
-    // Retro-BSDF response toward the incoming eye-path direction, times the
-    // throughput arriving at this vertex (pre-local-BSDF), so multiplying by
-    // the light cache's stored radiance at this point gives this vertex's
-    // contribution to the pixel's accumulated radiance in the same units as
-    // every other term already summed into prd.radiance.
-    const float3 f_retro = state.baseColor * (fmaxf(dot(state.N, thePrd->wo), 0.0f) * M_1_PIf);
-    const float3 w       = throughput * f_retro;
+    // Weight is just the eye-path throughput arriving at this vertex. The
+    // light cache's EMA output already represents the Lambertian-response-
+    // weighted photon power (see bdrcLightIntegrator's target, raygen.cu),
+    // and the mask cache's EMA output p_l_area(x) is the same density scalar
+    // the render-time composite multiplies by (see k_bdrc_composite) — the
+    // host scatter-add computes throughput * mask(x) * lightOutput(x), which
+    // together is exactly this suppressed vertex's contribution. No
+    // additional BRDF/cosine factor belongs here.
+    const float3 w = throughput;
     nrc.virtEmitThroughput[3*slot+0] = w.x;
     nrc.virtEmitThroughput[3*slot+1] = w.y;
     nrc.virtEmitThroughput[3*slot+2] = w.z;
