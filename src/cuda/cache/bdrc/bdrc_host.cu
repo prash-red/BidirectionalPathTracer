@@ -121,6 +121,26 @@ static __global__ void k_bdrc_assemble_targets(
     scaleRef[i] = invN;
 }
 
+// Summarises the field's camera-query output over valid pixels, for the design
+// note's fit gate: a field that is uniformly zero or uniformly saturated is the
+// failure this distinguishes from a plausible spatial pattern.
+static __global__ void k_bdrc_field_stats(
+    const float*        fieldOutput,
+    const unsigned int* camValid,
+    int                 numPixels,
+    float*              outSum,     // [3]: sum of luminance, max, count (as float)
+    unsigned int*       outNonZero)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= numPixels || !camValid[i]) return;
+
+    const float u = (fieldOutput[3*i+0] + fieldOutput[3*i+1] + fieldOutput[3*i+2]) / 3.0f;
+    atomicAdd(outSum + 0, u);
+    atomicAdd(outSum + 2, 1.0f);
+    atomicMax(reinterpret_cast<int*>(outSum) + 1, __float_as_int(u));
+    if (u > 1.0e-8f) atomicAdd(outNonZero, 1u);
+}
+
 // Counts lanes with a live reference density, and copies one live lane's
 // density out, for the design note's stream-count and reference-density gates.
 static __global__ void k_bdrc_count_live(
@@ -178,6 +198,14 @@ struct BdrcSystem
     unsigned int* d_liveCount   = nullptr;  // [2] photon, gather
     float*        d_liveDensity = nullptr;  // [1]
 
+    float* d_fieldStats    = nullptr;  // [3] sum, max, count
+    unsigned int* d_fieldNZ = nullptr;  // [1]
+
+    float    m_fieldMean   = 0.0f;
+    float    m_fieldMax    = 0.0f;
+    uint32_t m_fieldNonZero = 0u;
+    uint32_t m_fieldCount   = 0u;
+
     float    m_lastLoss    = 0.0f;
     uint32_t m_photonLive  = 0u;
     uint32_t m_gatherLive  = 0u;
@@ -188,13 +216,14 @@ struct BdrcSystem
         for (float** p : { &d_recQuery, &d_recBase, &d_recDensity, &d_recTailQuery,
                            &d_recTailValid, &d_recFactor, &d_weight, &d_scalePos,
                            &d_scaleRef, &d_tailOut, &d_camQuery, &d_camPrefix,
-                           &d_camFactor, &d_camOutput, &d_liveDensity })
+                           &d_camFactor, &d_camOutput, &d_liveDensity, &d_fieldStats })
         {
             cudaFree(*p);
             *p = nullptr;
         }
         cudaFree(d_camValid);  d_camValid  = nullptr;
         cudaFree(d_liveCount); d_liveCount = nullptr;
+        cudaFree(d_fieldNZ);   d_fieldNZ   = nullptr;
     }
 
     ~BdrcSystem() { freeAllBuffers(); }
@@ -256,12 +285,16 @@ void bdrcAllocBuffers(BdrcSystem* sys, uint32_t numPixels, uint32_t gatherCount)
     alloc(&sys->d_camFactor, static_cast<size_t>(3) * C);
     alloc(&sys->d_camOutput, static_cast<size_t>(3) * C);
     alloc(&sys->d_liveDensity, 1);
+    alloc(&sys->d_fieldStats, 3);
 
     cudaMalloc(reinterpret_cast<void**>(&sys->d_camValid), C * sizeof(unsigned int));
     cudaMemset(sys->d_camValid, 0, C * sizeof(unsigned int));
 
     cudaMalloc(reinterpret_cast<void**>(&sys->d_liveCount), 2u * sizeof(unsigned int));
     cudaMemset(sys->d_liveCount, 0, 2u * sizeof(unsigned int));
+
+    cudaMalloc(reinterpret_cast<void**>(&sys->d_fieldNZ), sizeof(unsigned int));
+    cudaMemset(sys->d_fieldNZ, 0, sizeof(unsigned int));
 }
 
 // ---- Accessors --------------------------------------------------------------
@@ -282,6 +315,10 @@ float    bdrcGetLastLoss   (const BdrcSystem* sys) { return sys->m_lastLoss;    
 uint32_t bdrcGetPhotonLive (const BdrcSystem* sys) { return sys->m_photonLive;  }
 uint32_t bdrcGetGatherLive (const BdrcSystem* sys) { return sys->m_gatherLive;  }
 float    bdrcGetLastDensity(const BdrcSystem* sys) { return sys->m_lastDensity; }
+float    bdrcGetFieldMean  (const BdrcSystem* sys) { return sys->m_fieldMean;   }
+float    bdrcGetFieldMax   (const BdrcSystem* sys) { return sys->m_fieldMax;    }
+uint32_t bdrcGetFieldNonZero(const BdrcSystem* sys){ return sys->m_fieldNonZero;}
+uint32_t bdrcGetFieldCount (const BdrcSystem* sys) { return sys->m_fieldCount;  }
 
 void bdrcSetDreConfig(BdrcSystem* sys, const DreConfig& dre)
 {
@@ -370,6 +407,15 @@ void bdrcDispatch(
         sys->field->query(stream, in, out, /*useEmaWeights=*/true);
     }
 
+    // Field statistics over the camera queries, for the fit gate.
+    {
+        cudaMemsetAsync(sys->d_fieldStats, 0, 3u * sizeof(float),   stream);
+        cudaMemsetAsync(sys->d_fieldNZ,    0, sizeof(unsigned int), stream);
+        const uint32_t blocks = (static_cast<uint32_t>(numPixels) + THREADS - 1u) / THREADS;
+        k_bdrc_field_stats<<<blocks, THREADS, 0, stream>>>(
+            sys->d_camOutput, sys->d_camValid, numPixels, sys->d_fieldStats, sys->d_fieldNZ);
+    }
+
     if (debugMode == 0)
     {
         device_bdrc_composite(stream, bufferAccum, sys->d_camPrefix, sys->d_camFactor,
@@ -407,4 +453,11 @@ void bdrcDispatch(
     cudaMemcpy(&sys->m_lastDensity, sys->d_liveDensity, sizeof(float), cudaMemcpyDeviceToHost);
     sys->m_photonLive = live[0];
     sys->m_gatherLive = live[1];
+
+    float stats[3] = { 0.0f, 0.0f, 0.0f };
+    cudaMemcpy(stats, sys->d_fieldStats, 3u * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&sys->m_fieldNonZero, sys->d_fieldNZ, sizeof(unsigned int), cudaMemcpyDeviceToHost);
+    sys->m_fieldCount = static_cast<uint32_t>(stats[2]);
+    sys->m_fieldMean  = (stats[2] > 0.0f) ? stats[0] / stats[2] : 0.0f;
+    sys->m_fieldMax   = stats[1];
 }

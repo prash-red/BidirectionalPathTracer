@@ -181,11 +181,13 @@ display()         -> OpenGL fullscreen quad
 NrcSystem*   m_nrcSystem    = nullptr;
 BdrcSystem*  m_bdrcSystem   = nullptr;
 int          m_nrc          = 0;     // 0=off, 1=NRC, 2=BDRC
-int          m_bdrcPhase    = 0;     // 0=Phase 1 (mask warmup), 1=Phase 2 (color)
-int          m_bdrcWarmup   = 2000;  // Frames before Phase 2 starts
-int          m_bdrcDebugMode = 0;    // 0=normal, 1=eye, 2=light, 3=mask, 4=eye+light
-bool         m_bdrcFreezeTraining = true; // Freeze weights; inference still runs
-uint32_t     m_nrcTrainingIteration = 0;  // Total training frames, never reset
+int          m_bdrcGatherCount   = 65536; // gather lanes/frame, independent of resolution
+float        m_bdrcPhotonClamp   = 10000.0f;
+DreConfig    m_bdrcDre;                    // generator, alpha, beta, power
+float3       m_bdrcReferenceOrigin = {};   // stamped once; never follows the camera
+int          m_bdrcDebugMode = 0;    // 0=normal, 1=cache contribution, 2=raw field
+bool         m_bdrcFreezeTraining = false; // no warmup: the fit runs from frame 0
+uint32_t     m_nrcTrainingIteration = 0;   // Total training frames, never reset
 ```
 
 ### Acceleration Structure Pipeline
@@ -316,115 +318,193 @@ NRC_UNBIASED_RATE   16      // 1-in-16 paths bypass cache (prevents drift)
 
 ---
 
-## Bidirectional Radiance Cache (BDRC)
+## Unified Transport Cache (BDRC mode, `m_nrc == 2`)
 
-BDRC extends NRC with bidirectional path tracing to correctly render caustics (light → specular → diffuse paths). When `m_nrc == 2`:
+One neural field replaces the former three-network system (eye colour cache,
+light colour cache, mask density cache). The field stores **incident flux per
+unit world area** on diffuse receivers — not radiance, not outgoing, with no
+BSDF baked in. The receiver BSDF is applied at the query, in the renderer, on
+every path that reads the field.
 
-### Three-Cache Architecture
+Source of truth for the design: `docs/superpowers/specs/2026-09-22-unified-single-cache-design.md`.
 
-| Cache | Neural Net | Purpose |
-|-------|-----------|---------|
-| **Eye Color Cache** | `base_ngp_cache` (3-ch, ReLU, RelativeL2) | Caches `c_e(D)` — incoming radiance at first diffuse vertex D from eye paths |
-| **Light Color Cache** | `base_ngp_cache` (3-ch, Softplus output, RelativeL2) | Caches caustic transport `c_l(Y)` — light-path contribution at caustic floor Y |
-| **Mask Cache** | `mask_ngp_cache` (1-ch, Softplus output, DRE Brier loss) | Estimates `p_l(x)` — PDF that a point x lies on a light path's caustic floor |
+### The field (`bdrc/unified_ngp_cache.h/.cu`)
 
-All three caches use **hash-grid + FullyFusedMLP** via tiny-cuda-nn, with 3D position as input (AABB-normalized). See `ngp_config.h` for architecture defaults (6-level hash grid, 64-dim hidden MLP, Adam optimizer).
+| Property | Value |
+|---|---|
+| Input | 5 dims: `[0..2]` world position normalized into the scene AABB (hash grid), `[3]` `sign_cam`, `[4]` arrival side (both Identity) |
+| Encoding | tcnn `Composite`/`Concatenation`: nested `HashGrid` (8 levels x 2 features, 16..~273, log2 hashmap 20) + nested `Identity` for the two labels |
+| MLP | FullyFusedMLP, 2 x 64, LeakyReLU hidden, **no output activation** |
+| Output | 3 channels; softplus is applied by `unified_ngp_cache::query()` and differentiated analytically by the loss kernel |
+| Optimizer | Adam, lr 5e-3, gradClip 0.05, gradScaler on with growth, weightClip 1.0 |
+| EMA | decay 0.99, start 100 |
 
-### Two-Phase Training (`bdrcPhase`)
+`tcnn` must not apply softplus itself: the loss differentiates through it, and a
+second application would square the activation.
 
-**Phase 1 (`bdrcPhase == 0`)** — Mask warmup (~2000 frames):
-- Mask cache trains to distinguish light-path endpoints from eye-path endpoints (DRE).
-- Eye and light color caches run inference (EMA query) but are not trained.
-- The loss combines eye-sample and light-sample Brier terms, weighted by `N_light / N_eye`.
+### Decomposition
 
-**Phase 2 (`bdrcPhase == 1`)** — Color training:
-- Mask cache is frozen (EMA-only updates, no gradient steps).
-- Eye color cache trains on: `c_e(D) = (L_direct_at_D + L_indirect) / T(cam→D)`
-- Light color cache trains on caustic transport: `c_l(Y) = T(cam→Y_pre) × f_Y_toward_specular`
-
-### BDRC Rendering Equation
-
-For each pixel:
+With `S` any vertex without a diffuse lobe:
 
 ```
-pixel = renderPrefix + T(cam→D) × eyeCache.query(D)
+U(x) = C(x) + T(x)
+
+C(x)  caustic term: flux per area deposited at x by emitter walks whose
+      vertices before x are all non-diffuse and number at least one (L S+ D)
+
+T(x)  everything else, as one gather segment:
+      T(x) = E_dir(x) + integral f_s(y) U(y) |cos| dw
 ```
 
-where:
-- `renderPrefix` = accumulated radiance before the NRC termination vertex D (includes NEE at all vertices up to and including D)
-- `T(cam→D)` = path throughput pre-BSDF at D (`throughputPreBsdf`)
-- `eyeCache.query(D)` = neural cache output `c_e(D)`
+The families `L -> D`, `L -> S+ -> D` and `L -> ... -> D -> S* -> D` are
+disjoint and complete, and the recursion through `U(y)` carries every longer
+path. Disjoint path families induce measures that add, so one network
+supervised by both memorises their sum — neither stream needs the other's
+density.
 
-### Eye Path — Caustic Suppression
+### The three streams (`cuda/raygen.cu`)
 
-To avoid double-counting with the light cache (which handles `light→specular→diffuse` caustic paths), eye paths suppress contributions when traversing a `diffuse→specular` chain:
+| Stream | Raygen | Lanes | Records |
+|---|---|---|---|
+| Camera | `__raygen__path_tracer` (BDRC branch of `integrator()`) | `numPixels` | `camQuery`, `camPrefix`, `camFactor = T(cam->D) * f_s(D)`, `camValid` |
+| Photon | `__raygen__light_path_tracer` -> `bdrcPhotonIntegrator` | `numPixels` | `recQuery`, `recBase` = raw clamped power, `recDensity` |
+| Gather | `__raygen__bdrc_gather` (own SBT `m_sbtGather`) | `m_bdrcGatherCount`, its own launch dimension | `recQuery` (anchor), `recBase` = E_dir + chain radiance, `recTailQuery`, `recFactor`, `recTailValid` |
 
-```cpp
-// per_ray_data.h
-bool eyePathFoundDiffuse;    // latches true once any diffuse vertex is hit
-bool eyePathInSpecularChain; // true if previous BSDF bounce was specular or glossy
+**Camera** traces the prefix with ordinary NEE and MIS, stops at the first
+diffuse vertex `D`, and records one query there. The pixel reads
+`prefix + T(cam->D) * f_s(D) * U(D)`. There is no suppression and no
+continuation: the path simply ends, so it can never traverse a `D S+` chain.
+
+**Photon** keeps the ungated `L S+ D` grammar — one deposit per path, no shadow
+ray, no dependence on the camera. It stores raw clamped power.
+
+**Gather** draws an anchor from the global area-uniform surface CDF table,
+picks a side with probability 1/2, estimates direct light there with a **unit
+BSDF** (`bdrcUnitBsdfDirect`, so the estimate is incident flux rather than
+outgoing radiance), then cosine-samples the hemisphere with `throughput = pi`
+and continues through any non-diffuse chain to the first diffuse vertex `y`,
+recording `factor = throughput * f_s(y)`. The anchor is both the reference
+anchor and the gather start, which makes the gathered half of the fit a
+regression at known points.
+
+### Labels (`bdrc/unified_features.h`)
+
+- `sign_cam` = `sign(dot(ng, referenceOrigin - x))`, where `referenceOrigin` is
+  stamped once in `initBDRC()` from the scene bounding-sphere centre and
+  **never** follows the viewing camera. A label taken against an interactive
+  camera would flip for every point the user orbits past, silently relabelling
+  the whole learned function mid-fit.
+- arrival side = `prd.bdrcFrontFace`, captured in `hit.cu` **before** the
+  normals are flipped to the ray side. The flipped normal cannot serve:
+  `dot(flippedN, wo)` is non-negative by construction.
+
+Layer and side stay separate inputs; their product would give a thin shell's
+dark inner back layer the label of its lit outer front.
+
+### The loss (`k_unified_dre_grad`)
+
+One weighted density-ratio objective over both positive streams against one
+surface reference measure. Per lane, per channel, with `u` the softplus density
+and `q` the lane's reference density:
+
+| Generator | positive term | reference term |
+|---|---|---|
+| logistic | `softplus(-logit)` | `softplus(logit)` |
+| brier | `sigmoid(-logit)^2` | `sigmoid(logit)^2` |
+| lsif | `-r` | `r^2 / 2` |
+| bregman(a) | `-(r^(a-1) - 1)/(a-1)` | `(r^a - 1)/a` |
+
+with `logit = log u + log beta - log q - log alpha` and `r = u/q`. Gradients are
+taken with respect to `log u` and chained through softplus; the `raw < -20`
+branch keeps `log u` finite for an untrained cell.
+
+Because `dL/dOutput` is per-sample, photon lanes and gather lanes never alias:
+both streams reach **one** `backward` and **one** optimizer step, with no
+`Overwrite`/`Accumulate` sequencing.
+
+### Per-frame dispatch (`bdrcDispatch`)
+
+```
+optixLaunch  eye paths      -> camera records
+optixLaunch  photon paths   -> photon records      (m_cudaStreamLight)
+optixLaunch  gather paths   -> gather records      (m_cudaStreamLight, gatherCount lanes)
+EMA inference over recTailQuery
+k_bdrc_assemble_targets     -> per-lane (RGB weight, p_r, 1/N_pos, 1/N_ref)
+dreAccumGrad                -> one optimizer step -> EMA update
+EMA inference over camQuery -> composite: camPrefix + camFactor * U
 ```
 
-Hit.cu sets these after each BSDF sample:
-```cpp
-prd->eyePathFoundDiffuse    |= (typeEvent & BSDF_EVENT_DIFFUSE) != 0;
-prd->eyePathInSpecularChain  = (typeEvent & (BSDF_EVENT_SPECULAR | BSDF_EVENT_GLOSSY)) != 0;
-```
+There is no two-phase warmup: the single fit runs from frame 0.
 
-Emission and NEE at vertex `x` are suppressed when `eyePathFoundDiffuse && eyePathInSpecularChain`.
+### Numerical contracts
 
-### Light Path Generation
+1. **The objective stays plain.** No per-stream reweighting of any kind — it
+   would move the fixed point off the stream sum.
+2. **Raw-ratio members require `alpha == beta`.** `lsif` and `bregman` read
+   `u* = (beta/alpha) * sum_s p_s w_bar_s`; the constructor rejects unequal
+   constants and the GUI pins `beta` to `alpha`.
+3. **`alpha` is the noise ratio.** The field runs 1e2-1e4 times the reference
+   density, so at `alpha = 1` the posterior saturates. Default 1000.
+4. **Each stream is normalized by its own launch count.** There is no
+   compaction: an invalid lane writes `recDensity = 0`, contributes nothing, and
+   keeps its denominator.
+5. **Reference density is per unit world surface area, halved**
+   (`0.5 * surfaceRef.invTotalArea`) because the field holds a value per
+   (point, side).
+6. **EMA teacher, live student.** Tail reads and every render/debug query pass
+   `useEmaWeights = true`.
+7. **The stored quantity is incident flux per area.** The receiver BSDF is
+   applied at the query.
+8. **The cache lives on diffuse lobes only.**
+9. **Training is camera-independent.** Moving the viewing camera changes rays
+   and film accumulation only.
 
-Light paths are launched alongside eye paths with `FLAG_LIGHT_PATH` set in `prd.flags`. The raygen:
-1. Samples the environment or area light for the light path origin.
-2. Traces the light path until a specular-then-diffuse vertex Y is found.
-3. Connects Y to the eye path's diffuse vertex D via `bdrcLightIntegrator()`.
-4. Writes `lightEndpoints[pixelIdx]`, `lightTargets[pixelIdx]`, and PDFs into the BDRC buffers.
+### Buffer layout (`NrcLaunchBuffers` in `launch_parameters.h`)
 
-### Per-Frame Dispatch (`bdrcDispatch`)
+Training lanes are one fixed-slot array: `[0, photonCount)` photons,
+`[photonCount, photonCount + gatherCount)` gathers.
 
-Called once per frame after both launches complete:
-
-1. **Compaction** — scatter-to-compact for sparse `lightValid` and `resampledValid` arrays.
-2. **Inference** — eye cache query on render features, light cache query on light endpoints.
-3. **Phase 1 training** — mask cache Brier loss step (eye + light samples).
-4. **Phase 2 training** — eye and light color cache training steps (if not frozen).
-5. **Compositing** — `bufferAccum += renderPrefix + T × eyeCacheOutput + lightCacheOutput`.
-
-Training can be paused via `m_bdrcFreezeTraining` (GUI toggle) while inference continues.
-
-### BDRC Buffer Layout (`NrcLaunchBuffers` in `launch_parameters.h`)
-
-All buffers are `[dim × numPixels]` (pixel-indexed before compaction) or `[dim × batchSize]` (slot-indexed after compaction):
-
-**Eye-path buffers** (written by `integrator()` in raygen.cu):
 | Buffer | Dim | Content |
-|--------|-----|---------|
-| `renderFeatures` | 14 × N | NRC feature vector at termination vertex |
-| `renderPrefix` | 3 × N | Radiance before vertex D (includes NEE at D) |
-| `renderThroughput` | 3 × N | `T(cam→D)` pre-BSDF |
-| `renderValid` | N | 1 if pixel has valid termination |
-| `trainNextFeatures` | 14 × B | Suffix terminal features |
-| `trainSuffixScaled` | 3 × B | `T(cam→D) × L_suffix` |
-| `trainThroughputAtK` | 3 × B | `T(cam→D)` pre-BSDF (training denominator) |
-| `trainNextValid` | B | 1 if suffix is valid |
+|---|---|---|
+| `recQuery` | 5 x lanes | start/deposit query (position + 2 labels) |
+| `recBase` | 3 x lanes | photon: clamped power. gather: `E_dir` + chain radiance |
+| `recDensity` | lanes | `p_r`; 0 disables the lane |
+| `recTailQuery` | 5 x lanes | gather tail query |
+| `recTailValid` | lanes | 1 when the tail query is meaningful |
+| `recFactor` | 3 x lanes | gather: `throughput * f_s` at the tail |
+| `camQuery` | 5 x N | query at the first diffuse vertex D |
+| `camPrefix` | 3 x N | radiance accumulated before and at D |
+| `camFactor` | 3 x N | `T(cam->D) * f_s(D)` |
+| `camValid` | N | 0 / 1 |
+| `referenceDensity` | scalar | `0.5 * invTotalArea` |
+| `referenceOrigin` | float3 | stamped once, never the live camera |
+| `photonClamp` | scalar | upper bound on stored photon power |
 
-**Light-path buffers** (written by `bdrcLightIntegrator()` in raygen.cu):
-| Buffer | Dim | Content |
-|--------|-----|---------|
-| `lightEndpoints` | 3 × N | AABB-normalized position of caustic floor Y |
-| `lightTargets` | 3 × N | `T(cam→Y_pre) × f_Y_toward_S` |
-| `lightValid` | N | 1 if this pixel has a valid caustic sample |
-| `light_p_sa` | N | Hemisphere PDF at Y (analytic) |
-| `light_p_e_area` | N | Eye-path area PDF at Y: `p_e_sa × cosY / dist²` |
-| `eyeVertexPos` | 3 × N | Position of eye-path vertex S |
-| `eyeVertexNormals` | 3 × N | Normal at S |
-| `eyeVertexThroughput` | 3 × N | `T(cam→D)` pre-BSDF |
-| `resampledEndpoints` | 3 × N | AABB-normalized position of R |
-| `resampledValid` | N | 1 if resampled endpoint is valid |
-| `resampled_p_e_area` | N | Eye-path area PDF at R |
+`SurfaceReferenceTable` holds **world-space** triangles plus an area CDF and
+`invTotalArea`. World space, not GAS-local: one field spans the whole scene, and
+the gather stream shoots shadow and continuation rays from these anchors.
 
----
+### Diagnostics
+
+`bdrcDispatch` prints every 100 frames and the GUI mirrors it:
+
+```
+[bdrc] iter=N loss=L photonLive=a/b gatherLive=c/d p_r=P field(mean=M max=X nonzero=n/m)
+```
+
+`gatherLive` must not change when the camera moves; `p_r` must be one positive
+constant; `field(mean,max)` distinguishes a plausible spatial pattern from a
+uniformly zero or saturated one.
+
+### Startup self-test (`unifiedSelfTestAll`)
+
+Runs at `initBDRC()` when the probe is enabled. Places both streams at one point
+so the analytic fixed point is `5q`, then checks every generator at two
+conditioning regimes. At `q = 1e-1` all four land on `5q`. At the realistic
+`q = 1e-4` only the posterior members land — the raw-ratio members' `r^2`
+reference term is heavy-tailed when `u/q` spans orders of magnitude, which is a
+property of the parameterization, not a defect, and is why the GUI defaults to
+logistic.
 
 ## Shader Configuration (`cuda/config.h`)
 
@@ -456,16 +536,13 @@ Uploaded to device as `__constant__ LaunchParameters theLaunchParameters` in eve
 - `nrc` — full `NrcLaunchBuffers` struct (see above)
 
 ### `NrcLaunchBuffers` subfields:
-- `enabled` — 0=NRC off, 1=active
+- `enabled` — 0 = off, 1 = active
 - `nrcType` — `NRC` or `BDRC`
-- `nrcDebugMode` — 0=normal, 1=cache-only, 2=mask, 3=indirect
-- `bdrcPhase` — 0=Phase 1, 1=Phase 2
-- `spreadC` — area-spread termination constant (default 0.01)
-- `terminationDepth` — fallback max depth
-- `aabbMin` / `aabbMax` — scene bounding box for feature normalization
-- All buffer pointers listed in the BDRC Buffer Layout table above
-
----
+- `nrcDebugMode` — NRC: 0 = normal, 1 = cache-only. BDRC: 0 = normal,
+  1 = cache contribution (`camFactor * U`), 2 = raw field (`U`)
+- `spreadC` / `terminationDepth` — NRC area-spread termination
+- `aabbMin` / `aabbMax` — scene bounding box for position normalization
+- All unified-cache buffers listed in the Buffer layout table above
 
 ## PerRayData (`cuda/per_ray_data.h`)
 
@@ -498,10 +575,11 @@ Carried as an OptiX payload pointer through raygen → hit → miss programs.
 **BDRC fields**:
 | Field | Type | Purpose |
 |-------|------|---------|
-| `lightSpecularCount` | `int` | Specular bounce counter on light path |
-| `lightDiffuseAfterSpecular` | `int` | Diffuse bounces after first specular (light path) |
-| `eyePathFoundDiffuse` | `bool` | Latches true once any diffuse vertex hit (eye path) |
-| `eyePathInSpecularChain` | `bool` | True if last BSDF was specular or glossy (eye path) |
+| `bdrcNg` | `float3` | Raw, unflipped world-space geometric normal; feeds the `sign_cam` label |
+| `bdrcFrontFace` | `bool` | Which side the ray arrived on; feeds the arrival-side label |
+
+Both are captured in `hit.cu` immediately before the normals are flipped to the
+ray side, because neither fact is recoverable afterwards.
 
 **`BsdfEventType` flags**:
 ```c
@@ -517,22 +595,20 @@ Note: `BSDF_EVENT_GLOSSY` and `BSDF_EVENT_SPECULAR` are distinct bits. The caust
 
 ## Neural Network Architecture (`bdrc/ngp_config.h`)
 
-All BDRC caches use the same `ngp_config` structure with these defaults:
+`ngp_config` builds the tcnn JSON. `labelDims > 0` switches `toEncodingJson()`
+from a bare `HashGrid` to a `Composite`/`Concatenation` whose nested `HashGrid`
+takes the leading `inputDim - labelDims` dims and whose nested `Identity` takes
+the trailing label dims. Labels must not be hashed: a label is a discrete
+condition on the function, not a position whose neighbourhood should be
+interpolated.
 
-**Hash-grid encoding**:
-- 6 levels, 4 features/level, base resolution 16, per-level scale 2.0×
-- Hash map size: 2^19 entries
+`weightClip` is passed to Adam as `clipping_magnitude`. Unlike gradient
+clipping it is unconditional — no weight the optimizer writes can overflow to
+Inf on the fp32 -> half cast. That is the exact mechanism behind the
+reproducible NaN by iteration ~400 that gradClip alone did not prevent.
 
-**MLP**:
-- 2 hidden layers × 64 neurons, FullyFusedMLP (tcnn)
-- Hidden activation: ReLU (eye cache) / ReLU (light cache) / configurable (mask cache)
-- Output activation: None/ReLU (eye cache), Softplus (light cache, mask cache)
-
-**Optimizer**: Adam, lr=1e-2, β1=0.9, β2=0.99
-
-**Gradient scaler**: enabled by default (initial scale 65536, growth factor 2×)
-
----
+The unified field's own configuration is in `makeUnifiedConfig()`
+(`unified_ngp_cache.cu`); see the table in the Unified Transport Cache section.
 
 ## Command-Line Options
 

@@ -62,6 +62,14 @@ uint32_t bdrcGetPhotonLive (const BdrcSystem* sys);  // lanes with density > 0 l
 uint32_t bdrcGetGatherLive (const BdrcSystem* sys);
 float    bdrcGetLastDensity(const BdrcSystem* sys);  // p_r read back from a live lane
 
+// Field statistics over the camera queries. A field that is uniformly zero or
+// uniformly saturated is the failure these distinguish from a plausible
+// spatial pattern.
+float    bdrcGetFieldMean   (const BdrcSystem* sys);
+float    bdrcGetFieldMax    (const BdrcSystem* sys);
+uint32_t bdrcGetFieldNonZero(const BdrcSystem* sys);
+uint32_t bdrcGetFieldCount  (const BdrcSystem* sys);
+
 void bdrcSetDreConfig(BdrcSystem* sys, const DreConfig& dre);
 
 void bdrcSaveWeights(const BdrcSystem* sys, const std::string& path);

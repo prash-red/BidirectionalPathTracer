@@ -1696,11 +1696,14 @@ bool Application::render()
 
         if (nrcIteration % 100u == 0u)
         {
-          printf("[bdrc] iter=%u loss=%.6g photonLive=%u/%u gatherLive=%u/%u p_r=%.6g\n",
+          printf("[bdrc] iter=%u loss=%.6g photonLive=%u/%u gatherLive=%u/%u p_r=%.6g "
+                 "field(mean=%.4g max=%.4g nonzero=%u/%u)\n",
                  nrcIteration, m_bdrcLastLoss,
                  m_bdrcPhotonLive, static_cast<unsigned int>(m_resolution.x * m_resolution.y),
                  m_bdrcGatherLive, static_cast<unsigned int>(m_bdrcGatherCount),
-                 m_bdrcLastDensity);
+                 m_bdrcLastDensity,
+                 bdrcGetFieldMean(m_bdrcSystem), bdrcGetFieldMax(m_bdrcSystem),
+                 bdrcGetFieldNonZero(m_bdrcSystem), bdrcGetFieldCount(m_bdrcSystem));
           fflush(stdout);
         }
 
