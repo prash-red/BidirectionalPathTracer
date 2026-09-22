@@ -5,11 +5,19 @@
 #ifndef BDRC_HOST_H
 #define BDRC_HOST_H
 
+#include "dre_config.h"
+
 #include <cuda_runtime.h>
 #include <cstdint>
 #include <string>
 
 struct BdrcSystem; // opaque, defined in BdrcHost.cu
+
+// Analytic fixed-point check of the unified field's weighted density-ratio
+// objective, over every generator. Lives here rather than in
+// unified_ngp_cache.h so a plain C++ translation unit can call it without
+// pulling tiny-cuda-nn's device headers into a host compile.
+bool unifiedSelfTestAll(cudaStream_t stream);
 
 // Lifecycle
 BdrcSystem* bdrcCreate(cudaStream_t stream);

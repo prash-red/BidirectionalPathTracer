@@ -491,9 +491,6 @@ __forceinline__ __device__ float3 integrator(PerRayData& prd, const uint2 theLau
   //prd.walk          = 0;               // Number of random walk steps taken through volume scattering.
   prd.typeEvent     = BSDF_EVENT_ABSORB; // Initialize for exit. (Otherwise miss programs do not work.)
   prd.nrcTerminated = false;
-  prd.eyePathFoundDiffuse    = false;
-  prd.eyePathInSpecularChain = false;
-  prd.virtEmitDepth = 0;
 
   // NRC area-spread tracking (Mueller et al. 2021, Section 3.4).
   // All local to the integrator; no need to store in PRD.
@@ -984,8 +981,6 @@ __forceinline__ __device__ void bdrcLightIntegrator(PerRayData& prd, const uint2
   prd.sigma_t   = make_float3(0.0f);
   prd.typeEvent = BSDF_EVENT_ABSORB;
   prd.flags     = 0; // No FLAG_LIGHT_PATH: disables camera connections in hit.cu
-  prd.eyePathFoundDiffuse    = false;
-  prd.eyePathInSpecularChain = false;
 
   prd.idxStack = 0;
   prd.stack[0].absorption_ior = make_float4(0.0f, 0.0f, 0.0f, 1.0f);

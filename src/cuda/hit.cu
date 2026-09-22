@@ -1472,6 +1472,12 @@ __forceinline__ __device__ void chRadiance()
   // Using the true geometry normal attribute as originally defined on the frontface!
   const bool isFrontFace = (0.0f <= dot(thePrd->wo, state.Ng));
 
+  // BDRC labels are taken here, before the flip below: state.Ng is still the
+  // authored outward face normal, and isFrontFace still says which side the ray
+  // arrived on. After the flip neither fact is recoverable.
+  thePrd->bdrcNg        = state.Ng;
+  thePrd->bdrcFrontFace = isFrontFace;
+
   // Flip the normals to the side the ray hit.
   if (!isFrontFace)
   {
@@ -1525,50 +1531,6 @@ __forceinline__ __device__ void chRadiance()
     thePrd->nrcSpecColor = state.specularColor;
   }
 
-  // Suppress diffuse→specular→light contributions so the eye cache does not double-count
-  // caustic paths that are already captured by the light cache (light→specular→diffuse).
-  const bool validForEyeCache = !(theLaunchParameters.nrc.enabled
-                                  && theLaunchParameters.nrc.nrcType == BDRC
-                                  && thePrd->eyePathFoundDiffuse
-                                  && thePrd->eyePathInSpecularChain);
-
-  // Virtual light emitter: when direct emission is suppressed here to avoid
-  // double-counting the caustic already captured by the light cache (see
-  // validForEyeCache above), record this vertex so the host can later query
-  // the frozen (EMA) light-color cache here and add the missing radiance into
-  // the EYE CACHE'S TRAINING TARGET ONLY (never into the live rendered frame —
-  // the eye cache is queried once, at its own first-diffuse vertex, at render
-  // time, so compensating its training target is sufficient and correct).
-  if (!validForEyeCache && theLaunchParameters.nrc.enabled
-      && theLaunchParameters.nrc.nrcType == BDRC
-      && thePrd->virtEmitDepth < VIRT_EMIT_MAX_DEPTH)
-  {
-    const unsigned int pixelIdx = theLaunchParameters.resolution.x * optixGetLaunchIndex().y
-                                 + optixGetLaunchIndex().x;
-    const unsigned int numPix   = theLaunchParameters.resolution.x * theLaunchParameters.resolution.y;
-    const unsigned int slot     = static_cast<unsigned int>(thePrd->virtEmitDepth) * numPix + pixelIdx;
-    const NrcLaunchBuffers& nrc = theLaunchParameters.nrc;
-
-    bdrcPackFeatures(nrc.virtEmitPos, slot, thePrd->pos,
-                     theLaunchParameters.nrc.aabbMin, theLaunchParameters.nrc.aabbMax);
-
-    // Weight is just the eye-path throughput arriving at this vertex. The
-    // light cache's EMA output already represents the Lambertian-response-
-    // weighted photon power (see bdrcLightIntegrator's target, raygen.cu),
-    // and the mask cache's EMA output p_l_area(x) is the same density scalar
-    // the render-time composite multiplies by (see k_bdrc_composite) — the
-    // host scatter-add computes throughput * mask(x) * lightOutput(x), which
-    // together is exactly this suppressed vertex's contribution. No
-    // additional BRDF/cosine factor belongs here.
-    const float3 w = throughput;
-    nrc.virtEmitThroughput[3*slot+0] = w.x;
-    nrc.virtEmitThroughput[3*slot+1] = w.y;
-    nrc.virtEmitThroughput[3*slot+2] = w.z;
-    nrc.virtEmitValid[slot] = 1u;
-
-    thePrd->virtEmitDepth += 1;
-  }
-
   // FIXME Implement arbitrary mesh lights. This only handles geometry emission on implicit hits.
   // Unfortunately many emission textures in glTF models are applied to the whole models 
   // with only little emissive regions and the rest of the texture being black.
@@ -1580,7 +1542,6 @@ __forceinline__ __device__ void chRadiance()
   // (I disagree with the KHR_materials_clearcoat extension.)
   //
 
-  if (validForEyeCache)
   {
     // Basic Implementation of area mesh lights
     if (thePrd->pdf > 0.0f
@@ -1746,12 +1707,6 @@ __forceinline__ __device__ void chRadiance()
   thePrd->pdf         = state.pdf;           // Note that specular events in MDL return pdf == 0.0f! (=> Not a path termination condition.)
   thePrd->typeEvent   = state.typeEvent;     // If this is BSDF_EVENT_ABSORB, the path ends inside the integrator and the radiance is returned.
 
-  // Update BDRC caustic-suppression state (mirrors Python bdpt.py lines 691/696).
-  if (theLaunchParameters.nrc.enabled && theLaunchParameters.nrc.nrcType == BDRC)
-  {
-    thePrd->eyePathFoundDiffuse    = thePrd->eyePathFoundDiffuse | ((state.typeEvent & BSDF_EVENT_DIFFUSE) != 0);
-    thePrd->eyePathInSpecularChain = (state.typeEvent & (BSDF_EVENT_SPECULAR | BSDF_EVENT_GLOSSY)) != 0;
-  }
 
   // End of BXDF sampling
 
@@ -1893,7 +1848,7 @@ __forceinline__ __device__ void chRadiance()
   // No need to to check the thePrd->eventType to see if it's diffuse oor glossy which can handle direct lighting.
   const int numLights = theLaunchParameters.numLights;
 
-  if (!theLaunchParameters.directLighting || numLights <= 0 || !validForEyeCache)
+  if (!theLaunchParameters.directLighting || numLights <= 0)
   {
     return;
   }

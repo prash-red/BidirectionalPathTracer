@@ -152,12 +152,17 @@ struct PerRayData
   // The raygen skips writing bufferAccum; the host-side accumulate kernel handles it.
   bool nrcTerminated;
 
-  // BDRC eye-cache caustic suppression.
-  // Suppresses diffuse→specular→light contributions in the eye path so they are not
-  // double-counted with the light cache's light→specular→diffuse caustic paths.
-  bool eyePathFoundDiffuse;    // latches True once any diffuse vertex is hit
-  bool eyePathInSpecularChain; // True if the previous BSDF bounce was specular
-  int  virtEmitDepth;          // Count of virtual-emission vertices recorded this path (caps at VIRT_EMIT_MAX_DEPTH)
+  // BDRC: geometric state at the hit, captured BEFORE the shading and geometric
+  // normals are flipped to the ray side.
+  //
+  // bdrcNg is the raw outward face normal as authored. bdrcFrontFace records
+  // which side the ray arrived on. Together they give the field's two labels:
+  // sign_cam (bdrcNg against a FIXED reference origin) and arrival side
+  // (bdrcFrontFace). The ray-flipped normal cannot serve either: dot(flippedN,
+  // wo) is non-negative by construction, so it can never tell the two sides
+  // apart.
+  float3 bdrcNg;
+  bool   bdrcFrontFace;
 };
 
 

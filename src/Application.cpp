@@ -1145,6 +1145,10 @@ void Application::initBDRC()
 
   m_launchParameters.nrc.enabled          = 1;
   m_launchParameters.nrc.nrcType          = BDRC;
+
+  // Temporary construction gate (removed in Task 7): the analytic fixed point
+  // of the weighted density-ratio objective, checked for every generator.
+  unifiedSelfTestAll(m_cudaStream);
 }
 
 
