@@ -42,16 +42,6 @@ enum NrcType {
     BDRC
 };
 
-// Maximum number of diffuse-after-specular connections stored per light path.
-// Controls the size of the depth-strided light buffer: BDRC_MAX_LIGHT_DEPTH × numPixels.
-constexpr int BDRC_MAX_LIGHT_DEPTH = 6;
-
-// Max virtual-light-emitter recordings per eye path's training suffix. A suffix
-// can re-enter a specular chain after its first diffuse vertex multiple times
-// (e.g. diffuse -> mirror -> diffuse -> mirror -> diffuse); this caps how many
-// of those re-entries contribute a virtual-emission correction.
-constexpr int VIRT_EMIT_MAX_DEPTH = 4;
-
 // Global diffuse-surface reference table for the density-ratio reference
 // measure. Density at ANY point on this surface set is the single scalar
 // invTotalArea (pure area-uniform reference), so no per-point density lookup
@@ -102,36 +92,42 @@ struct NrcLaunchBuffers
   unsigned int* trainPixelIndices; // [batchSize] pixel index for each training slot (unused by kernels, diagnostic)
   float*        trainFeatures;     // [NRC_INPUT_DIM × batchSize] compact slot-indexed train features
 
-  // ---- BDRC light-path buffers — written by bdrcLightIntegrator, one slot per pixel.
-  // The light-path grammar stores AT MOST ONE sample per path (the first diffuse
-  // vertex reached after >=1 specular bounce), so no depth-striding is needed.
-  float*        lightEndpoints;        // [3 × numPixels]  photon-hit position (AABB-normalized)
-  float*        lightTargets;          // [3 × numPixels]  photon power * BSDF-eval toward query dir
-  float*        light_p_e_area;        // [numPixels]      known reference density at the hit (== surfaceRef.invTotalArea)
-  unsigned int* lightValid;            // [numPixels]      1 if a photon landed this frame
-  float*        lightOutput;           // [3 × numPixels]  inference output (unchanged)
+  // ---- Unified transport cache: training lanes ------------------------------
+  //
+  // One fixed-slot records array: lanes [0, photonCount) are photons, lanes
+  // [photonCount, photonCount + gatherCount) are gathers. There is no
+  // compaction. An invalid lane writes recDensity = 0 and contributes nothing,
+  // while its launch still stands in the normalizer — each stream is normalized
+  // by its own draw count, not by the live count of valid samples, so a frame
+  // with fewer valid samples must not renormalize its gradient up.
+  unsigned int photonCount;   // == numPixels: the photon raygen launches at render resolution
+  unsigned int gatherCount;   // its own launch dimension, independent of resolution and framing
 
-  // ---- Virtual light emitter buffers — written by hit.cu at every diffuse
-  // vertex reached after the eye path's first diffuse vertex, when that vertex
-  // is in a specular chain (i.e. exactly where validForEyeCache suppresses
-  // direct emission). Depth-strided: slot for depth d, training slot s is
-  // d * batchSize + s. Consumed by bdrc_host.cu Phase 2 to compensate the eye
-  // cache's training target for the transport family L S+ D [any]+.
-  float*        virtEmitPos;          // [3 × VIRT_EMIT_MAX_DEPTH × batchSize] world-space position (AABB-normalized)
-  float*        virtEmitThroughput;   // [3 × VIRT_EMIT_MAX_DEPTH × batchSize] throughput * retro-BSDF-eval at that vertex
-  unsigned int* virtEmitValid;        // [VIRT_EMIT_MAX_DEPTH × batchSize]     1 if slot is valid
+  float*       recQuery;      // [5 x lanes]  start/deposit query (position + 2 labels)
+  float*       recBase;       // [3 x lanes]  photon: clamped power. gather: E_dir + chain radiance
+  float*       recDensity;    // [lanes]      p_r at this lane; 0 disables the lane
+  float*       recTailQuery;  // [5 x lanes]  gather tail query
+  float*       recTailValid;  // [lanes]      1 when the tail query is meaningful
+  float*       recFactor;     // [3 x lanes]  gather: throughput * f_s at the tail
 
-  // ---- BDRC eye-path supervision buffers (written by eye integrator) ---------
-  float*        eyeVertexPos;          // [3 × numPixels]  S pos (last specular before D, or camera)
-  float*        eyeVertexNormals;       // [3 × numPixels]  S normal (last specular before D, or camera)
-  float*        eyeVertexThroughput;   // [3 × numPixels]  T(cam→D) pre-BSDF (Python ev.throughput)
-  float*        resampledEndpoints;     // [3 × numPixels]  R pos normalized (hemisphere from S, or D)
-  unsigned int* resampledValid;        // [numPixels]  1 if resampledFeatures is valid
-  float*        resampled_p_sa;        // [numPixels]  Hemisphere pdf at eye vertex positions - analytic
-  float*        resampled_p_e_area;    // [numPixels]  Eye-path area PDF at R: p_e_sa * cos_R / dist_SR²
+  // ---- Unified transport cache: camera stream (pixel-indexed) --------------
+  float*        camQuery;     // [5 x numPixels] query at the first diffuse vertex D
+  float*        camPrefix;    // [3 x numPixels] radiance accumulated before and at D
+  float*        camFactor;    // [3 x numPixels] T(cam->D) * f_s(D) — the BSDF is applied HERE,
+                              //                 because the field stores incident flux, not
+                              //                 outgoing radiance
+  unsigned int* camValid;     // [numPixels]
 
-  // ---- BDRC training phase ---------------------------------------------------
-  int   bdrcPhase;    // 0 = Phase 1 (mask only), 1 = Phase 2 (color caches + frozen mask)
+  // ---- Unified transport cache: reference measure --------------------------
+  // Halved because the field holds a value per (point, side): an anchor takes
+  // either side with probability 1/2, so its density per (point, side) is half
+  // the area density. Deposits and gathers use the same halved value.
+  float        referenceDensity;
+
+  // Stamped once when the cache is constructed; never updated on camera motion.
+  float3       referenceOrigin;
+
+  float        photonClamp;   // upper bound on stored photon power
 
   // ---- Scene AABB ------------------------------------------------------------
   float3 aabbMin;

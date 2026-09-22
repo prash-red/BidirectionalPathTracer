@@ -326,8 +326,9 @@ set(HEADERS_CUDA
   ${CMAKE_CURRENT_SOURCE_DIR}/src/cuda/vector_math.h
   ${CMAKE_CURRENT_SOURCE_DIR}/src/cuda/geometry_data.h
         src/cuda/cache/bdrc/base_ngp_cache.h
-        src/cuda/cache/bdrc/mask_ngp_cache.h
         src/cuda/cache/bdrc/unified_ngp_cache.h
+        src/cuda/cache/bdrc/dre_config.h
+        src/cuda/cache/bdrc/unified_features.h
         src/cuda/cache/nrc/nrc.cu
         src/cuda/cache/nrc/nrc.h
         src/cuda/cache/nrc/nrc_config.h
@@ -342,7 +343,6 @@ set(SOURCES_CUDA
   ${CMAKE_CURRENT_SOURCE_DIR}/src/cuda/kernel_skinning.cu
         ${CMAKE_CURRENT_SOURCE_DIR}/src/cuda/cache/cache_helpers.cu
         ${CMAKE_CURRENT_SOURCE_DIR}/src/cuda/cache/bdrc/base_ngp_cache.cu
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/cuda/cache/bdrc/mask_ngp_cache.cu
         ${CMAKE_CURRENT_SOURCE_DIR}/src/cuda/cache/bdrc/unified_ngp_cache.cu
         src/cuda/cache/kernel_nrc.cu
         src/cuda/cache/nrc/nrc.cu

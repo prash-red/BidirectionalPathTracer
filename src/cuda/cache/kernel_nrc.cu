@@ -212,237 +212,108 @@ __host__ void device_nrc_build_targets(
 //   radiance = prefix + throughput * eyeOutput + maskOutput * lightOutput
 // maskOutput is p_l_area(D) — the scalar mask cache output at the eye vertex D.
 // Only writes into bufferAccum for pixels where renderValid[i] != 0.
+// pixel = prefix + T(cam->D) * f_s(D) * U(D).
+//
+// camFactor already carries T * f_s: the receiver BSDF is applied HERE, in the
+// renderer, because the field stores incident flux per unit area, not outgoing
+// radiance. Every path that reads the field applies it the same way — camera
+// composite, gather tail and debug view alike.
 static __global__ void k_bdrc_composite(
     float4*             bufferAccum,
-    const float*        renderPrefix,
-    const float*        renderThroughput,
-    const float*        eyeOutput,
-    const float*        lightOutput,
-    const float*        maskOutput,
-    const unsigned int* renderValid,
+    const float*        camPrefix,
+    const float*        camFactor,
+    const float*        fieldOutput,
+    const unsigned int* camValid,
     int                 numPixels,
     unsigned int        iteration)
 {
-  const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= numPixels)
-    return;
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= numPixels || !camValid[i]) return;
 
-  if (renderValid[i] == 0u)
-    return;
+    const float3 prefix = make_float3(camPrefix[3*i+0], camPrefix[3*i+1], camPrefix[3*i+2]);
+    const float3 factor = make_float3(camFactor[3*i+0], camFactor[3*i+1], camFactor[3*i+2]);
+    const float3 u      = make_float3(fieldOutput[3*i+0], fieldOutput[3*i+1], fieldOutput[3*i+2]);
 
-  const int   base3 = 3 * i;
-  const float mask  = maskOutput[i];  // p_l_area(D): scalar weight for light cache
-  float r = renderPrefix[base3+0] + renderThroughput[base3+0]*eyeOutput[base3+0] + mask*lightOutput[base3+0];
-  float g = renderPrefix[base3+1] + renderThroughput[base3+1]*eyeOutput[base3+1] + mask*lightOutput[base3+1];
-  float b = renderPrefix[base3+2] + renderThroughput[base3+2]*eyeOutput[base3+2] + mask*lightOutput[base3+2];
+    float3 radiance = prefix + factor * u;
 
-  if (0 < iteration)
-  {
-    const float t = 1.0f / static_cast<float>(iteration + 1);
-    const float4 prev = bufferAccum[i];
-    r = prev.x + (r - prev.x) * t;
-    g = prev.y + (g - prev.y) * t;
-    b = prev.z + (b - prev.z) * t;
-  }
-
-  bufferAccum[i] = make_float4(r, g, b, 1.0f);
+    if (0u < iteration)
+    {
+        const float  t   = 1.0f / static_cast<float>(iteration + 1u);
+        const float3 old = make_float3(bufferAccum[i]);
+        radiance = old + (radiance - old) * t;
+    }
+    bufferAccum[i] = make_float4(radiance, 1.0f);
 }
-
-// Host-callable wrappers for BDRC kernels.
 
 __host__ void device_bdrc_composite(
     cudaStream_t        cudaStream,
     float4*             bufferAccum,
-    const float*        renderPrefix,
-    const float*        renderThroughput,
-    const float*        eyeOutput,
-    const float*        lightOutput,
-    const float*        maskOutput,
-    const unsigned int* renderValid,
+    const float*        camPrefix,
+    const float*        camFactor,
+    const float*        fieldOutput,
+    const unsigned int* camValid,
     int                 numPixels,
     unsigned int        iteration)
 {
-  const int block = 256;
-  const int grid  = (numPixels + block - 1) / block;
-  k_bdrc_composite<<<grid, block, 0, cudaStream>>>(
-      bufferAccum, renderPrefix, renderThroughput, eyeOutput, lightOutput,
-      maskOutput, renderValid, numPixels, iteration);
+    constexpr int THREADS = 256;
+    const int blocks = (numPixels + THREADS - 1) / THREADS;
+    k_bdrc_composite<<<blocks, THREADS, 0, cudaStream>>>(
+        bufferAccum, camPrefix, camFactor, fieldOutput, camValid, numPixels, iteration);
 }
 
-// BDRC debug visualization kernel.
-// debugMode:
-//   1 = eye color cache output (ĉ_e)
-//   2 = light color cache output (ĉ_l)
-//   3 = mask cache output (α) as grayscale
-//   4 = combined ĉ_e + ĉ_l
-// Valid pixels write the debug value; invalid pixels write black to avoid prior-frame bleed-through.
+// debugMode 1 = the field's own contribution at D (factor * U), i.e. the image
+//               the cache is responsible for, with the prefix removed.
+// debugMode 2 = the raw field value U, with no BSDF applied. This is incident
+//               flux per unit area, so it is not a radiance and is only meant
+//               to be read for spatial structure.
 static __global__ void k_bdrc_debug(
     float4*             bufferAccum,
-    const float*        eyeOutput,
-    const float*        lightOutput,
-    const float*        maskOutput,
-    const unsigned int* renderValid,
+    const float*        camFactor,
+    const float*        fieldOutput,
+    const unsigned int* camValid,
     int                 numPixels,
+    unsigned int        iteration,
     int                 debugMode)
 {
-  const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= numPixels)
-    return;
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= numPixels) return;
 
-  if (renderValid[i] == 0u)
-  {
-    bufferAccum[i] = make_float4(0.0f, 0.0f, 0.0f, 1.0f);
-    return;
-  }
+    float3 radiance = make_float3(0.0f);
+    if (camValid[i])
+    {
+        const float3 u = make_float3(fieldOutput[3*i+0], fieldOutput[3*i+1], fieldOutput[3*i+2]);
+        if (debugMode == 1)
+        {
+            const float3 factor = make_float3(camFactor[3*i+0], camFactor[3*i+1], camFactor[3*i+2]);
+            radiance = factor * u;
+        }
+        else
+        {
+            radiance = u;
+        }
+    }
 
-  const int base3 = 3 * i;
-  float r = 0.f, g = 0.f, b = 0.f;
-
-  if (debugMode == 1)
-  {
-    r = eyeOutput[base3 + 0];
-    g = eyeOutput[base3 + 1];
-    b = eyeOutput[base3 + 2];
-  }
-  else if (debugMode == 2)
-  {
-    r = lightOutput[base3 + 0];
-    g = lightOutput[base3 + 1];
-    b = lightOutput[base3 + 2];
-  }
-  else if (debugMode == 3)
-  {
-    const float alpha = maskOutput[i];
-    r = alpha; g = alpha; b = alpha;
-  }
-  else if (debugMode == 4)
-  {
-    r = eyeOutput[base3 + 0] + lightOutput[base3 + 0];
-    g = eyeOutput[base3 + 1] + lightOutput[base3 + 1];
-    b = eyeOutput[base3 + 2] + lightOutput[base3 + 2];
-  }
-
-  bufferAccum[i] = make_float4(r, g, b, 1.0f);
+    if (0u < iteration)
+    {
+        const float  t   = 1.0f / static_cast<float>(iteration + 1u);
+        const float3 old = make_float3(bufferAccum[i]);
+        radiance = old + (radiance - old) * t;
+    }
+    bufferAccum[i] = make_float4(radiance, 1.0f);
 }
 
 __host__ void device_bdrc_debug(
     cudaStream_t        cudaStream,
     float4*             bufferAccum,
-    const float*        eyeOutput,
-    const float*        lightOutput,
-    const float*        maskOutput,
-    const unsigned int* renderValid,
+    const float*        camFactor,
+    const float*        fieldOutput,
+    const unsigned int* camValid,
     int                 numPixels,
     unsigned int        iteration,
     int                 debugMode)
 {
-  const int block = 256;
-  const int grid  = (numPixels + block - 1) / block;
-  k_bdrc_debug<<<grid, block, 0, cudaStream>>>(
-      bufferAccum, eyeOutput, lightOutput, maskOutput,
-      renderValid, numPixels, debugMode);
-}
-
-
-// ============================================================================
-// k_bdrc_splat_endpoints
-// Debug modes 5 (resampled eye endpoints) and 6 (light endpoints).
-// For each valid pixel, unpacks the 3D world position from packed BDRC features,
-// projects it through the perspective camera, and atomically adds the per-pixel
-// value (light cache output or lightTargets) to bufferAccum at the projected pixel.
-// bufferAccum must be zero-cleared before this kernel runs.
-// ============================================================================
-static __global__ void k_bdrc_splat_endpoints(
-    float4*             bufferAccum,
-    const float*        featureBuffer,    // [3 × numPixels] packed BDRC features (col-major, BDRC_INPUT_DIM=3)
-    const float*        valueBuffer,      // [3 × numPixels] RGB contribution to splat
-    const unsigned int* validBuffer,      // [numPixels]
-    int                 numPixels,
-    float               aabbMinX,   float aabbMinY,   float aabbMinZ,
-    float               aabbRangeX, float aabbRangeY, float aabbRangeZ,
-    float               camPx, float camPy, float camPz,
-    float               camUx, float camUy, float camUz,
-    float               camVx, float camVy, float camVz,
-    float               camWx, float camWy, float camWz,
-    int                 resX,
-    int                 resY,
-    int                 iteration)
-{
-  const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= numPixels || (validBuffer != nullptr && validBuffer[i] == 0u))
-    return;
-
-  // Denormalize packed feature position → world space.
-  const float* feat = featureBuffer + i * 3;  // BDRC_INPUT_DIM = 3, features stride by 3
-  const float  px   = feat[0] * aabbRangeX + aabbMinX;
-  const float  py   = feat[1] * aabbRangeY + aabbMinY;
-  const float  pz   = feat[2] * aabbRangeZ + aabbMinZ;
-
-  // Vector from world point toward camera origin (d_to_cam).
-  const float dx = camPx - px;
-  const float dy = camPy - py;
-  const float dz = camPz - pz;
-
-  // dW = dot(d_to_cam, W); negative means point is in front of the camera.
-  const float dW = dx*camWx + dy*camWy + dz*camWz;
-  if (dW >= 0.0f) return;
-
-  const float W2 = camWx*camWx + camWy*camWy + camWz*camWz;
-  const float U2 = camUx*camUx + camUy*camUy + camUz*camUz;
-  const float V2 = camVx*camVx + camVy*camVy + camVz*camVz;
-  if (U2 < 1e-12f || V2 < 1e-12f) return;
-
-  // Perspective NDC projection — same formula as the BDPT camera connection in hit.cu.
-  const float ndcX = (dx*camUx + dy*camUy + dz*camUz) * W2 / (dW * U2);
-  const float ndcY = (dx*camVx + dy*camVy + dz*camVz) * W2 / (dW * V2);
-  if (ndcX < -1.0f || ndcX > 1.0f || ndcY < -1.0f || ndcY > 1.0f) return;
-
-  const int ix = (int)((ndcX + 1.0f) * 0.5f * (float)resX);
-  const int iy = (int)((ndcY + 1.0f) * 0.5f * (float)resY);
-  if (ix < 0 || ix >= resX || iy < 0 || iy >= resY) return;
-
-  const unsigned int dstPx  = (unsigned int)(resX * iy + ix);
-  float* dst = reinterpret_cast<float*>(bufferAccum) + dstPx * 4;
-
-  float3 prev = make_float3(bufferAccum[dstPx]);
-  const float3 colorAccum = make_float3(valueBuffer[i * 3]);
-  const float t = 1.0f / static_cast<float>(iteration + 1);
-
-  float3 new_radiance = lerp(prev, colorAccum, t);
-
-  bufferAccum[dstPx] = make_float4(new_radiance.x, new_radiance.y, new_radiance.z, 1.0f);
-
-  // atomicAdd(dst + 0, valueBuffer[i * 3 + 0]);
-  // atomicAdd(dst + 1, valueBuffer[i * 3 + 1]);
-  // atomicAdd(dst + 2, valueBuffer[i * 3 + 2]);
-}
-
-__host__ void device_bdrc_splat_endpoints(
-    cudaStream_t        cudaStream,
-    float4*             bufferAccum,
-    const float*        featureBuffer,
-    const float*        valueBuffer,
-    const unsigned int* validBuffer,
-    int                 numPixels,
-    float3              aabbMin,
-    float3              aabbRange,
-    float3              cameraP,
-    float3              cameraU,
-    float3              cameraV,
-    float3              cameraW,
-    int                 resX,
-    int                 resY,
-    int                 iteration)
-{
-  const int block = 256;
-  const int grid  = (numPixels + block - 1) / block;
-  k_bdrc_splat_endpoints<<<grid, block, 0, cudaStream>>>(
-      bufferAccum, featureBuffer, valueBuffer, validBuffer, numPixels,
-      aabbMin.x,   aabbMin.y,   aabbMin.z,
-      aabbRange.x, aabbRange.y, aabbRange.z,
-      cameraP.x, cameraP.y, cameraP.z,
-      cameraU.x, cameraU.y, cameraU.z,
-      cameraV.x, cameraV.y, cameraV.z,
-      cameraW.x, cameraW.y, cameraW.z,
-      resX, resY, iteration);
+    constexpr int THREADS = 256;
+    const int blocks = (numPixels + THREADS - 1) / THREADS;
+    k_bdrc_debug<<<blocks, THREADS, 0, cudaStream>>>(
+        bufferAccum, camFactor, fieldOutput, camValid, numPixels, iteration, debugMode);
 }

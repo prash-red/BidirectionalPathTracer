@@ -1125,7 +1125,18 @@ void Application::initNRC() {
 
 void Application::initBDRC()
 {
-  m_bdrcSystem = bdrcCreate(m_cudaStream);
+  // The reference origin is stamped once, here, and never updated. It is NOT
+  // the live viewing camera: a label taken against an interactive camera would
+  // flip for every point the user orbits past, silently relabelling the whole
+  // learned function mid-fit. The scene's bounding-sphere centre is a
+  // deterministic, camera-independent choice.
+  if (m_sceneExtent.isValid())
+  {
+    const glm::vec3 c = m_sceneExtent.getCenter();
+    m_bdrcReferenceOrigin = make_float3(c.x, c.y, c.z);
+  }
+
+  m_bdrcSystem = bdrcCreate(m_cudaStream, m_bdrcDre);
 
   // BDRC still uses the NRC compact training batch for d_trainCount / d_trainFeatures.
   // Create the shared NRC system as well so those launch-parameter pointers are valid.
@@ -1145,10 +1156,7 @@ void Application::initBDRC()
 
   m_launchParameters.nrc.enabled          = 1;
   m_launchParameters.nrc.nrcType          = BDRC;
-
-  // Temporary construction gate (removed in Task 7): the analytic fixed point
-  // of the weighted density-ratio objective, checked for every generator.
-  unifiedSelfTestAll(m_cudaStream);
+  m_launchParameters.nrc.referenceOrigin  = m_bdrcReferenceOrigin;
 }
 
 
@@ -1399,43 +1407,32 @@ void Application::updateBuffers()
 
   if (m_nrc == 2 && m_bdrcSystem)
   {
-    bdrcAllocBuffers(m_bdrcSystem, numPixels);
+    bdrcAllocBuffers(m_bdrcSystem, numPixels, static_cast<uint32_t>(m_bdrcGatherCount));
 
-    // Wire all BDRC buffer pointers into NrcLaunchBuffers for raygen.
-    NrcLaunchBuffers& nrcBuf         = m_launchParameters.nrc;
+    NrcLaunchBuffers& b = m_launchParameters.nrc;
 
-    nrcBuf.renderOutput          = bdrcRenderOutput(m_bdrcSystem);
-    nrcBuf.renderFeatures        = bdrcRenderFeatures(m_bdrcSystem);
-    nrcBuf.renderThroughput      = bdrcRenderThroughput(m_bdrcSystem);
-    nrcBuf.renderPrefix          = bdrcRenderPrefix(m_bdrcSystem);
-    nrcBuf.renderValid           = bdrcRenderValid(m_bdrcSystem);
-    nrcBuf.trainNextFeatures     = bdrcTrainNextFeatures(m_bdrcSystem);
-    nrcBuf.trainSuffixScaled     = bdrcTrainSuffixScaled(m_bdrcSystem);
-    nrcBuf.trainSuffixThroughput = bdrcTrainSuffThroughput(m_bdrcSystem);
-    nrcBuf.trainThroughputAtK    = bdrcTrainThroughputAtK(m_bdrcSystem);
-    nrcBuf.trainNextValid        = bdrcTrainNextValid(m_bdrcSystem);
-    nrcBuf.renderReflectance     = nullptr;  // BDRC eye cache: no reflectance factorization
-    nrcBuf.trainReflectance      = nullptr;
+    b.photonCount  = numPixels;
+    b.gatherCount  = static_cast<uint32_t>(m_bdrcGatherCount);
 
-    nrcBuf.lightEndpoints  = bdrcLightEndpoints(m_bdrcSystem);
-    nrcBuf.lightTargets    = bdrcLightTargets(m_bdrcSystem);
-    nrcBuf.light_p_e_area  = bdrcLight_p_e_area(m_bdrcSystem);
-    nrcBuf.lightValid      = bdrcLightValid(m_bdrcSystem);
-    nrcBuf.lightOutput     = bdrcLightOutput(m_bdrcSystem);
+    b.recQuery     = bdrcRecQuery(m_bdrcSystem);
+    b.recBase      = bdrcRecBase(m_bdrcSystem);
+    b.recDensity   = bdrcRecDensity(m_bdrcSystem);
+    b.recTailQuery = bdrcRecTailQuery(m_bdrcSystem);
+    b.recTailValid = bdrcRecTailValid(m_bdrcSystem);
+    b.recFactor    = bdrcRecFactor(m_bdrcSystem);
 
-    nrcBuf.eyeVertexPos          = bdrcEyeVertexPos(m_bdrcSystem);
-    nrcBuf.eyeVertexNormals      = bdrcEyeVertexNormals(m_bdrcSystem);
-    nrcBuf.eyeVertexThroughput   = bdrcEyeVertexThroughput(m_bdrcSystem);
-    nrcBuf.resampledEndpoints    = bdrcResampledEndpoints(m_bdrcSystem);
-    nrcBuf.resampledValid        = bdrcResampledValid(m_bdrcSystem);
-    nrcBuf.resampled_p_sa        = bdrcResampled_p_sa(m_bdrcSystem);
-    nrcBuf.resampled_p_e_area    = bdrcResampled_p_e_area(m_bdrcSystem);
+    b.camQuery     = bdrcCamQuery(m_bdrcSystem);
+    b.camPrefix    = bdrcCamPrefix(m_bdrcSystem);
+    b.camFactor    = bdrcCamFactor(m_bdrcSystem);
+    b.camValid     = bdrcCamValid(m_bdrcSystem);
 
-    nrcBuf.virtEmitPos        = bdrcVirtEmitPos(m_bdrcSystem);
-    nrcBuf.virtEmitThroughput = bdrcVirtEmitThroughput(m_bdrcSystem);
-    nrcBuf.virtEmitValid      = bdrcVirtEmitValid(m_bdrcSystem);
+    b.photonClamp  = m_bdrcPhotonClamp;
 
-    nrcBuf.bdrcPhase             = m_bdrcPhase;
+    // Halved: the field holds a value per (point, side), and an anchor takes
+    // either side with probability 1/2, so its density per (point, side) is
+    // half the area density. Deposits use the same halved value.
+    b.referenceDensity = 0.5f * m_surfaceRefInvTotalArea;
+    b.referenceOrigin  = m_bdrcReferenceOrigin;
   }
 }
 
@@ -1654,12 +1651,9 @@ bool Application::render()
 
       if (m_nrc == 2 && m_bdrcSystem)
       {
-        // Update BDRC phase flag using the persistent training counter (not reset on camera move).
-        m_bdrcPhase = (m_nrcTrainingIteration >= static_cast<unsigned int>(m_bdrcWarmup)) ? 1 : 0;
-        m_launchParameters.nrc.bdrcPhase = m_bdrcPhase;
-
-        // Launch light path on second stream. The cudaDeviceSynchronize() below ensures both
-        // complete before bdrcDispatch. True parallel execution requires CUDA events; left as future work.
+        // Photon stream: one lane per pixel, on the second stream. The
+        // cudaDeviceSynchronize() below makes both launches complete before
+        // bdrcDispatch; true parallel execution would need CUDA events.
         if (m_sbtLightPath.raygenRecord)
         {
           CUDA_CHECK( cudaMemcpyAsync(reinterpret_cast<void*>(m_d_launchParameters),
@@ -1671,38 +1665,47 @@ bool Application::render()
                                           &m_sbtLightPath,
                                           m_resolution.x, m_resolution.y, 1) );
         }
+
+        // Gather stream: its own launch dimension, so the gather count does not
+        // track the window size or the camera framing.
+        if (m_sbtGather.raygenRecord && m_bdrcGatherCount > 0)
+        {
+          OPTIX_CHECK( m_api.optixLaunch(m_pipeline, m_cudaStreamLight,
+                                          reinterpret_cast<CUdeviceptr>(m_d_launchParameters),
+                                          sizeof(LaunchParameters),
+                                          &m_sbtGather,
+                                          static_cast<unsigned int>(m_bdrcGatherCount), 1, 1) );
+        }
+
         CUDA_CHECK( cudaDeviceSynchronize() );
 
         bdrcDispatch(m_bdrcSystem,
                      m_cudaStream,
                      m_launchParameters.bufferAccum,
                      m_resolution.x * m_resolution.y,
-                     m_nrcBatchSize,
                      nrcIteration,
-                     m_bdrcPhase,
+                     m_nrcTrainingIteration,
+                     static_cast<unsigned int>(m_bdrcLrAnnealIters),
                      m_bdrcDebugMode,
-                     nrcTrainCount(m_nrcSystem),
-                     nrcTrainFeatures(m_nrcSystem),
-                     nrcTrainPixelIndices(m_nrcSystem),
-                     m_bdrcFreezeTraining,
-                     m_launchParameters.nrc.aabbMin,
-                     m_launchParameters.nrc.aabbMax,
-                     m_launchParameters.cameraP,
-                     m_launchParameters.cameraU,
-                     m_launchParameters.cameraV,
-                     m_launchParameters.cameraW,
-                     m_resolution.x,
-                     m_resolution.y);
+                     m_bdrcFreezeTraining);
 
-        m_bdrcLastEyeLoss   = bdrcGetLastEyeLoss(m_bdrcSystem);
-        m_bdrcLastLightLoss = bdrcGetLastLightLoss(m_bdrcSystem);
-        m_bdrcLastMaskLoss  = bdrcGetLastMaskLoss(m_bdrcSystem);
-        m_bdrcEyeLossHistory  [m_bdrcEyeLossHistoryIdx]   = m_bdrcLastEyeLoss;
-        m_bdrcLightLossHistory[m_bdrcLightLossHistoryIdx] = m_bdrcLastLightLoss;
-        m_bdrcMaskLossHistory [m_bdrcMaskLossHistoryIdx]  = m_bdrcLastMaskLoss;
-        m_bdrcEyeLossHistoryIdx   = (m_bdrcEyeLossHistoryIdx   + 1) % NRC_LOSS_HISTORY;
-        m_bdrcLightLossHistoryIdx = (m_bdrcLightLossHistoryIdx + 1) % NRC_LOSS_HISTORY;
-        m_bdrcMaskLossHistoryIdx  = (m_bdrcMaskLossHistoryIdx  + 1) % NRC_LOSS_HISTORY;
+        m_bdrcLastLoss    = bdrcGetLastLoss(m_bdrcSystem);
+        m_bdrcPhotonLive  = bdrcGetPhotonLive(m_bdrcSystem);
+        m_bdrcGatherLive  = bdrcGetGatherLive(m_bdrcSystem);
+        m_bdrcLastDensity = bdrcGetLastDensity(m_bdrcSystem);
+
+        if (nrcIteration % 100u == 0u)
+        {
+          printf("[bdrc] iter=%u loss=%.6g photonLive=%u/%u gatherLive=%u/%u p_r=%.6g\n",
+                 nrcIteration, m_bdrcLastLoss,
+                 m_bdrcPhotonLive, static_cast<unsigned int>(m_resolution.x * m_resolution.y),
+                 m_bdrcGatherLive, static_cast<unsigned int>(m_bdrcGatherCount),
+                 m_bdrcLastDensity);
+          fflush(stdout);
+        }
+
+        m_bdrcLossHistory[m_bdrcLossHistoryIdx] = m_bdrcLastLoss;
+        m_bdrcLossHistoryIdx = (m_bdrcLossHistoryIdx + 1) % NRC_LOSS_HISTORY;
       }
       else if (m_nrc == 1 && m_nrcSystem)
       {
@@ -2301,90 +2304,90 @@ void Application::guiWindow()
     ImGui::Text("Samples: %d / frame", m_nrcLastTrainCount);
   }
 
-  if (m_nrc == 2 && ImGui::CollapsingHeader("BDRC Cache Visualization"))
+  if (m_nrc == 2 && ImGui::CollapsingHeader("Unified transport cache"))
   {
-    ImGui::Text("BDRC Mode");
-    ImGui::Checkbox("Freeze Training", &m_bdrcFreezeTraining);
-    ImGui::Text("Phase: %s (training frame %u / warmup %d)",
-                m_bdrcPhase == 0 ? "1-Mask warmup" : "2-Color caches",
-                m_nrcTrainingIteration, m_bdrcWarmup);
-    ImGui::SliderInt("BDRC Warmup Frames", &m_bdrcWarmup, 0, 10000 );
+    ImGui::Text("photon lanes live: %u / %u", m_bdrcPhotonLive,
+                static_cast<unsigned int>(m_resolution.x * m_resolution.y));
+    ImGui::Text("gather lanes live: %u / %u", m_bdrcGatherLive,
+                static_cast<unsigned int>(m_bdrcGatherCount));
+    ImGui::Text("reference density p_r: %.6g", m_bdrcLastDensity);
+    ImGui::Text("training frame: %u", m_nrcTrainingIteration);
 
-    static const char* bdrcDebugItems[] = {
-      "Normal",
-      "Eye cache (ce)",
-      "Light cache (cl)",
-      "Mask (alpha)",
-      "Eye + Light",
-      "Eye Resampled Endpoints",
-      "Light Endpoints"
-    };
-    if (ImGui::Combo("BDRC Debug View", &m_bdrcDebugMode, bdrcDebugItems, 7))
+    {
+      float lossMax = *std::max_element(m_bdrcLossHistory, m_bdrcLossHistory + NRC_LOSS_HISTORY);
+      if (lossMax < 1e-6f) lossMax = 1e-6f;
+      char overlay[32];
+      snprintf(overlay, sizeof(overlay), "%.4g", m_bdrcLastLoss);
+      ImGui::PlotLines("##BdrcLoss", m_bdrcLossHistory, NRC_LOSS_HISTORY, m_bdrcLossHistoryIdx,
+                       overlay, 0.0f, lossMax * 1.1f, ImVec2(0.0f, 48.0f));
+      if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Weighted density-ratio loss over both streams (last %d frames).",
+                          NRC_LOSS_HISTORY);
+    }
+    ImGui::Text("loss: %.6g", m_bdrcLastLoss);
+
+    ImGui::Checkbox("Freeze training", &m_bdrcFreezeTraining);
+
+    static const char* generatorItems[] = { "logistic", "brier", "lsif", "bregman" };
+    int  gen      = static_cast<int>(m_bdrcDre.objective);
+    bool dreDirty = false;
+    dreDirty |= ImGui::Combo("Generator", &gen, generatorItems, IM_ARRAYSIZE(generatorItems));
+    m_bdrcDre.objective = static_cast<DreObjective>(gen);
+
+    dreDirty |= ImGui::SliderFloat("alpha (noise ratio)", &m_bdrcDre.alpha, 1.0f, 10000.0f,
+                                   "%.0f", ImGuiSliderFlags_Logarithmic);
+    dreDirty |= ImGui::SliderFloat("beta", &m_bdrcDre.beta, 0.01f, 100.0f,
+                                   "%.3f", ImGuiSliderFlags_Logarithmic);
+    if (m_bdrcDre.objective == DreObjective::Bregman)
+      dreDirty |= ImGui::SliderFloat("bregman power", &m_bdrcDre.power, -1.0f, 4.0f);
+
+    if (dreIsRawRatio(m_bdrcDre.objective))
+    {
+      ImGui::TextDisabled("raw-ratio generator: beta is pinned to alpha, and its");
+      ImGui::TextDisabled("r^2 reference term is heavy-tailed when u/q is large.");
+    }
+
+    if (dreDirty && m_bdrcSystem != nullptr)
+    {
+      // The raw-ratio members read u* = (beta/alpha) * sum_s p_s w_bar_s, so
+      // they reject unequal constants. Pin beta rather than throw at the user
+      // from a slider callback.
+      if (dreIsRawRatio(m_bdrcDre.objective))
+        m_bdrcDre.beta = m_bdrcDre.alpha;
+      bdrcSetDreConfig(m_bdrcSystem, m_bdrcDre);
+    }
+
+    if (ImGui::SliderInt("Gather lanes", &m_bdrcGatherCount, 0, 1 << 20))
+      m_isDirtyResolution = true;   // reallocates the records array
+    ImGui::SliderFloat("Photon clamp", &m_bdrcPhotonClamp, 1.0f, 1.0e6f,
+                       "%.0f", ImGuiSliderFlags_Logarithmic);
+    ImGui::SliderInt("LR anneal iters", &m_bdrcLrAnnealIters, 500, 200000);
+
+    static const char* bdrcDebugItems[] = { "Normal", "Cache contribution", "Raw field" };
+    if (ImGui::Combo("BDRC debug view", &m_bdrcDebugMode, bdrcDebugItems,
+                     IM_ARRAYSIZE(bdrcDebugItems)))
     {
       m_launchParameters.iteration = 0;
       if (m_launchParameters.bufferAccum != nullptr)
       {
         const int numPixels = m_launchParameters.resolution.x * m_launchParameters.resolution.y;
-        CUDA_CHECK( cudaMemset(reinterpret_cast<void*>(m_launchParameters.bufferAccum), 0, numPixels * sizeof(float4)) );
+        CUDA_CHECK( cudaMemset(reinterpret_cast<void*>(m_launchParameters.bufferAccum), 0,
+                               numPixels * sizeof(float4)) );
       }
-    }
-
-    // Show loss for the visualized cache. Eye/light losses are only non-zero in Phase 2.
-    if (m_bdrcDebugMode == 1 || m_bdrcDebugMode == 4)
-    {
-      const float* hist    = m_bdrcEyeLossHistory;
-      float        lossMax = *std::max_element(hist, hist + NRC_LOSS_HISTORY);
-      if (lossMax < 1e-6f) lossMax = 1e-6f;
-      char overlay[32];
-      snprintf(overlay, sizeof(overlay), "%.4f", m_bdrcLastEyeLoss);
-      ImGui::PlotLines("##BdrcEyeLoss", hist, NRC_LOSS_HISTORY, m_bdrcEyeLossHistoryIdx,
-                       overlay, 0.0f, lossMax * 1.1f, ImVec2(0, 40));
-      if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Eye cache (ce) training loss — Phase 2 only");
-      ImGui::Text("Eye loss:   %.4f", m_bdrcLastEyeLoss);
-    }
-    if (m_bdrcDebugMode == 2 || m_bdrcDebugMode == 4)
-    {
-      const float* hist    = m_bdrcLightLossHistory;
-      float        lossMax = *std::max_element(hist, hist + NRC_LOSS_HISTORY);
-      if (lossMax < 1e-6f) lossMax = 1e-6f;
-      char overlay[32];
-      snprintf(overlay, sizeof(overlay), "%.4f", m_bdrcLastLightLoss);
-      ImGui::PlotLines("##BdrcLightLoss", hist, NRC_LOSS_HISTORY, m_bdrcLightLossHistoryIdx,
-                       overlay, 0.0f, lossMax * 1.1f, ImVec2(0, 40));
-      if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Light cache (cl) training loss (avg of Y-target and zero-target passes) — Phase 2 only");
-      ImGui::Text("Light loss: %.4f", m_bdrcLastLightLoss);
-    }
-    if (m_bdrcDebugMode == 3)
-    {
-      const float* hist    = m_bdrcMaskLossHistory;
-      float        lossMax = *std::max_element(hist, hist + NRC_LOSS_HISTORY);
-      if (lossMax < 1e-6f) lossMax = 1e-6f;
-      char overlay[32];
-      snprintf(overlay, sizeof(overlay), "%.4f", m_bdrcLastMaskLoss);
-      ImGui::PlotLines("##BdrcMaskLoss", hist, NRC_LOSS_HISTORY, m_bdrcMaskLossHistoryIdx,
-                       overlay, 0.0f, lossMax * 1.1f, ImVec2(0, 40));
-      if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Mask cache DRE Brier loss — (sum_eye + sum_light) / n_eye — Phase 1 only");
-      ImGui::Text("Mask loss:  %.4f", m_bdrcLastMaskLoss);
     }
   }
 
   if (m_nrc == 2 && m_bdrcSystem != nullptr && ImGui::CollapsingHeader("Cache Weights"))
   {
-    static char weightPrefix[512] = "bdrc_weights";
-    ImGui::InputText("Path prefix", weightPrefix, sizeof(weightPrefix));
-    ImGui::SameLine();
-    ImGui::TextDisabled("(saves _eye.bin / _light.bin / _mask.bin)");
+    static char weightPath[512] = "bdrc_field.bin";
+    ImGui::InputText("Path", weightPath, sizeof(weightPath));
 
     if (ImGui::Button("Save"))
     {
-      const std::string p = weightPrefix;
       try
       {
-        bdrcSaveWeights(m_bdrcSystem, p + "_eye.bin", p + "_light.bin", p + "_mask.bin");
-        std::cout << "BDRC weights saved to prefix '" << p << "'\n";
+        bdrcSaveWeights(m_bdrcSystem, weightPath);
+        std::cout << "Unified cache weights saved to '" << weightPath << "'\n";
       }
       catch (const std::exception& e)
       {
@@ -2394,11 +2397,10 @@ void Application::guiWindow()
     ImGui::SameLine();
     if (ImGui::Button("Load"))
     {
-      const std::string p = weightPrefix;
-      if (!bdrcLoadWeights(m_bdrcSystem, m_cudaStream, p + "_eye.bin", p + "_light.bin", p + "_mask.bin"))
-        std::cerr << "bdrcLoadWeights: failed to load from prefix '" << p << "'\n";
+      if (!bdrcLoadWeights(m_bdrcSystem, m_cudaStream, weightPath))
+        std::cerr << "bdrcLoadWeights: failed to load from '" << weightPath << "'\n";
       else
-        std::cout << "BDRC weights loaded from prefix '" << p << "'\n";
+        std::cout << "Unified cache weights loaded from '" << weightPath << "'\n";
     }
   }
 
@@ -5797,6 +5799,12 @@ void Application::cleanup()
   }
 
   // BDPT: Free the light path raygen record (shared records were already freed above via m_sbt).
+  if (m_sbtGather.raygenRecord)
+  {
+    CUDA_CHECK( cudaFree(reinterpret_cast<void*>(m_sbtGather.raygenRecord)) );
+    m_sbtGather.raygenRecord = 0;
+  }
+
   if (m_sbtLightPath.raygenRecord)
   {
     CUDA_CHECK( cudaFree(reinterpret_cast<void*>(m_sbtLightPath.raygenRecord)) );
@@ -6413,6 +6421,12 @@ void Application::initPipeline()
   pgd->raygen.module            = m_modules[MODULE_ID_RAYGENERATION];
   pgd->raygen.entryFunctionName = "__raygen__light_path_tracer";
 
+  pgd = &programGroupDescriptions[PGID_GATHER_RAYGENERATION];
+  pgd->kind  = OPTIX_PROGRAM_GROUP_KIND_RAYGEN;
+  pgd->flags = OPTIX_PROGRAM_GROUP_FLAGS_NONE;
+  pgd->raygen.module            = m_modules[MODULE_ID_RAYGENERATION];
+  pgd->raygen.entryFunctionName = "__raygen__bdrc_gather";
+
   pgd = &programGroupDescriptions[PGID_EXCEPTION];
   pgd->kind  = OPTIX_PROGRAM_GROUP_KIND_EXCEPTION;
   pgd->flags = OPTIX_PROGRAM_GROUP_FLAGS_NONE;
@@ -6600,6 +6614,14 @@ void Application::initSBT()
     OPTIX_CHECK( m_api.optixSbtRecordPackHeader(m_programGroups[PGID_LIGHT_PATH_RAYGENERATION], &rg_light_path_sbt) );
 
     CUDA_CHECK( cudaMemcpy(reinterpret_cast<void*>(m_sbtLightPath.raygenRecord), &rg_light_path_sbt, sizeof(dev::EmptyRecord), cudaMemcpyHostToDevice) );
+
+    CUDA_CHECK( cudaMalloc(reinterpret_cast<void**>(&m_sbtGather.raygenRecord), sizeof(dev::EmptyRecord)) );
+
+    dev::EmptyRecord rg_gather_sbt;
+
+    OPTIX_CHECK( m_api.optixSbtRecordPackHeader(m_programGroups[PGID_GATHER_RAYGENERATION], &rg_gather_sbt) );
+
+    CUDA_CHECK( cudaMemcpy(reinterpret_cast<void*>(m_sbtGather.raygenRecord), &rg_gather_sbt, sizeof(dev::EmptyRecord), cudaMemcpyHostToDevice) );
 
     // The light path SBT reuses the miss, hitgroup, and callable records from m_sbt.
     // These are assigned after m_sbt is fully constructed (see end of initSBT).
@@ -6799,14 +6821,23 @@ void Application::initSBT()
   // BDPT: The light path SBT shares all records except raygen with the eye path SBT.
   // (Miss, hitgroup, and callable programs are the same; only the raygen differs.)
   m_sbtLightPath.missRecordBase            = m_sbt.missRecordBase;
+  m_sbtGather.missRecordBase            = m_sbt.missRecordBase;
   m_sbtLightPath.missRecordStrideInBytes   = m_sbt.missRecordStrideInBytes;
+  m_sbtGather.missRecordStrideInBytes   = m_sbt.missRecordStrideInBytes;
   m_sbtLightPath.missRecordCount           = m_sbt.missRecordCount;
+  m_sbtGather.missRecordCount           = m_sbt.missRecordCount;
   m_sbtLightPath.hitgroupRecordBase        = m_sbt.hitgroupRecordBase;
+  m_sbtGather.hitgroupRecordBase        = m_sbt.hitgroupRecordBase;
   m_sbtLightPath.hitgroupRecordStrideInBytes = m_sbt.hitgroupRecordStrideInBytes;
+  m_sbtGather.hitgroupRecordStrideInBytes = m_sbt.hitgroupRecordStrideInBytes;
   m_sbtLightPath.hitgroupRecordCount       = m_sbt.hitgroupRecordCount;
+  m_sbtGather.hitgroupRecordCount       = m_sbt.hitgroupRecordCount;
   m_sbtLightPath.callablesRecordBase       = m_sbt.callablesRecordBase;
+  m_sbtGather.callablesRecordBase       = m_sbt.callablesRecordBase;
   m_sbtLightPath.callablesRecordStrideInBytes = m_sbt.callablesRecordStrideInBytes;
+  m_sbtGather.callablesRecordStrideInBytes = m_sbt.callablesRecordStrideInBytes;
   m_sbtLightPath.callablesRecordCount      = m_sbt.callablesRecordCount;
+  m_sbtGather.callablesRecordCount      = m_sbt.callablesRecordCount;
 }
 
 
@@ -6929,8 +6960,11 @@ void Application::updateSBT()
 
   // Keep the BDPT SBT's hitgroup pointers in sync.
   m_sbtLightPath.hitgroupRecordBase            = m_sbt.hitgroupRecordBase;
+  m_sbtGather.hitgroupRecordBase            = m_sbt.hitgroupRecordBase;
   m_sbtLightPath.hitgroupRecordStrideInBytes   = m_sbt.hitgroupRecordStrideInBytes;
+  m_sbtGather.hitgroupRecordStrideInBytes   = m_sbt.hitgroupRecordStrideInBytes;
   m_sbtLightPath.hitgroupRecordCount           = m_sbt.hitgroupRecordCount;
+  m_sbtGather.hitgroupRecordCount           = m_sbt.hitgroupRecordCount;
 }
 
 

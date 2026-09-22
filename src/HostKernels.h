@@ -109,53 +109,30 @@ extern __host__ void device_nrc_build_targets(
     const unsigned int* trainNextValid,
     int                 numTrainSamples);
 
-// BDRC: composite eye+light cache outputs into bufferAccum.
-// radiance[px] = prefix + renderThroughput*eyeOutput + maskOutput*lightOutput
-// maskOutput is p_l_area(D) — scalar mask cache output at the eye vertex D.
+// BDRC unified cache: composite the field into bufferAccum.
+// pixel = camPrefix + camFactor * fieldOutput, where camFactor = T(cam->D) * f_s(D).
+// The receiver BSDF is applied here because the field stores incident flux.
 extern __host__ void device_bdrc_composite(
     cudaStream_t        cudaStream,
     float4*             bufferAccum,
-    const float*        renderPrefix,
-    const float*        renderThroughput,
-    const float*        eyeOutput,
-    const float*        lightOutput,
-    const float*        maskOutput,
-    const unsigned int* renderValid,
+    const float*        camPrefix,
+    const float*        camFactor,
+    const float*        fieldOutput,
+    const unsigned int* camValid,
     int                 numPixels,
     unsigned int        iteration);
 
-// BDRC debug visualization: write one of the three cache outputs directly to bufferAccum.
-// debugMode: 1=eye(ĉ_e), 2=light(ĉ_l), 3=mask(α) grayscale, 4=eye+light combined.
+// BDRC unified cache debug view.
+// debugMode 1 = camFactor * fieldOutput (the cache's own contribution).
+// debugMode 2 = fieldOutput (raw incident flux per area; structure only).
 extern __host__ void device_bdrc_debug(
     cudaStream_t        cudaStream,
     float4*             bufferAccum,
-    const float*        eyeOutput,
-    const float*        lightOutput,
-    const float*        maskOutput,
-    const unsigned int* renderValid,
+    const float*        camFactor,
+    const float*        fieldOutput,
+    const unsigned int* camValid,
     int                 numPixels,
     unsigned int        iteration,
     int                 debugMode);
-
-// BDRC debug modes 5 and 6: splat per-pixel endpoint contributions to camera-projected pixels.
-// Unpacks world positions from packed BDRC features, projects through the perspective camera,
-// and atomically adds valueBuffer[i] to bufferAccum at the projected pixel.
-// bufferAccum must be zero-cleared before this call.
-extern __host__ void device_bdrc_splat_endpoints(
-    cudaStream_t        cudaStream,
-    float4*             bufferAccum,
-    const float*        featureBuffer,    // [3 × numPixels] packed BDRC features
-    const float*        valueBuffer,      // [3 × numPixels] RGB values to splat
-    const unsigned int* validBuffer,      // [numPixels]
-    int                 numPixels,
-    float3              aabbMin,
-    float3              aabbRange,        // aabbMax - aabbMin
-    float3              cameraP,
-    float3              cameraU,
-    float3              cameraV,
-    float3              cameraW,
-    int                 resX,
-    int                 resY,
-    int                 iteration);
 
 #endif // HOST_KERNELS_H

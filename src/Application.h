@@ -200,8 +200,12 @@ enum ProgramGroupId
   // Emissive mesh area light:
   PGID_LIGHT_MESH,
 
-  // BDPT: Light path raygen program.
+  // BDPT / BDRC photon stream: light path raygen program.
   PGID_LIGHT_PATH_RAYGENERATION,
+
+  // BDRC gather stream raygen program. Launched at its own lane count, not at
+  // the render resolution.
+  PGID_GATHER_RAYGENERATION,
 
   // Number of all hardcoded program group entries.
   NUM_PROGRAM_GROUP_IDS
@@ -618,6 +622,7 @@ private:
 
   OptixShaderBindingTable m_sbt   = {}; // SBT for the eye path tracer.
   OptixShaderBindingTable m_sbtLightPath = {}; // SBT for the light path tracer (shares miss/hit/callable records with m_sbt).
+  OptixShaderBindingTable m_sbtGather    = {}; // SBT for the BDRC gather raygen (shares miss/hit/callable records with m_sbt).
 
   LaunchParameters  m_launchParameters   = {};
   LaunchParameters* m_d_launchParameters = nullptr;
@@ -679,20 +684,25 @@ private:
   BdrcSystem*  m_bdrcSystem    = nullptr;
   CUstream     m_cudaStreamLight = nullptr;  // Second stream for parallel light-path launch
   uint32_t     m_nrcTrainingIteration = 0u;  // Total training frames — never reset on camera move
-  int          m_bdrcPhase     = 0;          // 0 = Phase 1 (mask warmup), 1 = Phase 2 (color)
-  int          m_bdrcWarmup    = 2000;       // Frames before Phase 2
-  int          m_bdrcDebugMode = 0;          // 0=normal, 1=eye cache, 2=light cache, 3=mask, 4=eye+light
-  bool         m_bdrcFreezeTraining = true;  // Freeze all cache weight updates; inference still runs
+  int          m_bdrcDebugMode = 0;          // 0=normal, 1=cache contribution, 2=raw field
+  bool         m_bdrcFreezeTraining = false; // there is no warmup: the single fit runs from frame 0
 
-  float        m_bdrcLastEyeLoss   = 0.0f;
-  float        m_bdrcLastLightLoss = 0.0f;
-  float        m_bdrcLastMaskLoss  = 0.0f;
-  float        m_bdrcEyeLossHistory  [NRC_LOSS_HISTORY] = {};
-  float        m_bdrcLightLossHistory[NRC_LOSS_HISTORY] = {};
-  float        m_bdrcMaskLossHistory [NRC_LOSS_HISTORY] = {};
-  int          m_bdrcEyeLossHistoryIdx   = 0;
-  int          m_bdrcLightLossHistoryIdx = 0;
-  int          m_bdrcMaskLossHistoryIdx  = 0;
+  // Gather lanes per frame. Its own launch dimension, deliberately independent
+  // of the render resolution so the gather stream does not move when the window
+  // or the camera does.
+  int          m_bdrcGatherCount   = 65536;
+  float        m_bdrcPhotonClamp   = 10000.0f;
+  int          m_bdrcLrAnnealIters = 10000;
+
+  DreConfig    m_bdrcDre;                    // generator, alpha, beta, power
+  float3       m_bdrcReferenceOrigin = {};   // stamped once in initBDRC; never follows the camera
+
+  float        m_bdrcLastLoss    = 0.0f;
+  uint32_t     m_bdrcPhotonLive  = 0u;
+  uint32_t     m_bdrcGatherLive  = 0u;
+  float        m_bdrcLastDensity = 0.0f;
+  float        m_bdrcLossHistory[NRC_LOSS_HISTORY] = {};
+  int          m_bdrcLossHistoryIdx = 0;
 };
 
 #endif // APPLICATION_H

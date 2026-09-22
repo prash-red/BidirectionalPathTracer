@@ -79,3 +79,7 @@ Testing/
 
 .idea/.worktrees/
 .superpowers/
+# IDE and local worktrees
+.idea/
+.worktrees/
+.superpowers/
