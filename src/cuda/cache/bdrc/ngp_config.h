@@ -14,6 +14,15 @@ struct ngp_config
     // Base input layout for a 3D hash-grid cache.
     int inputDim = 3;
 
+    // Trailing input dims that bypass the hash grid and enter the MLP directly
+    // (an Identity nested encoding inside a Composite). 0 = the plain
+    // hash-grid-only encoding. The unified field uses 2: a fixed-origin face
+    // orientation label and an arrival-side label. Labels must not be hashed —
+    // the demo's field.wgsl appends them after the grid features for the same
+    // reason: a label is a discrete condition on the function, not a position
+    // whose neighbourhood should be interpolated.
+    int labelDims = 0;
+
     // Hash grid encoding settings.
     int   nLevels           = 6;
     int   nFeaturesPerLevel = 4;
@@ -36,6 +45,17 @@ struct ngp_config
     bool        amsgrad     = false;
     bool        decoupledWd = false;
     bool        lamb        = false;
+    // Hard cap on |weight| applied by tcnn's own Adam kernel, BEFORE the
+    // half-precision cast that actually stores the parameter. 0 = disabled
+    // (tcnn's own default). Unlike gradient clipping/scaling, this is an
+    // unconditional guarantee: no weight this optimizer writes can ever exceed
+    // this magnitude, so it can never overflow to Inf when cast to half. That
+    // is the exact mechanism behind the reproducible NaN by iteration ~400 seen
+    // with gradClip alone — a huge-but-finite (in fp32) Adam update, divided by
+    // a near-zero second-moment estimate, overflowing on the half cast without
+    // ever producing a non-finite gradient for gradScaler's overflow check to
+    // catch.
+    float       weightClip  = 0.0f;
 
     // Precision and gradient-scaling controls.
     bool  gradScaler             = false;
@@ -53,6 +73,9 @@ struct ngp_config
         if (inputDim <= 0) {
             throw std::invalid_argument("NGPConfig.inputDim must be > 0");
         }
+        if (labelDims < 0 || labelDims >= inputDim) {
+            throw std::invalid_argument("NGPConfig.labelDims must be in [0, inputDim)");
+        }
         if (nLevels <= 0 || nFeaturesPerLevel <= 0 || baseResolution <= 0 || log2HashmapSize <= 0) {
             throw std::invalid_argument("NGPConfig hash-grid parameters must be > 0");
         }
@@ -60,13 +83,37 @@ struct ngp_config
             throw std::invalid_argument("NGPConfig.perLevelScale must be > 1.0");
         }
 
-        return {
+        const nlohmann::json grid = {
             {"otype", "HashGrid"},
             {"n_levels", nLevels},
             {"n_features_per_level", nFeaturesPerLevel},
             {"log2_hashmap_size", log2HashmapSize},
             {"base_resolution", baseResolution},
             {"per_level_scale", perLevelScale},
+        };
+
+        if (labelDims == 0) {
+            return grid;
+        }
+
+        // Composite: the leading dims go through the hash grid, the trailing
+        // label dims bypass it into the MLP. tcnn's CompositeEncoding accepts
+        // n_dims_to_encode and dims_to_encode_begin per nested entry.
+        nlohmann::json gridEntry = grid;
+        gridEntry["n_dims_to_encode"]     = inputDim - labelDims;
+        gridEntry["dims_to_encode_begin"] = 0;
+
+        return {
+            {"otype", "Composite"},
+            {"reduction", "Concatenation"},
+            {"nested", nlohmann::json::array({
+                gridEntry,
+                {
+                    {"otype", "Identity"},
+                    {"n_dims_to_encode", labelDims},
+                    {"dims_to_encode_begin", inputDim - labelDims},
+                },
+            })},
         };
     }
 
@@ -131,6 +178,7 @@ struct ngp_config
             {"beta2",          0.99f},
             {"epsilon",        1e-8f},
             {"l2_reg",         0.0f},
+            {"clipping_magnitude", weightClip},
         };
     }
 };
