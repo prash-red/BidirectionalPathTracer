@@ -77,23 +77,34 @@ __device__ __forceinline__ void nrcPackFeatures(
     d[13] = specularColor.z;
 }
 
+// Packs one 3-dim BDRC position query: world position normalized into the
+// SCENE AABB, clamped to [0,1].
+//
+// World space, not GAS-local: one neural field spans the whole scene, so two
+// meshes must not share a coordinate. Normalizing each mesh by its own local
+// AABB (the pre-2026-09 convention) collapsed every mesh onto the same unit
+// cube and made two instances of one mesh indistinguishable to the field.
+//
+// Layout: element (feature f, lane i) at buf[i * BDRC_INPUT_DIM + f], i.e. a
+// column-major [BDRC_INPUT_DIM x N] tcnn matrix.
 __device__ __forceinline__ void bdrcPackFeatures(
     float*       buf,
-    uint32_t     pixelIdx,
-    const float3 pos,
+    uint32_t     lane,
+    const float3 worldPos,
     const float3 aabbMin,
     const float3 aabbMax)
 {
-    float* d = buf + pixelIdx * BDRC_INPUT_DIM;
+    float* d = buf + lane * BDRC_INPUT_DIM;
 
-    // [0,1,2] world-space position normalized to scene AABB
-    const float pad = 0.f;
-    const float rx = aabbMax.x - aabbMin.x + 2 * pad;
-    const float ry = aabbMax.y - aabbMin.y + 2 * pad;
-    const float rz = aabbMax.z - aabbMin.z + 2 * pad;
-    d[0] = fminf(fmaxf((pos.x - (aabbMin.x - pad)) / (rx > 0.f ? rx : 1.f), 0.f), 1.f);
-    d[1] = fminf(fmaxf((pos.y - (aabbMin.y - pad)) / (ry > 0.f ? ry : 1.f), 0.f), 1.f);
-    d[2] = fminf(fmaxf((pos.z - (aabbMin.z - pad)) / (rz > 0.f ? rz : 1.f), 0.f), 1.f);
+    // A planar scene has zero extent on one axis; fall back to 1.0 so the
+    // coordinate pins to 0 instead of producing inf/NaN that would poison
+    // every hash-grid cell the lane touches.
+    const float rx = aabbMax.x - aabbMin.x;
+    const float ry = aabbMax.y - aabbMin.y;
+    const float rz = aabbMax.z - aabbMin.z;
+    d[0] = fminf(fmaxf((worldPos.x - aabbMin.x) / (rx > 0.f ? rx : 1.f), 0.f), 1.f);
+    d[1] = fminf(fmaxf((worldPos.y - aabbMin.y) / (ry > 0.f ? ry : 1.f), 0.f), 1.f);
+    d[2] = fminf(fmaxf((worldPos.z - aabbMin.z) / (rz > 0.f ? rz : 1.f), 0.f), 1.f);
 }
 
 #endif // NRC_FEATURES_H

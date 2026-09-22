@@ -1549,7 +1549,8 @@ __forceinline__ __device__ void chRadiance()
     const unsigned int slot     = static_cast<unsigned int>(thePrd->virtEmitDepth) * numPix + pixelIdx;
     const NrcLaunchBuffers& nrc = theLaunchParameters.nrc;
 
-    bdrcPackFeatures(nrc.virtEmitPos, slot, thePrd->posLocal, thePrd->localAabbMin, thePrd->localAabbMax);
+    bdrcPackFeatures(nrc.virtEmitPos, slot, thePrd->pos,
+                     theLaunchParameters.nrc.aabbMin, theLaunchParameters.nrc.aabbMax);
 
     // Weight is just the eye-path throughput arriving at this vertex. The
     // light cache's EMA output already represents the Lambertian-response-

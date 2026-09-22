@@ -4567,8 +4567,6 @@ void Application::freeSurfaceReferenceTable()
 {
   if (m_surfaceRefPositions) { CUDA_CHECK( cudaFree(reinterpret_cast<void*>(m_surfaceRefPositions)) ); m_surfaceRefPositions = 0; }
   if (m_surfaceRefCdf)       { CUDA_CHECK( cudaFree(reinterpret_cast<void*>(m_surfaceRefCdf)) );       m_surfaceRefCdf       = 0; }
-  if (m_surfaceRefLocalAabbMin) { CUDA_CHECK( cudaFree(reinterpret_cast<void*>(m_surfaceRefLocalAabbMin)) ); m_surfaceRefLocalAabbMin = 0; }
-  if (m_surfaceRefLocalAabbMax) { CUDA_CHECK( cudaFree(reinterpret_cast<void*>(m_surfaceRefLocalAabbMax)) ); m_surfaceRefLocalAabbMax = 0; }
   m_surfaceRefTriCount     = 0;
   m_surfaceRefTotalArea    = 0.0f;
   m_surfaceRefInvTotalArea = 0.0f;
@@ -4579,10 +4577,8 @@ void Application::initSurfaceReferenceTable()
 {
   freeSurfaceReferenceTable();
 
-  std::vector<float3> localPositions;
+  std::vector<float3> worldPositions;
   std::vector<float>  triAreas;
-  std::vector<float3> triLocalAabbMin;
-  std::vector<float3> triLocalAabbMax;
 
   for (size_t instanceIdx = 0; instanceIdx < m_instances.size(); ++instanceIdx)
   {
@@ -4609,11 +4605,9 @@ void Application::initSurfaceReferenceTable()
         const unsigned int i1 = indexData[3 * t + 1];
         const unsigned int i2 = indexData[3 * t + 2];
 
-        // World-space positions are needed only to compute the true (scale-aware)
-        // triangle area for the CDF; the stored sample position stays in the same
-        // GAS-local frame every other BDRC feature buffer uses (posLocal +
-        // deviceMesh.localAabbMin/Max), so both mask-cache training streams share
-        // one normalization domain with the render-time query.
+        // World space throughout: the area for the CDF is scale-aware, and the
+        // stored sample position is what the gather stream shoots its shadow and
+        // continuation rays from. A per-mesh local frame cannot serve either.
         const glm::vec4 p0w = xform * glm::vec4(posData[i0].x, posData[i0].y, posData[i0].z, 1.0f);
         const glm::vec4 p1w = xform * glm::vec4(posData[i1].x, posData[i1].y, posData[i1].z, 1.0f);
         const glm::vec4 p2w = xform * glm::vec4(posData[i2].x, posData[i2].y, posData[i2].z, 1.0f);
@@ -4627,12 +4621,10 @@ void Application::initSurfaceReferenceTable()
         if (triArea <= 0.0f)
           continue;
 
-        localPositions.push_back(posData[i0]);
-        localPositions.push_back(posData[i1]);
-        localPositions.push_back(posData[i2]);
+        worldPositions.push_back(w0);
+        worldPositions.push_back(w1);
+        worldPositions.push_back(w2);
         triAreas.push_back(triArea);
-        triLocalAabbMin.push_back(deviceMesh.localAabbMin);
-        triLocalAabbMax.push_back(deviceMesh.localAabbMax);
       }
     }
   }
@@ -4652,19 +4644,13 @@ void Application::initSurfaceReferenceTable()
     cdf[t] *= invTotal;
   cdf[numTriangles] = 1.0f;
 
-  const size_t posBytes = localPositions.size() * sizeof(float3);
+  const size_t posBytes = worldPositions.size() * sizeof(float3);
   CUDA_CHECK( cudaMalloc(reinterpret_cast<void**>(&m_surfaceRefPositions), posBytes) );
-  CUDA_CHECK( cudaMemcpy(reinterpret_cast<void*>(m_surfaceRefPositions), localPositions.data(), posBytes, cudaMemcpyHostToDevice) );
+  CUDA_CHECK( cudaMemcpy(reinterpret_cast<void*>(m_surfaceRefPositions), worldPositions.data(), posBytes, cudaMemcpyHostToDevice) );
 
   const size_t cdfBytes = cdf.size() * sizeof(float);
   CUDA_CHECK( cudaMalloc(reinterpret_cast<void**>(&m_surfaceRefCdf), cdfBytes) );
   CUDA_CHECK( cudaMemcpy(reinterpret_cast<void*>(m_surfaceRefCdf), cdf.data(), cdfBytes, cudaMemcpyHostToDevice) );
-
-  const size_t aabbBytes = triLocalAabbMin.size() * sizeof(float3);
-  CUDA_CHECK( cudaMalloc(reinterpret_cast<void**>(&m_surfaceRefLocalAabbMin), aabbBytes) );
-  CUDA_CHECK( cudaMemcpy(reinterpret_cast<void*>(m_surfaceRefLocalAabbMin), triLocalAabbMin.data(), aabbBytes, cudaMemcpyHostToDevice) );
-  CUDA_CHECK( cudaMalloc(reinterpret_cast<void**>(&m_surfaceRefLocalAabbMax), aabbBytes) );
-  CUDA_CHECK( cudaMemcpy(reinterpret_cast<void*>(m_surfaceRefLocalAabbMax), triLocalAabbMax.data(), aabbBytes, cudaMemcpyHostToDevice) );
 
   m_surfaceRefTriCount     = static_cast<uint32_t>(numTriangles);
   m_surfaceRefTotalArea    = totalArea;
@@ -7277,8 +7263,6 @@ void Application::initLaunchParameters()
 
   m_launchParameters.surfaceRef.positions     = reinterpret_cast<float3*>(m_surfaceRefPositions);
   m_launchParameters.surfaceRef.cdf           = reinterpret_cast<float*>(m_surfaceRefCdf);
-  m_launchParameters.surfaceRef.localAabbMin  = reinterpret_cast<float3*>(m_surfaceRefLocalAabbMin);
-  m_launchParameters.surfaceRef.localAabbMax  = reinterpret_cast<float3*>(m_surfaceRefLocalAabbMax);
   m_launchParameters.surfaceRef.triCount      = m_surfaceRefTriCount;
   m_launchParameters.surfaceRef.invTotalArea  = m_surfaceRefInvTotalArea;
 
@@ -7307,8 +7291,6 @@ void Application::updateLaunchParameters()
 
   m_launchParameters.surfaceRef.positions     = reinterpret_cast<float3*>(m_surfaceRefPositions);
   m_launchParameters.surfaceRef.cdf           = reinterpret_cast<float*>(m_surfaceRefCdf);
-  m_launchParameters.surfaceRef.localAabbMin  = reinterpret_cast<float3*>(m_surfaceRefLocalAabbMin);
-  m_launchParameters.surfaceRef.localAabbMax  = reinterpret_cast<float3*>(m_surfaceRefLocalAabbMax);
   m_launchParameters.surfaceRef.triCount      = m_surfaceRefTriCount;
   m_launchParameters.surfaceRef.invTotalArea  = m_surfaceRefInvTotalArea;
 

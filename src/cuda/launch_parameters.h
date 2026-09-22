@@ -52,20 +52,24 @@ constexpr int BDRC_MAX_LIGHT_DEPTH = 6;
 // of those re-entries contribute a virtual-emission correction.
 constexpr int VIRT_EMIT_MAX_DEPTH = 4;
 
-// Global diffuse-surface reference table for CPM/NCE mask-cache training.
-// Density at ANY point on this surface set is the single scalar invTotalArea
-// (pure area-uniform reference — the a_eff=0 case of the Python project's
-// surface_mixture reference distribution). Built once at scene load; never
-// depends on the camera or the current eye path.
+// Global diffuse-surface reference table for the density-ratio reference
+// measure. Density at ANY point on this surface set is the single scalar
+// invTotalArea (pure area-uniform reference), so no per-point density lookup
+// is ever needed. Built once at scene load; never depends on the camera or on
+// any path.
+//
+// Positions are WORLD space. The gather stream traces shadow rays and
+// continuation rays from these anchors, which is only meaningful in world
+// space, and the field's own coordinate is world-normalized too (see
+// bdrcPackFeatures). World verts go stale under rigid-body node animation; the
+// table is rebuilt on scene reload, and animated-instance support would need a
+// per-frame rebuild.
 struct SurfaceReferenceTable
 {
-  float3*      positions;    // [3 * triCount] GAS-local-space triangle verts (v0,v1,v2 per tri) —
-                              // same local frame every other BDRC feature buffer uses
-  float*       cdf;          // [triCount + 1] normalized cumulative-area CDF (area computed in world space)
-  float3*      localAabbMin; // [triCount] owning mesh's GAS-local rest-pose AABB min, per triangle
-  float3*      localAabbMax; // [triCount] owning mesh's GAS-local rest-pose AABB max, per triangle
+  float3*      positions;    // [3 * triCount] world-space triangle verts (v0,v1,v2 per tri)
+  float*       cdf;          // [triCount + 1] normalized cumulative-area CDF
   unsigned int triCount;
-  float        invTotalArea; // 1 / total surface area — the known reference density
+  float        invTotalArea; // 1 / total surface area — the reference density
 };
 
 // Device buffers used by the NRC path-termination and self-training loop.

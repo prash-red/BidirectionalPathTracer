@@ -24,18 +24,18 @@ __forceinline__ __device__ unsigned int surfaceRefBinarySearchCDF(
 }
 
 // Exact area-uniform sample of the global diffuse-surface reference table.
-// The returned position's exact per-unit-area density is tbl.invTotalArea —
-// the SAME scalar for every point in the scene, so no per-point density lookup
-// is ever needed (this is the pure-uniform case; there is no shape/NDC mixture
-// in this port). outPos/outLocalAabbMin/outLocalAabbMax are in the SAME
-// GAS-local coordinate convention as every other BDRC feature buffer (the
-// owning mesh's own local AABB), so this reference stream and the render-time
-// query normalize into the same domain. outNormal is the (already-normalized)
-// face normal of the sampled triangle. Returns false (no output written) if
-// the table is empty — callers must check the return value.
+// The returned point's per-unit-area density is tbl.invTotalArea everywhere,
+// so no per-point density lookup is needed (this is the pure-uniform case;
+// there is no shape/NDC mixture in this port).
+//
+// World space: the gather stream shoots a shadow ray and a continuation ray
+// from this anchor, neither of which is meaningful in a per-mesh local frame.
+//
+// Returns false (nothing written) when the table is empty or the sampled
+// triangle is degenerate — callers must check.
 __forceinline__ __device__ bool sampleSurfaceUniform(
     unsigned int& seed, const SurfaceReferenceTable& tbl,
-    float3& outPos, float3& outNormal, float3& outLocalAabbMin, float3& outLocalAabbMax)
+    float3& outWorldPos, float3& outWorldNormal)
 {
   if (tbl.triCount == 0u || tbl.cdf == nullptr)
     return false;
@@ -47,8 +47,8 @@ __forceinline__ __device__ bool sampleSurfaceUniform(
   const float3 v1 = tbl.positions[3u * triIdx + 1u];
   const float3 v2 = tbl.positions[3u * triIdx + 2u];
 
-  // Uniform barycentric sample (Turk 1990) — same formula as the existing
-  // mesh-light triangle sampler in light_sample.cu.
+  // Uniform barycentric sample (Turk 1990) — same formula as the mesh-light
+  // triangle sampler in light_sample.cu.
   const float u1 = rng(seed);
   const float u2 = rng(seed);
   const float su = sqrtf(u1);
@@ -56,11 +56,13 @@ __forceinline__ __device__ bool sampleSurfaceUniform(
   const float b1 = su * (1.0f - u2);
   const float b2 = su * u2;
 
-  outPos          = b0 * v0 + b1 * v1 + b2 * v2;
-  const float3 cr = cross(v1 - v0, v2 - v0);
-  outNormal       = normalize(cr);
-  outLocalAabbMin = tbl.localAabbMin[triIdx];
-  outLocalAabbMax = tbl.localAabbMax[triIdx];
+  outWorldPos = b0 * v0 + b1 * v1 + b2 * v2;
+
+  const float3 cr  = cross(v1 - v0, v2 - v0);
+  const float  len = sqrtf(dot(cr, cr));
+  if (len <= 0.0f)
+    return false;   // degenerate triangle: no usable face normal
+  outWorldNormal = cr / len;
   return true;
 }
 

@@ -583,8 +583,6 @@ private:
   // Density at any point on this surface set is the single scalar 1/m_surfaceRefTotalArea.
   CUdeviceptr  m_surfaceRefPositions   = 0;  // float3[3 * m_surfaceRefTriCount], GAS-local space
   CUdeviceptr  m_surfaceRefCdf         = 0;  // float[m_surfaceRefTriCount + 1], normalized to [0,1]
-  CUdeviceptr  m_surfaceRefLocalAabbMin = 0; // float3[m_surfaceRefTriCount], owning mesh's local AABB min
-  CUdeviceptr  m_surfaceRefLocalAabbMax = 0; // float3[m_surfaceRefTriCount], owning mesh's local AABB max
   uint32_t     m_surfaceRefTriCount    = 0;
   float        m_surfaceRefTotalArea   = 0.0f;
   float        m_surfaceRefInvTotalArea = 0.0f;

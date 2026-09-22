@@ -224,7 +224,8 @@ __forceinline__ __device__ bool handleBdrcCacheLogic(
     nrc.renderPrefix[3 * pixelIdx + 2] = radianceBeforeD.z;
 
     nrc.renderValid[pixelIdx] = 1u;
-    bdrcPackFeatures(nrc.renderFeatures, pixelIdx, prd.posLocal, prd.localAabbMin, prd.localAabbMax);
+    bdrcPackFeatures(nrc.renderFeatures, pixelIdx, prd.pos,
+                     theLaunchParameters.nrc.aabbMin, theLaunchParameters.nrc.aabbMax);
   }
 
   // ---- Training suffix: continue path from D with full NEE + Russian Roulette ----
@@ -244,7 +245,8 @@ __forceinline__ __device__ bool handleBdrcCacheLogic(
 
     nrc.trainPixelIndices[slot] = pixelIdx;
 
-    bdrcPackFeatures(nrc.trainFeatures, slot, prd.posLocal, prd.localAabbMin, prd.localAabbMax);
+    bdrcPackFeatures(nrc.trainFeatures, slot, prd.pos,
+                     theLaunchParameters.nrc.aabbMin, theLaunchParameters.nrc.aabbMax);
 
     nrc.trainThroughputAtK[3 * slot + 0] = tpK1.x;
     nrc.trainThroughputAtK[3 * slot + 1] = tpK1.y;
@@ -297,7 +299,8 @@ __forceinline__ __device__ bool handleBdrcDebugFirstHit(
   const NrcLaunchBuffers& nrc = theLaunchParameters.nrc;
 
   // Eye cache query: pack the first-hit position as the query feature.
-  bdrcPackFeatures(nrc.renderFeatures, pixelIdx, prd.posLocal, prd.localAabbMin, prd.localAabbMax);
+  bdrcPackFeatures(nrc.renderFeatures, pixelIdx, prd.pos,
+                     theLaunchParameters.nrc.aabbMin, theLaunchParameters.nrc.aabbMax);
   nrc.renderValid[pixelIdx] = 1u;
 
   // S position: last specular before this hit, or cameraP if path started diffuse.
@@ -320,7 +323,8 @@ __forceinline__ __device__ bool handleBdrcDebugFirstHit(
 
   // R = first-hit position (placeholder; overwritten by the diffuse-termination probe when
   // the path continues, and p_e_area=0 makes it a zero-gradient slot if it is not overwritten).
-  bdrcPackFeatures(nrc.resampledEndpoints, pixelIdx, prd.posLocal, prd.localAabbMin, prd.localAabbMax);
+  bdrcPackFeatures(nrc.resampledEndpoints, pixelIdx, prd.pos,
+                     theLaunchParameters.nrc.aabbMin, theLaunchParameters.nrc.aabbMax);
   nrc.resampledValid[pixelIdx] = 1u;
   nrc.resampled_p_e_area[pixelIdx] = 0.0f;
 
@@ -621,17 +625,14 @@ __forceinline__ __device__ float3 integrator(PerRayData& prd, const uint2 theLau
       // distribution: density is the single known scalar invTotalArea
       // everywhere, so no per-point density lookup is needed.
       {
-        float3 refPos, refNormal, refLocalAabbMin, refLocalAabbMax;
-        if (sampleSurfaceUniform(prd.seed, theLaunchParameters.surfaceRef,
-                                  refPos, refNormal, refLocalAabbMin, refLocalAabbMax))
+        float3 refPos, refNormal;
+        if (sampleSurfaceUniform(prd.seed, theLaunchParameters.surfaceRef, refPos, refNormal))
         {
-          // refPos/refLocalAabbMin/refLocalAabbMax are already in the SAME
-          // GAS-local frame convention as every other BDRC feature buffer
-          // (posLocal + the owning mesh's own localAabbMin/Max), so this
-          // reference/anchor stream and the render-time query at D share one
-          // normalization domain — required for the mask cache's NCE loss to
-          // have a meaningful fixed point.
-          bdrcPackFeatures(nrc.resampledEndpoints, px, refPos, refLocalAabbMin, refLocalAabbMax);
+          // refPos is world space, normalized against the same scene AABB as
+          // every other cache query, so the reference/anchor stream and the
+          // render-time query share one normalization domain.
+          bdrcPackFeatures(nrc.resampledEndpoints, px, refPos,
+                           theLaunchParameters.nrc.aabbMin, theLaunchParameters.nrc.aabbMax);
           nrc.resampledValid[px]     = 1u;
           nrc.resampled_p_sa[px]     = 0.0f;  // no longer a solid-angle PDF; unused downstream
           nrc.resampled_p_e_area[px] = theLaunchParameters.surfaceRef.invTotalArea;
@@ -1045,7 +1046,8 @@ __forceinline__ __device__ void bdrcLightIntegrator(PerRayData& prd, const uint2
         const float3 tp_Y_pre = prd.throughputPreBsdf;
         const float3 target   = tp_Y_pre * prd.nrcBaseColor * M_1_PIf;
 
-        bdrcPackFeatures(nrc.lightEndpoints, pixelIdx, prd.posLocal, prd.localAabbMin, prd.localAabbMax);
+        bdrcPackFeatures(nrc.lightEndpoints, pixelIdx, prd.pos,
+                     theLaunchParameters.nrc.aabbMin, theLaunchParameters.nrc.aabbMax);
         nrc.lightTargets[3*pixelIdx+0] = target.x;
         nrc.lightTargets[3*pixelIdx+1] = target.y;
         nrc.lightTargets[3*pixelIdx+2] = target.z;
