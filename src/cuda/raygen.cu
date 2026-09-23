@@ -751,8 +751,9 @@ __forceinline__ __device__ void bdrcPhotonIntegrator(PerRayData& prd, const unsi
   prd.pdf       = 0.0f;
   prd.occlusion = 1.0f;
   prd.sigma_t   = make_float3(0.0f);
-  prd.typeEvent = BSDF_EVENT_ABSORB;
-  prd.flags     = 0;
+  prd.typeEvent   = BSDF_EVENT_ABSORB;
+  prd.flags       = FLAG_BDRC_PHOTON;
+  prd.bdrcSegment = 0;
 
   prd.idxStack = 0;
   prd.stack[0].absorption_ior = make_float4(0.0f, 0.0f, 0.0f, 1.0f);
@@ -776,7 +777,7 @@ __forceinline__ __device__ void bdrcPhotonIntegrator(PerRayData& prd, const unsi
 
     prd.wo       = -prd.wi;
     prd.distance = RT_DEFAULT_MAX;
-    prd.flags    = 0;
+    prd.flags    = FLAG_BDRC_PHOTON;
 
     optixTrace(theLaunchParameters.handle,
                prd.pos, prd.wi,
@@ -935,9 +936,10 @@ __forceinline__ __device__ void bdrcGatherIntegrator(PerRayData& prd, const unsi
   prd.stack[0].absorption_ior = make_float4(0.0f, 0.0f, 0.0f, 1.0f);
   prd.occlusion = 1.0f;
   prd.sigma_t   = make_float3(0.0f);
-  prd.typeEvent = BSDF_EVENT_ABSORB;
-  prd.flags     = 0;
-  prd.throughput = make_float3(1.0f);
+  prd.typeEvent   = BSDF_EVENT_ABSORB;
+  prd.flags       = FLAG_BDRC_GATHER;
+  prd.bdrcSegment = 0;
+  prd.throughput  = make_float3(1.0f);
 
   const float3 origin = anchorPos + oriented * theLaunchParameters.sceneEpsilon;
 
@@ -964,9 +966,10 @@ __forceinline__ __device__ void bdrcGatherIntegrator(PerRayData& prd, const unsi
     {
       const float epsilon = (prd.flags & FLAG_HIT) ? theLaunchParameters.sceneEpsilon : 0.0f;
 
-      prd.wo       = -prd.wi;
-      prd.distance = RT_DEFAULT_MAX;
-      prd.flags    = 0;
+      prd.wo          = -prd.wi;
+      prd.distance    = RT_DEFAULT_MAX;
+      prd.flags       = FLAG_BDRC_GATHER;
+      prd.bdrcSegment = depth + 1;   // 1 on the first segment
 
       optixTrace(theLaunchParameters.handle,
                  prd.pos, prd.wi,
@@ -977,7 +980,7 @@ __forceinline__ __device__ void bdrcGatherIntegrator(PerRayData& prd, const unsi
                  payload.x, payload.y);
 
       if (!(prd.flags & FLAG_HIT))
-        break;   // the miss program already added the environment with MIS
+        break;   // the miss program added the environment iff this was segment 1
 
       if (prd.typeEvent & BSDF_EVENT_DIFFUSE)
       {
@@ -1035,7 +1038,10 @@ extern "C" __global__ void __raygen__bdrc_gather()
   const unsigned int slot = nrc.photonCount + lane;
 
   PerRayData prd;
-  prd.seed = tea<4>(lane, theLaunchParameters.iteration + 0x9e3779b9u);
+  // Seeded from the persistent training counter, never from `iteration`:
+  // `iteration` resets on every camera move, which would make an orbiting
+  // camera redraw the identical anchor set every frame and overfit one batch.
+  prd.seed = tea<4>(lane, theLaunchParameters.nrc.trainingIteration + 0x9e3779b9u);
 
   bdrcGatherIntegrator(prd, slot);
 }
@@ -1055,8 +1061,16 @@ extern "C" __global__ void __raygen__light_path_tracer()
   PerRayData prd;
 
   // Use a seed offset to decorrelate light paths from eye paths.
+  // BDRC photons seed from the persistent training counter (see the gather
+  // raygen); the BDPT light path keeps the per-frame `iteration` because it
+  // contributes to the progressively-averaged image, not to a fit.
+  const unsigned int lightSeedBase =
+      (theLaunchParameters.nrc.nrcType == BDRC && theLaunchParameters.nrc.enabled)
+      ? theLaunchParameters.nrc.trainingIteration
+      : theLaunchParameters.iteration;
+
   prd.seed = tea<4>(theLaunchParameters.resolution.x * theLaunchIndex.y + theLaunchIndex.x,
-                    theLaunchParameters.iteration + 0x12345678u);
+                    lightSeedBase + 0x12345678u);
 
   if (theLaunchParameters.nrc.nrcType == BDRC)
   {

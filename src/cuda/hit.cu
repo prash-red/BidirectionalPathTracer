@@ -1542,6 +1542,20 @@ __forceinline__ __device__ void chRadiance()
   // (I disagree with the KHR_materials_clearcoat extension.)
   //
 
+  // Which paths may collect emission here.
+  //
+  // A photon carries power, not radiance. A gather segment collects emission
+  // only on its first segment, the MIS partner of the anchor's own light
+  // sample; emission met deeper in the chain belongs to C(x), which the photon
+  // stream owns. The camera path collects it everywhere, including at D, where
+  // L_e(D) is legitimately part of the pixel and is not in the field (the field
+  // stores INCIDENT flux, and emission is not incident).
+  const bool bdrcPhotonPath = (thePrd->flags & FLAG_BDRC_PHOTON) != 0;
+  const bool bdrcGatherPath = (thePrd->flags & FLAG_BDRC_GATHER) != 0;
+  const bool bdrcCollectEmission =
+      !bdrcPhotonPath && (!bdrcGatherPath || thePrd->bdrcSegment == 1);
+
+  if (bdrcCollectEmission)
   {
     // Basic Implementation of area mesh lights
     if (thePrd->pdf > 0.0f
@@ -1839,6 +1853,27 @@ __forceinline__ __device__ void chRadiance()
 
   // Skip NEE for light paths; their contributions are atomically scattered to bufferAccumLightPath inside the block above.
   if (thePrd->flags & FLAG_LIGHT_PATH)
+  {
+    return;
+  }
+
+  // Next-event estimation is suppressed on every path that would double-count
+  // a family another stream already owns:
+  //
+  //  - photon: it carries power, not radiance.
+  //  - gather: emitter sampling anywhere along the chain re-collects
+  //    L -> S+ -> anchor, which the photon stream owns as C(x). The anchor's own
+  //    direct term is estimated exactly once, in the raygen, with a unit BSDF.
+  //  - camera at its first diffuse vertex D: the pixel reads
+  //    prefix + T * f_s(D) * U(D), and U(D) already contains E_dir(D) by
+  //    construction of the gather target (T(x) = E_dir(x) + ...). Taking NEE
+  //    here as well would render every directly lit surface twice as bright.
+  if (bdrcPhotonPath || bdrcGatherPath)
+  {
+    return;
+  }
+  if (theLaunchParameters.nrc.enabled && theLaunchParameters.nrc.nrcType == BDRC &&
+      (state.typeEvent & BSDF_EVENT_DIFFUSE))
   {
     return;
   }

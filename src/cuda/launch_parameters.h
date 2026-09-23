@@ -100,6 +100,15 @@ struct NrcLaunchBuffers
   // while its launch still stands in the normalizer — each stream is normalized
   // by its own draw count, not by the live count of valid samples, so a frame
   // with fewer valid samples must not renormalize its gradient up.
+  // Persistent training-frame counter. NEVER reset on camera move, unlike
+  // LaunchParameters::iteration (which resets for the progressive-accumulation
+  // blend). The training streams seed their RNG from this: seeding from
+  // `iteration` made every frame of a camera orbit draw the SAME anchors and
+  // the SAME emitter samples, so the fit took hundreds of gradient steps on one
+  // frozen batch and overfit it. Moving the camera must change rays and film
+  // accumulation only.
+  unsigned int trainingIteration;
+
   unsigned int photonCount;   // == numPixels: the photon raygen launches at render resolution
   unsigned int gatherCount;   // its own launch dimension, independent of resolution and framing
 

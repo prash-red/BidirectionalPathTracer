@@ -313,6 +313,7 @@ private:
   void updateVariant();
   void updateSBTMaterialData();
 
+  void stampBdrcReferenceOrigin();
   void initLaunchParameters();
   void updateLaunchParameters();
 
@@ -695,7 +696,8 @@ private:
   int          m_bdrcLrAnnealIters = 10000;
 
   DreConfig    m_bdrcDre;                    // generator, alpha, beta, power
-  float3       m_bdrcReferenceOrigin = {};   // stamped once in initBDRC; never follows the camera
+  float3       m_bdrcReferenceOrigin = {};   // stamped once from the scene AABB; never follows the camera
+  bool         m_bdrcReferenceOriginStamped = false;
 
   float        m_bdrcLastLoss    = 0.0f;
   uint32_t     m_bdrcPhotonLive  = 0u;

@@ -89,7 +89,9 @@ public:
 
     void optimizerStep(cudaStream_t stream);
 
-    // Analytic fixed-point check, run once at construction.
+    // Analytic fixed-point check. Not run automatically — it takes thousands of
+    // optimizer steps. unifiedSelfTestAll() drives it, and initBDRC() calls that
+    // only when GLTF_BDRC_SELFTEST=1 is set in the environment.
     //
     // Both streams are placed at one input point. Photons carry weight 2 with
     // scalePos = 1/N; gathers carry weight 3 with scalePos = scaleRef = 1/N.

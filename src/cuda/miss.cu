@@ -109,6 +109,15 @@ extern "C" __global__ void __miss__env_constant()
     emission *= weightMIS;
   }
   // Potential ambient occlusion is only applied for environment lights.
+  // Same rule as the emission block in hit.cu: a photon carries power, not
+  // radiance, and a gather segment collects the environment only on its first
+  // segment, as the MIS partner of the anchor's own light sample.
+  const bool bdrcCollectEnv =
+      !(thePrd->flags & FLAG_BDRC_PHOTON) &&
+      (!(thePrd->flags & FLAG_BDRC_GATHER) || thePrd->bdrcSegment == 1);
+  if (!bdrcCollectEnv)
+    return;
+
   thePrd->radiance += thePrd->throughput * emission * thePrd->occlusion;
   thePrd->typeEvent = BSDF_EVENT_ABSORB;
 }
@@ -154,6 +163,15 @@ extern "C" __global__ void __miss__env_sphere()
     }
   }
   // Potential ambient occlusion is only applied for environment lights.
+  // Same rule as the emission block in hit.cu: a photon carries power, not
+  // radiance, and a gather segment collects the environment only on its first
+  // segment, as the MIS partner of the anchor's own light sample.
+  const bool bdrcCollectEnv =
+      !(thePrd->flags & FLAG_BDRC_PHOTON) &&
+      (!(thePrd->flags & FLAG_BDRC_GATHER) || thePrd->bdrcSegment == 1);
+  if (!bdrcCollectEnv)
+    return;
+
   thePrd->radiance += thePrd->throughput * emission * light.emission * thePrd->occlusion;
   thePrd->typeEvent = BSDF_EVENT_ABSORB;
 }

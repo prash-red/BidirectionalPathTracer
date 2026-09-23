@@ -1125,17 +1125,9 @@ void Application::initNRC() {
 
 void Application::initBDRC()
 {
-  // The reference origin is stamped once, here, and never updated. It is NOT
-  // the live viewing camera: a label taken against an interactive camera would
-  // flip for every point the user orbits past, silently relabelling the whole
-  // learned function mid-fit. The scene's bounding-sphere centre is a
-  // deterministic, camera-independent choice.
-  if (m_sceneExtent.isValid())
-  {
-    const glm::vec3 c = m_sceneExtent.getCenter();
-    m_bdrcReferenceOrigin = make_float3(c.x, c.y, c.z);
-  }
-
+  // The reference origin is stamped in updateLaunchParameters(), the first
+  // point at which the scene AABB exists: initBDRC() runs before loadGLTF(), so
+  // m_sceneExtent is still invalid here.
   m_bdrcSystem = bdrcCreate(m_cudaStream, m_bdrcDre);
 
   // BDRC still uses the NRC compact training batch for d_trainCount / d_trainFeatures.
@@ -1157,6 +1149,14 @@ void Application::initBDRC()
   m_launchParameters.nrc.enabled          = 1;
   m_launchParameters.nrc.nrcType          = BDRC;
   m_launchParameters.nrc.referenceOrigin  = m_bdrcReferenceOrigin;
+
+  // Opt-in gate: every generator must reach the same sum-of-streams fixed point.
+  // Thousands of optimizer steps, so it is not on by default.
+  if (const char* env = std::getenv("GLTF_BDRC_SELFTEST"))
+  {
+    if (env[0] == '1')
+      unifiedSelfTestAll(m_cudaStream);
+  }
 }
 
 
@@ -1573,6 +1573,12 @@ bool Application::render()
     //
     if (!m_accumulate)
       m_launchParameters.iteration = 0u;
+
+    // The training streams seed their RNG from this, not from `iteration`, which
+    // resets on every camera move. Seeding from `iteration` made every frame of
+    // a camera orbit draw the SAME anchors and the SAME emitter samples, so the
+    // fit took hundreds of gradient steps on one frozen batch.
+    m_launchParameters.nrc.trainingIteration = m_nrcTrainingIteration;
 
     unsigned int iteration = m_launchParameters.iteration;
 
@@ -4603,6 +4609,25 @@ void Application::initSurfaceReferenceTable()
       if (hostPrim.indices.count == 0)
         continue;
 
+      // The cache lives on diffuse lobes only. A glossy-only or delta surface
+      // is a transport vertex: every walk samples through it, and it takes no
+      // deposit, gather start, reference mass or query. Leaving glass and metal
+      // in this table put gather anchors on them, where the unit-BSDF direct
+      // estimate is meaningless and the cosine hemisphere ignores the real
+      // BSDF entirely — and because the hash grid interpolates spatially, that
+      // bled into the genuine floor queries underneath, which is exactly where
+      // the caustic has to be read.
+      //
+      // A glTF metallic-roughness material has a diffuse lobe unless it is
+      // fully metallic or fully transmissive.
+      if (hostPrim.indexMaterial >= 0 &&
+          static_cast<size_t>(hostPrim.indexMaterial) < m_materials.size())
+      {
+        const MaterialData& mat = m_materials[hostPrim.indexMaterial];
+        if (mat.metallicFactor >= 0.99f || mat.transmissionFactor >= 0.99f)
+          continue;
+      }
+
       const unsigned int* indexData    = reinterpret_cast<const unsigned int*>(hostPrim.indices.h_ptr);
       const float3*       posData      = reinterpret_cast<const float3*>(hostPrim.positions.h_ptr);
       const size_t        numTriangles = hostPrim.indices.count / 3;
@@ -7274,6 +7299,34 @@ LightDefinition Application::createPointLight() const
   return light;
 }
 
+// Stamp the unified field's fixed reference origin, once, the first time the
+// scene AABB is known.
+//
+// It is NOT the live viewing camera: this renderer's camera is interactive, and
+// a label taken against it would flip for every point the user orbits past,
+// silently relabelling the whole learned function mid-fit. The scene
+// bounding-sphere centre is deterministic and camera-independent.
+//
+// Called from BOTH initLaunchParameters() (first load) and
+// updateLaunchParameters() (drag-and-drop, AS rebuild), because only one of
+// those runs on any given path.
+void Application::stampBdrcReferenceOrigin()
+{
+  if (m_nrc != 2 || m_bdrcReferenceOriginStamped || !m_sceneExtent.isValid())
+  {
+    return;
+  }
+
+  const glm::vec3 center = m_sceneExtent.getCenter();
+  m_bdrcReferenceOrigin        = make_float3(center.x, center.y, center.z);
+  m_bdrcReferenceOriginStamped = true;
+  m_launchParameters.nrc.referenceOrigin = m_bdrcReferenceOrigin;
+
+  std::cout << "BDRC reference origin stamped at (" << center.x << ", "
+            << center.y << ", " << center.z << ")\n";
+}
+
+
 void Application::initLaunchParameters()
 {
   CUDA_CHECK( cudaMalloc(reinterpret_cast<void**>(&m_d_launchParameters), sizeof(LaunchParameters)) );
@@ -7318,6 +7371,8 @@ void Application::initLaunchParameters()
     m_launchParameters.nrc.aabbMax = make_float3(mx.x, mx.y, mx.z);
   }
 
+  stampBdrcReferenceOrigin();
+
   // All dirty flags are set here and the first render() call will take care to allocate and update all necessary resources.
 }
 
@@ -7341,6 +7396,8 @@ void Application::updateLaunchParameters()
     const glm::vec3 center = m_sceneExtent.getCenter();
     m_launchParameters.sceneSphereCenter = make_float3(center.x, center.y, center.z);
     m_launchParameters.sceneSphereRadius = m_sceneExtent.getDiameter() * 0.5f;
+
+    stampBdrcReferenceOrigin();
 
     // Update NRC AABB for world-space position normalization in feature packing.
     if (m_nrc > 0)

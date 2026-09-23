@@ -24,9 +24,11 @@
 struct BdrcSystem; // opaque, defined in bdrc_host.cu
 
 // Analytic fixed-point check of the unified field's weighted density-ratio
-// objective, over every generator and two conditioning regimes. Lives here
-// rather than in unified_ngp_cache.h so a plain C++ translation unit can call
-// it without pulling tiny-cuda-nn's device headers into a host compile.
+// objective, over every generator and two conditioning regimes. Takes thousands
+// of optimizer steps, so initBDRC() runs it only when GLTF_BDRC_SELFTEST=1 is
+// set in the environment. Lives here rather than in unified_ngp_cache.h so a
+// plain C++ translation unit can call it without pulling tiny-cuda-nn's device
+// headers into a host compile.
 bool unifiedSelfTestAll(cudaStream_t stream);
 
 // ---- Lifecycle --------------------------------------------------------------

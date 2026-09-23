@@ -66,6 +66,19 @@ enum BsdfEventType
 #define FLAG_SHADOW        0x00000002
 // Set when this PerRayData belongs to a light path (BDPT).
 #define FLAG_LIGHT_PATH    0x00000004
+// Set on the unified cache's two TRAINING paths. Both carry supervision, not
+// image radiance, and both must stay out of the families the other stream owns.
+//
+// A photon carries power, not radiance: emitter sampling and emission at a
+// photon vertex are not its to collect.
+#define FLAG_BDRC_PHOTON   0x00000008
+// A gather segment collects emission only on its FIRST segment, as the
+// MIS partner of the anchor's own unit-BSDF light sample, and never takes
+// emitter sampling at all. Emission and direct light met deeper in the chain
+// are the family L -> S+ -> anchor, which the photon stream already owns as
+// C(x); collecting them here too would put the same transport in both streams
+// and destroy the disjointness the sum rests on.
+#define FLAG_BDRC_GATHER   0x00000010
 // Set if the material stack is not empty.
 // This is implicit with the idxStack value.
 //#define FLAG_VOLUME                 0x00000010 
@@ -163,6 +176,10 @@ struct PerRayData
   // apart.
   float3 bdrcNg;
   bool   bdrcFrontFace;
+
+  // 1-based segment index along a gather continuation. Only segment 1 may
+  // collect emission; see FLAG_BDRC_GATHER.
+  int    bdrcSegment;
 };
 
 
