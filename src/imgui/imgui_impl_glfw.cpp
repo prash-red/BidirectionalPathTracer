@@ -757,8 +757,15 @@ static void ImGui_ImplGlfw_UpdateMouseData()
         // FIXME: This is currently only correct on Win32. See what we do below with the WM_NCHITTEST, missing an equivalent for other systems.
         // See https://github.com/glfw/glfw/issues/1236 if you want to help in making this a GLFW feature.
 #if GLFW_HAS_MOUSE_PASSTHROUGH
-        const bool window_no_input = (viewport->Flags & ImGuiViewportFlags_NoInputs) != 0;
-        glfwSetWindowAttrib(window, GLFW_MOUSE_PASSTHROUGH, window_no_input);
+        // The header can be newer than the library actually loaded (e.g. the
+        // OptiX SDK's GLFW 3.4 header with a system GLFW 3.3): 3.3 rejects this
+        // attribute with an error on every frame, so check the runtime version.
+        static const bool runtimeHasPassthrough = [] { int major = 0, minor = 0, rev = 0; glfwGetVersion(&major, &minor, &rev); return major * 1000 + minor * 100 >= 3400; }();
+        if (runtimeHasPassthrough)
+        {
+            const bool window_no_input = (viewport->Flags & ImGuiViewportFlags_NoInputs) != 0;
+            glfwSetWindowAttrib(window, GLFW_MOUSE_PASSTHROUGH, window_no_input);
+        }
 #endif
 #if GLFW_HAS_MOUSE_PASSTHROUGH || GLFW_HAS_WINDOW_HOVERED
         if (glfwGetWindowAttrib(window, GLFW_HOVERED))
