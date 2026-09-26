@@ -337,7 +337,7 @@ Source of truth for the design: `docs/superpowers/specs/2026-09-22-unified-singl
 | Property | Value |
 |---|---|
 | Input | 5 dims: `[0..2]` world position normalized into the scene AABB (hash grid), `[3]` `sign_cam`, `[4]` arrival side (both Identity) |
-| Encoding | tcnn `Composite`/`Concatenation`: nested `HashGrid` (8 levels x 2 features, 16..~273, log2 hashmap 20) + nested `Identity` for the two labels |
+| Encoding | tcnn `Composite`/`Concatenation`: nested `HashGrid` (12 levels x 2 features, 16..1384 at per-level scale 1.5, log2 hashmap 22; finest cell ~2.9 mm on a 4 m scene) + nested `Identity` for the two labels |
 | MLP | FullyFusedMLP, 2 x 64, LeakyReLU hidden, **no output activation** |
 | Output | 3 channels; softplus is applied by `unified_ngp_cache::query()` and differentiated analytically by the loss kernel |
 | Optimizer | Adam, lr 5e-3, gradClip 0.05, gradScaler on with growth, weightClip 1.0 |

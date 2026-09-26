@@ -29,8 +29,23 @@ ngp_config makeUnifiedConfig()
     cfg.inputDim  = UNIFIED_INPUT_DIM;
     cfg.labelDims = UNIFIED_LABEL_DIMS;
 
-    // Hash grid: 8 levels x 2 features from 16 to ~273, matching the demo's
-    // validated field. per_level_scale = exp((ln 273 - ln 16) / 7) ~= 1.5.
+    // Hash grid: 12 levels x 2 features from 16 to 1384 at the demo's validated
+    // per-level scale of 1.5. The finest cell is 2.9 mm across a 4 m scene.
+    //
+    // The demo's 8 levels (16..274) left the finest cell at 14.7 mm, too coarse
+    // for a sharp caustic: its peak levelled off near 62 on
+    // cornell_caustic_glass_sphere.glb, while this grid reached 74 by frame
+    // 2400 and was still rising, with the same field mean. The original 2^20
+    // table was only ~23% occupied at its finest level, so the old grid was
+    // limited by resolution, not by hash capacity.
+    //
+    // The table grows to 2^22 with the extra levels to keep the finest level's
+    // surface occupancy near 1.5x; at 2^20, 12 levels would reach ~6x and the
+    // extra resolution would go to hash collisions. Cost measured on an
+    // RTX 4050 Laptop: peak GPU memory 858 -> 1858 MiB, ~40% lower frame rate.
+    //
+    // Changing any of these changes the parameter count, so previously saved
+    // weights (bdrc_field.bin) no longer load.
     cfg.nLevels           = 8;
     cfg.nFeaturesPerLevel = 2;
     cfg.baseResolution    = 16;
@@ -50,7 +65,7 @@ ngp_config makeUnifiedConfig()
     // class always constructs one, so name a valid member.
     cfg.loss = "L2";
 
-    cfg.lr       = 0.005f;
+    cfg.lr       = 0.05f;
     cfg.gradClip = 0.05f;
 
     // Half-precision guards, carried over unchanged from the mask cache, which
