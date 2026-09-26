@@ -367,7 +367,7 @@ density.
 | Stream | Raygen | Lanes | Records |
 |---|---|---|---|
 | Camera | `__raygen__path_tracer` (BDRC branch of `integrator()`) | `numPixels` | `camQuery`, `camPrefix`, `camFactor = T(cam->D) * f_s(D)`, `camValid` |
-| Photon | `__raygen__light_path_tracer` -> `bdrcPhotonIntegrator` | `numPixels` | `recQuery`, `recBase` = raw clamped power, `recDensity` |
+| Photon | `__raygen__light_path_tracer` -> `bdrcPhotonIntegrator` | `m_bdrcPhotonCount` (default 262144), 1-D launch | `recQuery`, `recBase` = raw clamped power, `recDensity` |
 | Gather | `__raygen__bdrc_gather` (own SBT `m_sbtGather`) | `m_bdrcGatherCount`, its own launch dimension | `recQuery` (anchor), `recBase` = E_dir + chain radiance, `recTailQuery`, `recFactor`, `recTailValid` |
 
 **Camera** traces the prefix with ordinary NEE and MIS, stops at the first

@@ -109,7 +109,7 @@ struct NrcLaunchBuffers
   // accumulation only.
   unsigned int trainingIteration;
 
-  unsigned int photonCount;   // == numPixels: the photon raygen launches at render resolution
+  unsigned int photonCount;   // its own launch dimension, independent of resolution (like gatherCount)
   unsigned int gatherCount;   // its own launch dimension, independent of resolution and framing
 
   float*       recQuery;      // [5 x lanes]  start/deposit query (position + 2 labels)

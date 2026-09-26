@@ -280,8 +280,16 @@ float unified_ngp_cache::dreAccumGrad(
 
     auto ctx = m_network->forward(stream, input, &networkOut, false, false);
 
+    // gradScale carries the loss scale and nothing else. It must NOT divide by
+    // padded_output_width: tcnn's own losses divide the padding back out
+    // (l2.h: n_total = n_elements / stride * dims), so backward() has no such
+    // expectation, and the normalization this objective wants — sum over the
+    // three channels, each stream divided by its own draw count — is already
+    // applied by the per-lane scalePos/scaleRef coefficients. The extra 1/16
+    // came from mask_ngp_cache's lossScale/(paddedWidth * normBatch), where it
+    // rode along with a batch divisor that those coefficients now replace.
     const float lossScale = m_gradScaler.currentScale();
-    const float gradScale = lossScale / static_cast<float>(paddedWidth);
+    const float gradScale = lossScale;
 
     const uint32_t blocks = (batchSize + tcnn::N_THREADS_LINEAR - 1u) / tcnn::N_THREADS_LINEAR;
     k_unified_dre_grad<<<blocks, tcnn::N_THREADS_LINEAR, 0, stream>>>(

@@ -1407,11 +1407,13 @@ void Application::updateBuffers()
 
   if (m_nrc == 2 && m_bdrcSystem)
   {
-    bdrcAllocBuffers(m_bdrcSystem, numPixels, static_cast<uint32_t>(m_bdrcGatherCount));
+    bdrcAllocBuffers(m_bdrcSystem, numPixels,
+                     static_cast<uint32_t>(m_bdrcPhotonCount),
+                     static_cast<uint32_t>(m_bdrcGatherCount));
 
     NrcLaunchBuffers& b = m_launchParameters.nrc;
 
-    b.photonCount  = numPixels;
+    b.photonCount  = static_cast<uint32_t>(m_bdrcPhotonCount);
     b.gatherCount  = static_cast<uint32_t>(m_bdrcGatherCount);
 
     b.recQuery     = bdrcRecQuery(m_bdrcSystem);
@@ -2366,6 +2368,11 @@ void Application::guiWindow()
       bdrcSetDreConfig(m_bdrcSystem, m_bdrcDre);
     }
 
+    if (ImGui::SliderInt("Photon lanes", &m_bdrcPhotonCount, 0, 1 << 21))
+      m_isDirtyResolution = true;   // reallocates the records array
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("Photon paths per frame (caustic stream). Only ~5%% deposit, but\n"
+                        "every lane is normalized by this count. 0 disables caustics.");
     if (ImGui::SliderInt("Gather lanes", &m_bdrcGatherCount, 0, 1 << 20))
       m_isDirtyResolution = true;   // reallocates the records array
     ImGui::SliderFloat("Photon clamp", &m_bdrcPhotonClamp, 1.0f, 1.0e6f,

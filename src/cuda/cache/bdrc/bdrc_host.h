@@ -36,9 +36,11 @@ bool unifiedSelfTestAll(cudaStream_t stream);
 BdrcSystem* bdrcCreate(cudaStream_t stream, const DreConfig& dre);
 void        bdrcDestroy(BdrcSystem* sys);
 
-// numPixels sizes the camera and photon lanes; gatherCount sizes the gather
-// lanes and is independent of the render resolution.
-void bdrcAllocBuffers(BdrcSystem* sys, uint32_t numPixels, uint32_t gatherCount);
+// numPixels sizes the camera stream only. photonCount and gatherCount size the
+// two training streams and are independent of the render resolution, so the
+// fit does not change when the window does.
+void bdrcAllocBuffers(BdrcSystem* sys, uint32_t numPixels,
+                      uint32_t photonCount, uint32_t gatherCount);
 
 // ---- Training records -------------------------------------------------------
 // Lanes [0, photonCount) are photons, [photonCount, lanes) are gathers.

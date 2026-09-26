@@ -1074,7 +1074,13 @@ extern "C" __global__ void __raygen__light_path_tracer()
 
   if (theLaunchParameters.nrc.nrcType == BDRC)
   {
-    const unsigned int lane = theLaunchParameters.resolution.x * theLaunchIndex.y + theLaunchIndex.x;
+    // BDRC launches this raygen 1-D at photonCount lanes, independent of the
+    // render resolution (see Application::render). A 2-D launch at the window
+    // size would tie the photon budget, and with it the caustic noise, to the
+    // window. BDPT mode still launches 2-D and takes the branch below.
+    const unsigned int lane = theLaunchIndex.x;
+    if (lane >= theLaunchParameters.nrc.photonCount)
+      return;
     bdrcPhotonIntegrator(prd, lane);
   }
   else

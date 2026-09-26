@@ -245,14 +245,15 @@ void bdrcDestroy(BdrcSystem* sys)
     delete sys;
 }
 
-void bdrcAllocBuffers(BdrcSystem* sys, uint32_t numPixels, uint32_t gatherCount)
+void bdrcAllocBuffers(BdrcSystem* sys, uint32_t numPixels,
+                      uint32_t photonCount, uint32_t gatherCount)
 {
     sys->freeAllBuffers();
 
     sys->numPixels   = numPixels;
-    sys->photonCount = numPixels;                   // the photon raygen launches at resolution
+    sys->photonCount = photonCount;
     sys->gatherCount = gatherCount;
-    sys->lanes       = padTo(numPixels + gatherCount, BDRC_GRAN);
+    sys->lanes       = padTo(photonCount + gatherCount, BDRC_GRAN);
     sys->camLanes    = padTo(numPixels, BDRC_GRAN);
 
     const uint32_t L = sys->lanes;
