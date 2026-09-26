@@ -423,6 +423,11 @@ Application::~Application()
 {
   try
   {
+    if (m_cameraRecording)
+    {
+      cameraRecordStop(); // Closing the window ends a recording; keep what was flown.
+    }
+
     cleanup();
 
     delete m_allocator; // This frees all CUDA allocations done with the arena allocator!
@@ -1495,10 +1500,14 @@ bool Application::render()
     m_isDirtyLights = false;
   }
 
+  updateCameraPath(); // A replayed pose marks the camera dirty, like a mouse move.
+
   if (m_cameras[m_indexCamera].getIsDirty() || m_isDirtyResolution)
   {
     updateCamera();
   }
+
+  recordCameraPose(); // The pose this frame renders with.
 
   if (m_isDirtyResolution)
   {
@@ -2566,6 +2575,57 @@ void Application::guiWindow()
     }
   }
 
+  if (ImGui::CollapsingHeader("Camera Path"))
+  {
+    ImGui::InputText("File", m_cameraPathFile, sizeof(m_cameraPathFile));
+
+    if (m_cameraRecording)
+    {
+      if (ImGui::Button("Stop recording (R)"))
+      {
+        cameraRecordStop();
+      }
+      ImGui::SameLine();
+      ImGui::Text("%zu poses, %.1f s", m_cameraPath.size(), m_cameraPath.duration());
+    }
+    else if (m_cameraPlaying)
+    {
+      if (ImGui::Button("Stop replay"))
+      {
+        cameraPlayStop();
+      }
+      ImGui::SameLine();
+      ImGui::Text("%.1f / %.1f s", std::max(0.0f, cameraPathSeconds() - m_cameraPlayDelay), m_cameraPath.duration());
+    }
+    else
+    {
+      if (ImGui::Button("Record (R)"))
+      {
+        cameraRecordStart();
+      }
+      ImGui::SameLine();
+      if (ImGui::Button("Replay"))
+      {
+        cameraPlayStart(m_cameraPathFile, false);
+      }
+      ImGui::SameLine();
+      if (ImGui::Button("Orbit"))
+      {
+        cameraPlayProcedural(CAMERA_MOTION_ORBIT, false);
+      }
+      ImGui::SameLine();
+      if (ImGui::Button("Circle"))
+      {
+        cameraPlayProcedural(CAMERA_MOTION_CIRCLE, false);
+      }
+    }
+    ImGui::DragFloat("Motion duration [s]", &m_cameraMotionSeconds, 0.1f, 0.5f, 600.0f, "%.1f");
+    ImGui::DragFloat("Orbit angle [deg]", &m_cameraOrbitDegrees, 1.0f, -3600.0f, 3600.0f, "%.0f");
+    ImGui::DragFloat("Circle radius [x distance]", &m_cameraCircleRadius, 0.005f, 0.001f, 2.0f, "%.3f");
+    ImGui::DragFloat("Hold first pose [s]", &m_cameraPlayDelay, 0.1f, 0.0f, 600.0f, "%.1f");
+    ImGui::Checkbox("Loop replay", &m_cameraPlayLoop);
+  }
+
   if (ImGui::CollapsingHeader("Camera"))
   {
     dev::Camera& guiCam = m_cameras[m_indexCamera];
@@ -3403,6 +3463,21 @@ void Application::guiEventHandler()
   {
     MY_VERIFY(screenshot(false));
   }
+  if (ImGui::IsKeyPressed(ImGuiKey_R, false) && !io.WantTextInput) // Key R: start/stop recording the camera path.
+  {
+    if (m_cameraRecording)
+      cameraRecordStop();
+    else
+      cameraRecordStart();
+  }
+
+  // A replay owns the camera. Any input here would be overwritten next frame at
+  // best, and at worst leave the trackball out of sync with the replayed pose.
+  if (m_cameraPlaying)
+  {
+    return;
+  }
+
   if (ImGui::IsKeyPressed(ImGuiKey_W)) // Key W: Camera moves Fwd
   {
     cameraTranslate(0.0f, 0.0f, 1.0f);

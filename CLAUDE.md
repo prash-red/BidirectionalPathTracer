@@ -81,6 +81,7 @@ BidirectionalPathTracer/
 │   ├── Animation.cpp/.h        # glTF animation system
 │   ├── Arena.cpp/.h            # GPU memory arena allocator (cuda::ArenaAllocator)
 │   ├── Camera.cpp/.h           # Camera types (perspective, orthographic)
+│   ├── CameraPath.cpp/.h       # Camera path recording + wall-clock replay
 │   ├── CheckMacros.h           # CUDA/OptiX error-checking macros
 │   ├── ConversionArguments.h   # Helper for attribute conversion
 │   ├── DeviceBuffer.h          # RAII wrapper for GPU buffer allocations

@@ -281,6 +281,7 @@ set(HEADERS_HOST
   src/Application.h
   src/Arena.h
   src/Camera.h
+  src/CameraPath.h
   src/CheckMacros.h
   src/ConversionArguments.h
   src/DeviceBuffer.h
@@ -309,6 +310,7 @@ set(SOURCES_HOST
   src/Application.cpp
   src/Arena.cpp
   src/Camera.cpp
+  src/CameraPath.cpp
   src/main.cpp
   src/Mesh.cpp
   src/Options.cpp

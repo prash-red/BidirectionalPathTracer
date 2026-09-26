@@ -30,6 +30,7 @@
 #include "Options.h"
 #include <GLFW/glfw3.h> // dpi 
 
+#include <algorithm>
 #include <iostream>
 
 static int toInt(float x)
@@ -350,6 +351,7 @@ void Options::printUsage(std::string const& argv0)
     "  SPACE       Toggle GUI display.\n"
     "  P           Save image as tonemapped *.png.\n"
     "  H           Save image as linear *.hdr.\n"
+    "  R           Start/stop recording the camera path.\n"
     "  LMB         Orbit\n"
     "  MMB         Pan\n"
     "  RMB         Dolly\n"

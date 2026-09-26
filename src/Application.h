@@ -98,6 +98,7 @@
 
 #include "Animation.h"
 #include "Camera.h"
+#include "CameraPath.h"
 #include "Light.h"
 #include "Mesh.h"
 #include "Node.h"
