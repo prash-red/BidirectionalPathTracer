@@ -171,7 +171,7 @@ The `Application` class is the central orchestrator. Key responsibilities:
 **Per-frame loop** (`main.cpp`):
 ```
 render()          -> optixLaunch() eye + light paths (async)
-bdrcDispatch()    -> compaction, inference, training (BDRC mode)
+bdrcTrainStep() x K, bdrcRender() -> training, inference, composite (BDRC mode)
 nrcDispatch()     -> inference + training (NRC mode)
 update()          -> CUDA-GL interop copy to display texture
 guiWindow()       -> all GUI panels including cache debug views
@@ -183,13 +183,15 @@ display()         -> OpenGL fullscreen quad
 NrcSystem*   m_nrcSystem    = nullptr;
 BdrcSystem*  m_bdrcSystem   = nullptr;
 int          m_nrc          = 0;     // 0=off, 1=NRC, 2=BDRC
+int          m_bdrcPhotonCount   = 262144; // photon lanes/frame, independent of resolution
 int          m_bdrcGatherCount   = 65536; // gather lanes/frame, independent of resolution
 float        m_bdrcPhotonClamp   = 10000.0f;
 DreConfig    m_bdrcDre;                    // generator, alpha, beta, power
 float3       m_bdrcReferenceOrigin = {};   // stamped once; never follows the camera
 int          m_bdrcDebugMode = 0;    // 0=normal, 1=cache contribution, 2=raw field
 bool         m_bdrcFreezeTraining = false; // no warmup: the fit runs from frame 0
-uint32_t     m_nrcTrainingIteration = 0;   // Total training frames, never reset
+uint32_t     m_nrcTrainingIteration = 0;   // NRC: training frames; BDRC: optimizer steps. Never reset
+int          m_bdrcStepsPerFrame = 1;      // optimizer steps per frame, each on a fresh batch
 ```
 
 ### Acceleration Structure Pipeline
@@ -434,17 +436,26 @@ Because `dL/dOutput` is per-sample, photon lanes and gather lanes never alias:
 both streams reach **one** `backward` and **one** optimizer step, with no
 `Overwrite`/`Accumulate` sequencing.
 
-### Per-frame dispatch (`bdrcDispatch`)
+### Per-frame dispatch (`bdrcTrainStep` x K, then `bdrcRender`)
 
 ```
 optixLaunch  eye paths      -> camera records
-optixLaunch  photon paths   -> photon records      (m_cudaStreamLight)
-optixLaunch  gather paths   -> gather records      (m_cudaStreamLight, gatherCount lanes)
-EMA inference over recTailQuery
-k_bdrc_assemble_targets     -> per-lane (RGB weight, p_r, 1/N_pos, 1/N_ref)
-dreAccumGrad                -> one optimizer step -> EMA update
-EMA inference over camQuery -> composite: camPrefix + camFactor * U
+repeat K = "Train steps / frame" times (1 while frozen):
+  optixLaunch  photon paths -> photon records      (m_cudaStreamLight)
+  optixLaunch  gather paths -> gather records      (m_cudaStreamLight, gatherCount lanes)
+  bdrcTrainStep: EMA inference over recTailQuery
+                 k_bdrc_assemble_targets -> per-lane (RGB weight, p_r, 1/N_pos, 1/N_ref)
+                 dreAccumGrad -> one optimizer step -> EMA update
+                 clear records, then synchronize (the next batch writes them on the other stream)
+bdrcRender:    EMA inference over camQuery -> composite: camPrefix + camFactor * U
 ```
+
+Every step draws a **fresh** batch: the photon and gather raygens seed from
+`nrc.trainingIteration`, which counts optimizer steps (`m_nrcTrainingIteration`
+in BDRC mode) and so advances per step; reusing one batch K times would fit one
+frame's noise K times. The LR schedule also counts steps. The GUI's "Learning
+rate" slider sets the base rate the schedule multiplies (`bdrcSetLearningRate`),
+effective from the next step with the Adam state kept.
 
 There is no two-phase warmup: the single fit runs from frame 0.
 
@@ -506,7 +517,9 @@ the gather stream shoots shadow and continuation rays from these anchors.
 
 ### Diagnostics
 
-`bdrcDispatch` prints every 100 frames and the GUI mirrors it:
+In **Debug builds only** (`!defined(NDEBUG)`) the dispatch prints every 100
+optimizer steps (not frames: the film iteration restarts on every camera move or
+animated frame). The GUI shows the same values in every build:
 
 ```
 [bdrc] iter=N loss=L photonLive=a/b gatherLive=c/d p_r=P field(mean=M max=X nonzero=n/m)

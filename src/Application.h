@@ -715,17 +715,51 @@ private:
   int          m_nrcLossHistoryIdx  = 0;
 
   BdrcSystem*  m_bdrcSystem    = nullptr;
+
+  // SPPM reference renderer (m_nrc == 3).
+  SppmSystem*  m_sppmSystem    = nullptr;
+  SppmConfig   m_sppmConfig;
+  char         m_sppmSavePath[512] = "sppm_reference.pfm";
+
+  // Batch output for every mode: after this many frames, write the linear image
+  // to m_saveAfterPath and close the window. 0 = off.
+  int          m_saveAfterFrames = 0;
+  std::string  m_saveAfterPath;
+  uint32_t     m_frameCounter    = 0u;
+  bool         m_saveAfterDone   = false;
+
+  // Camera path. Poses are recorded and replayed against wall-clock time, so
+  // every render mode sees the same camera at the same second whatever its
+  // frame rate, and screen recordings of different modes line up.
+  dev::CameraPath m_cameraPath;
+  char         m_cameraPathFile[512] = "camera_path.txt"; // GUI record/play file.
+  bool         m_cameraRecording   = false;
+  bool         m_cameraPlaying     = false;
+  bool         m_cameraPlayExit    = false; // Close the window at the end (-play-camera).
+  bool         m_cameraPlayLoop    = false;
+  float        m_cameraPlayDelay   = 0.0f;  // Seconds the first pose is held.
+  float        m_cameraMotionSeconds = 10.0f;  // Duration of a generated orbit/circle.
+  float        m_cameraOrbitDegrees  = 360.0f;
+  float        m_cameraCircleRadius  = 0.1f;   // x the distance to the look-at point.
+  bool         m_cameraClockPending = false; // Clock starts on the first frame, after init.
+  std::chrono::steady_clock::time_point m_cameraClockStart;
   CUstream     m_cudaStreamLight = nullptr;  // Second stream for parallel light-path launch
   uint32_t     m_nrcTrainingIteration = 0u;  // Total training frames — never reset on camera move
   int          m_bdrcDebugMode = 0;          // 0=normal, 1=cache contribution, 2=raw field
-  bool         m_bdrcFreezeTraining = false; // there is no warmup: the single fit runs from frame 0
+  bool         m_bdrcFreezeTraining = true; // there is no warmup: the single fit runs from frame 0
 
   // Gather lanes per frame. Its own launch dimension, deliberately independent
   // of the render resolution so the gather stream does not move when the window
   // or the camera does.
   int          m_bdrcGatherCount   = 65536;
+  // Photon lanes per frame. Its own launch dimension, like the gather stream.
+  // 262144 = 512x512, so the default window reproduces the earlier
+  // resolution-tied photon set bit-for-bit. 0 disables the caustic stream.
+  int          m_bdrcPhotonCount   = 262144;
   float        m_bdrcPhotonClamp   = 10000.0f;
   int          m_bdrcLrAnnealIters = 10000;
+  int          m_bdrcStepsPerFrame = 1;        // Optimizer steps per frame, each on a fresh batch.
+  uint32_t     m_bdrcLastPrintedHundred = 0u;  // [bdrc] log throttle: last printed step / 100.
 
   DreConfig    m_bdrcDre;                    // generator, alpha, beta, power
   float3       m_bdrcReferenceOrigin = {};   // stamped once from the scene AABB; never follows the camera

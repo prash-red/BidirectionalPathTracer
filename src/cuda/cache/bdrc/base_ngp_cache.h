@@ -74,7 +74,11 @@ public:
     // -------------------------------------------------------------------------
     // setLearningRate — mirrors bdrc BaseCache.set_learning_rate(factor)
     // -------------------------------------------------------------------------
-    void setLearningRate(float factor);
+    void setLearningRate(float factor);   // lr = base * factor
+
+    // The base rate setLearningRate() scales. Takes effect on the next setLearningRate().
+    void  setBaseLearningRate(float lr) { m_config.lr = lr; }
+    float getBaseLearningRate() const   { return m_config.lr; }
 
     // =========================================================================
     // EMA — mirrors bdrc/cache/base.py BaseCache EMA methods exactly

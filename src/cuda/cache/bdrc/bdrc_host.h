@@ -81,25 +81,39 @@ bool bdrcLoadWeights(BdrcSystem* sys, cudaStream_t stream, const std::string& pa
 
 // ---- Per-frame dispatch -----------------------------------------------------
 //
-// Call once after the camera, photon and gather launches have completed.
+// Per frame: one or more training steps, then one render.
 //
-//   tail queries -> EMA inference -> assemble targets -> one DRE loss ->
-//   one backward -> one optimizer step -> EMA update -> camera inference ->
-//   composite
+//   bdrcTrainStep  after a photon + gather launch: tail queries -> EMA
+//                  inference -> assemble targets -> one DRE loss -> one
+//                  backward -> one optimizer step -> EMA update; then counts the
+//                  batch's live lanes and clears its records. With several steps
+//                  per frame, relaunch photon + gather (with a new seed) before
+//                  each call.
+//   bdrcRender     after the camera launch and the last step: camera inference
+//                  -> composite, field statistics, diagnostics read-back.
 //
 // The tail read uses the EMA teacher while the fit updates the live student: a
 // bootstrapped estimator that ends by reading the field's own EMA is unbiased
 // for the measure the current field induces, and the true solution is the fixed
 // point of the iteration.
-void bdrcDispatch(
+void bdrcTrainStep(
+    BdrcSystem*  sys,
+    cudaStream_t stream,
+    unsigned int trainingIteration,  // optimizer steps so far, never resets; drives the LR schedule
+    unsigned int lrAnnealIters,
+    bool         freezeTraining);
+
+void bdrcRender(
     BdrcSystem*  sys,
     cudaStream_t stream,
     float4*      bufferAccum,
     int          numPixels,
     unsigned int iteration,          // resets on camera move; drives the film blend
-    unsigned int trainingIteration,  // never resets; drives the LR schedule
-    unsigned int lrAnnealIters,
-    int          debugMode,
-    bool         freezeTraining);
+    int          debugMode);
+
+// Base learning rate; the warm-up/anneal schedule multiplies it every step.
+float bdrcGetLearningRate(const BdrcSystem* sys);
+void  bdrcSetLearningRate(BdrcSystem* sys, float lr);
+float bdrcGetLrFactor    (const BdrcSystem* sys);  // schedule factor of the last step
 
 #endif // BDRC_HOST_H

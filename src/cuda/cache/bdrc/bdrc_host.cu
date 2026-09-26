@@ -207,6 +207,7 @@ struct BdrcSystem
     uint32_t m_fieldCount   = 0u;
 
     float    m_lastLoss    = 0.0f;
+    float    m_lrFactor    = 1.0f;  // LR schedule factor of the last step.
     uint32_t m_photonLive  = 0u;
     uint32_t m_gatherLive  = 0u;
     float    m_lastDensity = 0.0f;
@@ -321,6 +322,21 @@ float    bdrcGetFieldMax   (const BdrcSystem* sys) { return sys->m_fieldMax;    
 uint32_t bdrcGetFieldNonZero(const BdrcSystem* sys){ return sys->m_fieldNonZero;}
 uint32_t bdrcGetFieldCount (const BdrcSystem* sys) { return sys->m_fieldCount;  }
 
+float bdrcGetLrFactor(const BdrcSystem* sys) { return sys->m_lrFactor; }
+
+float bdrcGetLearningRate(const BdrcSystem* sys)
+{
+    return sys->field->getBaseLearningRate();
+}
+
+void bdrcSetLearningRate(BdrcSystem* sys, float lr)
+{
+    // The schedule multiplies this base rate on every step; set it now too so
+    // the change takes effect from the next step either way.
+    sys->field->setBaseLearningRate(lr);
+    sys->field->setLearningRate(sys->m_lrFactor);
+}
+
 void bdrcSetDreConfig(BdrcSystem* sys, const DreConfig& dre)
 {
     sys->field->setDreConfig(dre);
@@ -340,55 +356,53 @@ bool bdrcLoadWeights(BdrcSystem* sys, cudaStream_t stream, const std::string& pa
 // Per-frame dispatch
 // ============================================================================
 
-void bdrcDispatch(
+void bdrcTrainStep(
     BdrcSystem*  sys,
     cudaStream_t stream,
-    float4*      bufferAccum,
-    int          numPixels,
-    unsigned int iteration,
     unsigned int trainingIteration,
     unsigned int lrAnnealIters,
-    int          debugMode,
     bool         freezeTraining)
 {
     const uint32_t lanes       = sys->lanes;
     const uint32_t photonCount = sys->photonCount;
     const uint32_t gatherCount = sys->gatherCount;
-    const uint32_t camLanes    = sys->camLanes;
 
-    if (lanes == 0u || camLanes == 0u)
+    if (lanes == 0u)
         return;
 
     constexpr uint32_t THREADS = 256u;
 
-    // ---- 1. Tail queries -> EMA inference -----------------------------------
-    // The teacher reads the tails; only the fit below touches the live weights.
-    {
-        tcnn::GPUMatrixDynamic<float> in(sys->d_recTailQuery, UNIFIED_INPUT_DIM, lanes,
-                                         tcnn::MatrixLayout::ColumnMajor);
-        tcnn::GPUMatrix<float> out(sys->d_tailOut, 3u, lanes);
-        sys->field->query(stream, in, out, /*useEmaWeights=*/true);
-    }
+    // Live-lane counts describe the most recent batch; count before it is cleared.
+    cudaMemsetAsync(sys->d_liveCount, 0, 2u * sizeof(unsigned int), stream);
 
-    // ---- 2. Assemble per-lane (weight, p_r, 1/N_pos, 1/N_ref) ---------------
-    {
-        const uint32_t blocks = (lanes + THREADS - 1u) / THREADS;
-        k_bdrc_assemble_targets<<<blocks, THREADS, 0, stream>>>(
-            sys->d_weight, sys->d_scalePos, sys->d_scaleRef,
-            sys->d_recBase, sys->d_recDensity, sys->d_recFactor,
-            sys->d_recTailValid, sys->d_tailOut,
-            photonCount, gatherCount, lanes);
-    }
-
-    // ---- 3. One loss over the whole batch -> one step -----------------------
-    // Both streams accumulate into ONE optimizer step. dL/dOutput is per-sample,
-    // so photon lanes and gather lanes never alias and no Overwrite/Accumulate
-    // sequencing is needed.
     if (!freezeTraining)
     {
-        sys->field->setLearningRate(
-            bdrcLrScheduleFactor(trainingIteration, BDRC_LR_WARMUP_ITERS,
-                                 lrAnnealIters, BDRC_LR_MIN_FACTOR));
+        // ---- 1. Tail queries -> EMA inference -------------------------------
+        // The teacher reads the tails; only the fit below touches the live weights.
+        {
+            tcnn::GPUMatrixDynamic<float> in(sys->d_recTailQuery, UNIFIED_INPUT_DIM, lanes,
+                                             tcnn::MatrixLayout::ColumnMajor);
+            tcnn::GPUMatrix<float> out(sys->d_tailOut, 3u, lanes);
+            sys->field->query(stream, in, out, /*useEmaWeights=*/true);
+        }
+
+        // ---- 2. Assemble per-lane (weight, p_r, 1/N_pos, 1/N_ref) -----------
+        {
+            const uint32_t blocks = (lanes + THREADS - 1u) / THREADS;
+            k_bdrc_assemble_targets<<<blocks, THREADS, 0, stream>>>(
+                sys->d_weight, sys->d_scalePos, sys->d_scaleRef,
+                sys->d_recBase, sys->d_recDensity, sys->d_recFactor,
+                sys->d_recTailValid, sys->d_tailOut,
+                photonCount, gatherCount, lanes);
+        }
+
+        // ---- 3. One loss over the whole batch -> one step -------------------
+        // Both streams accumulate into ONE optimizer step. dL/dOutput is per-sample,
+        // so photon lanes and gather lanes never alias and no Overwrite/Accumulate
+        // sequencing is needed.
+        sys->m_lrFactor = bdrcLrScheduleFactor(trainingIteration, BDRC_LR_WARMUP_ITERS,
+                                               lrAnnealIters, BDRC_LR_MIN_FACTOR);
+        sys->field->setLearningRate(sys->m_lrFactor);
 
         tcnn::GPUMatrixDynamic<float> in(sys->d_recQuery, UNIFIED_INPUT_DIM, lanes,
                                          tcnn::MatrixLayout::ColumnMajor);
@@ -400,7 +414,47 @@ void bdrcDispatch(
         sys->field->updateEma(stream);
     }
 
-    // ---- 4. Camera inference (EMA) and composite ----------------------------
+    // ---- 4. Stream counts, then clear this batch's records ------------------
+    if (photonCount > 0u)
+    {
+        const uint32_t blocks = (photonCount + THREADS - 1u) / THREADS;
+        k_bdrc_count_live<<<blocks, THREADS, 0, stream>>>(
+            sys->d_recDensity, 0u, photonCount, sys->d_liveCount + 0, sys->d_liveDensity);
+    }
+    if (gatherCount > 0u)
+    {
+        const uint32_t blocks = (gatherCount + THREADS - 1u) / THREADS;
+        k_bdrc_count_live<<<blocks, THREADS, 0, stream>>>(
+            sys->d_recDensity, photonCount, photonCount + gatherCount,
+            sys->d_liveCount + 1, sys->d_liveDensity);
+    }
+
+    cudaMemsetAsync(sys->d_recDensity,   0, lanes * sizeof(float), stream);
+    cudaMemsetAsync(sys->d_recTailValid, 0, lanes * sizeof(float), stream);
+
+    // The next batch's photon and gather launches write these records on
+    // another stream. Without this wait, the training reads above and the clear
+    // can run after the next batch is written, and it trains on empty records.
+    cudaStreamSynchronize(stream);
+}
+
+
+void bdrcRender(
+    BdrcSystem*  sys,
+    cudaStream_t stream,
+    float4*      bufferAccum,
+    int          numPixels,
+    unsigned int iteration,
+    int          debugMode)
+{
+    const uint32_t camLanes = sys->camLanes;
+
+    if (sys->lanes == 0u || camLanes == 0u)
+        return;
+
+    constexpr uint32_t THREADS = 256u;
+
+    // ---- Camera inference (EMA) and composite -------------------------------
     {
         tcnn::GPUMatrixDynamic<float> in(sys->d_camQuery, UNIFIED_INPUT_DIM, camLanes,
                                          tcnn::MatrixLayout::ColumnMajor);
@@ -428,25 +482,7 @@ void bdrcDispatch(
                           sys->d_camValid, numPixels, iteration, debugMode);
     }
 
-    // ---- 5. Stream counts, then clear the per-frame state --------------------
-    cudaMemsetAsync(sys->d_liveCount, 0, 2u * sizeof(unsigned int), stream);
-    if (photonCount > 0u)
-    {
-        const uint32_t blocks = (photonCount + THREADS - 1u) / THREADS;
-        k_bdrc_count_live<<<blocks, THREADS, 0, stream>>>(
-            sys->d_recDensity, 0u, photonCount, sys->d_liveCount + 0, sys->d_liveDensity);
-    }
-    if (gatherCount > 0u)
-    {
-        const uint32_t blocks = (gatherCount + THREADS - 1u) / THREADS;
-        k_bdrc_count_live<<<blocks, THREADS, 0, stream>>>(
-            sys->d_recDensity, photonCount, photonCount + gatherCount,
-            sys->d_liveCount + 1, sys->d_liveDensity);
-    }
-
-    cudaMemsetAsync(sys->d_recDensity,   0, lanes    * sizeof(float),        stream);
-    cudaMemsetAsync(sys->d_recTailValid, 0, lanes    * sizeof(float),        stream);
-    cudaMemsetAsync(sys->d_camValid,     0, camLanes * sizeof(unsigned int), stream);
+    cudaMemsetAsync(sys->d_camValid, 0, camLanes * sizeof(unsigned int), stream);
 
     unsigned int live[2] = { 0u, 0u };
     cudaStreamSynchronize(stream);

@@ -1176,6 +1176,288 @@ void Application::initNRC() {
 
 
 
+void Application::renderSppm(unsigned int iteration)
+{
+  if (m_sppmSystem == nullptr || m_launchParameters.bufferAccum == nullptr ||
+      m_sbtSppmEye.raygenRecord == 0 || m_sbtSppmPhoton.raygenRecord == 0)
+  {
+    return;
+  }
+
+  // The renderer restarts accumulation (iteration 0) whenever the view, the
+  // scene, a material or the resolution changes. SPPM's per-pixel statistics
+  // describe one view of one scene, so they start over with it.
+  if (iteration == 0u)
+    sppmReset(m_sppmSystem, m_cudaStream);
+
+  sppmBeginIteration(m_sppmSystem, m_cudaStream);
+  sppmFillLaunchBuffers(m_sppmSystem, m_launchParameters.sppm);
+
+  CUDA_CHECK( cudaMemcpyAsync(reinterpret_cast<void*>(m_d_launchParameters), &m_launchParameters,
+                              sizeof(LaunchParameters), cudaMemcpyHostToDevice, m_cudaStream) );
+
+  OPTIX_CHECK( m_api.optixLaunch(m_pipeline, m_cudaStream,
+                                 reinterpret_cast<CUdeviceptr>(m_d_launchParameters), sizeof(LaunchParameters),
+                                 &m_sbtSppmEye, m_resolution.x, m_resolution.y, 1) );
+  if (m_sppmConfig.photonsPerIter > 0u)
+  {
+    OPTIX_CHECK( m_api.optixLaunch(m_pipeline, m_cudaStream,
+                                   reinterpret_cast<CUdeviceptr>(m_d_launchParameters), sizeof(LaunchParameters),
+                                   &m_sbtSppmPhoton, m_sppmConfig.photonsPerIter, 1, 1) );
+  }
+  CUDA_CHECK( cudaStreamSynchronize(m_cudaStream) );
+
+  const glm::vec3 mn = m_sceneExtent.isValid() ? m_sceneExtent.getMin() : glm::vec3(0.0f);
+  sppmEndIteration(m_sppmSystem, m_cudaStream, m_launchParameters.bufferAccum,
+                   make_float3(mn.x, mn.y, mn.z));
+  CUDA_CHECK( cudaDeviceSynchronize() );
+
+#if !defined(NDEBUG)
+  // Debug builds only; the GUI shows the same statistics in every build.
+  const SppmStats st = sppmGetStats(m_sppmSystem);
+  if (st.iterations == 1u || st.iterations % 100u == 0u)
+  {
+    const float r0 = m_sppmConfig.initialRadius * (m_sceneExtent.isValid() ? m_sceneExtent.getDiameter() : 1.0f);
+    printf("[sppm] iter=%u emitted=%.4g deposits=%u activeVP=%u/%u radius=[%.4g, %.4g] (r0=%.4g)\n",
+           st.iterations, st.photonsEmitted, st.lastDeposits, st.lastActiveVps,
+           static_cast<unsigned int>(m_resolution.x * m_resolution.y),
+           st.minRadius, st.maxRadius, r0);
+    fflush(stdout);
+  }
+#endif
+}
+
+
+float Application::cameraPathSeconds() const
+{
+  return std::chrono::duration<float>(std::chrono::steady_clock::now() - m_cameraClockStart).count();
+}
+
+
+void Application::cameraRecordStart()
+{
+  if (m_cameraPlaying)
+  {
+    return;
+  }
+  m_cameraPath.clear();
+  m_cameraRecording    = true;
+  m_cameraClockPending = true; // The first recorded pose is at t = 0.
+  std::cout << "[camera] recording to " << m_cameraPathFile << '\n';
+}
+
+
+void Application::cameraRecordStop()
+{
+  if (!m_cameraRecording)
+  {
+    return;
+  }
+  m_cameraRecording = false;
+  if (m_cameraPath.save(m_cameraPathFile, m_resolution.x, m_resolution.y))
+  {
+    std::cout << "[camera] wrote " << m_cameraPath.size() << " poses, "
+              << m_cameraPath.duration() << " s, to " << m_cameraPathFile << '\n';
+  }
+}
+
+
+bool Application::cameraPlayStart(const std::string& path, const bool exitAtEnd)
+{
+  if (m_cameraRecording)
+  {
+    cameraRecordStop();
+  }
+
+  int width  = 0;
+  int height = 0;
+  if (!m_cameraPath.load(path, width, height))
+  {
+    return false;
+  }
+  // The pose does not carry the aspect ratio: another window shape frames the
+  // same camera differently, and recordings of the two would not match.
+  if (0 < width && (width != m_resolution.x || height != m_resolution.y))
+  {
+    std::cerr << "WARNING: camera path " << path << " was recorded at " << width << 'x' << height
+              << ", replaying at " << m_resolution.x << 'x' << m_resolution.y << '\n';
+  }
+
+  cameraPlayBegin(path, exitAtEnd);
+  return true;
+}
+
+
+void Application::cameraPlayProcedural(const CameraMotion motion, const bool exitAtEnd)
+{
+  if (m_cameraRecording)
+  {
+    cameraRecordStop();
+  }
+
+  // Starts from the camera as it is now, so the path begins without a jump.
+  const dev::Camera& start = m_cameras[m_indexCamera];
+  if (motion == CAMERA_MOTION_ORBIT)
+  {
+    m_cameraPath.makeOrbit(start, m_cameraMotionSeconds, m_cameraOrbitDegrees);
+    cameraPlayBegin("orbit", exitAtEnd);
+  }
+  else
+  {
+    m_cameraPath.makeCircle(start, m_cameraMotionSeconds, m_cameraCircleRadius);
+    cameraPlayBegin("circle", exitAtEnd);
+  }
+}
+
+
+void Application::cameraPlayBegin(const std::string& source, const bool exitAtEnd)
+{
+  m_cameraPlaying      = true;
+  m_cameraPlayExit     = exitAtEnd;
+  m_cameraClockPending = true; // Starts on the first rendered frame, after all initialization.
+  m_guiState           = GUI_STATE_NONE; // Abandon a mouse drag in progress.
+  std::cout << "[camera] replaying " << m_cameraPath.size() << " poses, " << m_cameraPath.duration()
+            << " s (+" << m_cameraPlayDelay << " s hold) from " << source << '\n';
+}
+
+
+void Application::cameraPlayStop()
+{
+  if (!m_cameraPlaying)
+  {
+    return;
+  }
+  m_cameraPlaying = false;
+  // Manual control resumes from the replayed pose, not from where the
+  // trackball last left its longitude/latitude.
+  m_trackball.reinitOrientationFromCamera();
+}
+
+
+void Application::updateCameraPath()
+{
+  if (m_cameraClockPending)
+  {
+    m_cameraClockStart   = std::chrono::steady_clock::now();
+    m_cameraClockPending = false;
+  }
+
+  if (!m_cameraPlaying)
+  {
+    return;
+  }
+
+  const float duration = m_cameraPath.duration();
+  float t = cameraPathSeconds() - m_cameraPlayDelay;
+  if (duration < t)
+  {
+    if (m_cameraPlayLoop && 0.0f < duration)
+    {
+      t = fmodf(t, duration); // The hold is only at the start, not on every lap.
+    }
+    else
+    {
+      m_cameraPath.apply(duration, m_cameras[m_indexCamera]);
+      cameraPlayStop();
+      std::cout << "[camera] replay finished\n";
+      if (m_cameraPlayExit)
+      {
+        glfwSetWindowShouldClose(m_window, GLFW_TRUE);
+      }
+      return;
+    }
+  }
+  m_cameraPath.apply(std::max(0.0f, t), m_cameras[m_indexCamera]);
+}
+
+
+void Application::recordCameraPose()
+{
+  if (m_cameraRecording)
+  {
+    m_cameraPath.append(cameraPathSeconds(), m_cameras[m_indexCamera]);
+  }
+}
+
+
+bool Application::saveLinearPfm(const std::string& path)
+{
+  if (m_launchParameters.bufferAccum == nullptr)
+  {
+    std::cerr << "ERROR: saveLinearPfm() needs the flat accumulation buffer (interop 0, 1 or 2)\n";
+    return false;
+  }
+
+  const int    w = m_resolution.x;
+  const int    h = m_resolution.y;
+  const size_t n = static_cast<size_t>(w) * static_cast<size_t>(h);
+
+  // Raw accumulation, never the denoised buffer: a reference must not be denoised.
+  std::vector<float4> eye(n);
+  CUDA_CHECK( cudaMemcpy(eye.data(), m_launchParameters.bufferAccum, n * sizeof(float4), cudaMemcpyDeviceToHost) );
+
+  // Include the BDPT light path exactly when the display blends it, so the
+  // file is what the viewer shows. SPPM and BDRC never launch it.
+  const bool withLightPath = (m_launchParameters.bufferAccumLightPath != nullptr &&
+                              m_iterationLightPath > 0 && m_bdptDisplayMode == 2 &&
+                              !(m_nrc > 0 && m_nrcDebugMode != 0));
+  std::vector<float4> light;
+  float scale = 0.0f;
+  if (withLightPath)
+  {
+    light.resize(n);
+    CUDA_CHECK( cudaMemcpy(light.data(), m_launchParameters.bufferAccumLightPath, n * sizeof(float4), cudaMemcpyDeviceToHost) );
+    scale = 1.0f / static_cast<float>(m_iterationLightPath);
+  }
+
+  FILE* f = fopen(path.c_str(), "wb");
+  if (f == nullptr)
+  {
+    std::cerr << "ERROR: saveLinearPfm() cannot open " << path << '\n';
+    return false;
+  }
+
+  // PFM: "PF", dimensions, then a negative scale for little-endian, then
+  // bottom-to-top scanlines of float32 RGB. The accumulation buffer's row 0 is
+  // the bottom of the image (OpenGL convention), so rows go out in order.
+  fprintf(f, "PF\n%d %d\n-1.0\n", w, h);
+  std::vector<float> row(static_cast<size_t>(w) * 3u);
+  for (int y = 0; y < h; ++y)
+  {
+    for (int x = 0; x < w; ++x)
+    {
+      const size_t i = static_cast<size_t>(y) * w + x;
+      float3 c = make_float3(eye[i].x, eye[i].y, eye[i].z);
+      if (withLightPath)
+        c += make_float3(light[i].x, light[i].y, light[i].z) * scale;
+      row[3 * x + 0] = c.x;
+      row[3 * x + 1] = c.y;
+      row[3 * x + 2] = c.z;
+    }
+    fwrite(row.data(), sizeof(float), row.size(), f);
+  }
+  fclose(f);
+
+  std::cout << "Saved linear image " << path << " (" << w << "x" << h
+            << (withLightPath ? ", eye + BDPT light path" : "") << ")\n";
+  return true;
+}
+
+
+void Application::initSPPM()
+{
+  m_sppmSystem = sppmCreate();
+
+  // One camera pass and one photon pass per render() call; the per-pixel
+  // statistics carry the progression, so sub-frame launches have no meaning.
+  m_launches = 1;
+
+  m_launchParameters.sppm.enabled = 1;
+  // Buffers are allocated with the resolution in the resize path, once the
+  // scene extent that sets the radii is known.
+}
+
+
 void Application::initBDRC()
 {
   // The reference origin is stamped in updateLaunchParameters(), the first
@@ -1707,14 +1989,15 @@ bool Application::render()
     }
 
     m_launchParameters.iteration += m_launches; // Skip the number of rendered sub frames inside the host launch parameters.
-    if (m_nrc != 2 || !m_bdrcFreezeTraining)
+    if (m_nrc != 2)
       m_nrcTrainingIteration     += m_launches; // Training counter — never reset on camera move.
+                                                // BDRC advances it per optimizer step instead, below.
 
     // BDPT: Launch the light path tracer (one launch per render call, same resolution as the eye path).
     // bufferAccumLightPath must be zero-cleared once per frame for correct running-sum accumulation;
     // instead of clearing per-frame we accumulate over all iterations and divide in update().
     float scaleLightPath = 0.0f; // Updated below when BDPT is active; used by INTEROP_IMG compositing.
-    if (m_sbtLightPath.raygenRecord && m_launchParameters.bufferAccumLightPath != nullptr && m_nrc != 2)
+    if (m_sbtLightPath.raygenRecord && m_launchParameters.bufferAccumLightPath != nullptr && m_nrc != 2 && m_nrc != 3)
     {
       CUDA_CHECK( cudaMemcpyAsync(reinterpret_cast<void*>(m_d_launchParameters), &m_launchParameters, sizeof(LaunchParameters), cudaMemcpyHostToDevice, m_cudaStream) );
       OPTIX_CHECK( m_api.optixLaunch(m_pipeline, m_cudaStream, reinterpret_cast<CUdeviceptr>(m_d_launchParameters), sizeof(LaunchParameters), &m_sbtLightPath, m_resolution.x, m_resolution.y, 1) );
@@ -1739,61 +2022,97 @@ bool Application::render()
 
       if (m_nrc == 2 && m_bdrcSystem)
       {
-        // Photon stream: one lane per pixel, on the second stream. The
-        // cudaDeviceSynchronize() below makes both launches complete before
-        // bdrcDispatch; true parallel execution would need CUDA events.
-        if (m_sbtLightPath.raygenRecord)
+        // K training steps per frame, each on a FRESH batch: the photon and
+        // gather raygens seed from nrc.trainingIteration, which advances once
+        // per optimizer step, so every step draws independent samples. Reusing
+        // one batch K times would fit that frame's noise K times. A frozen field
+        // takes no steps, so one batch (for the live-lane diagnostics) suffices.
+        const int steps = m_bdrcFreezeTraining ? 1 : std::max(1, m_bdrcStepsPerFrame);
+        for (int step = 0; step < steps; ++step)
         {
-          CUDA_CHECK( cudaMemcpyAsync(reinterpret_cast<void*>(m_d_launchParameters),
-                                      &m_launchParameters, sizeof(LaunchParameters),
-                                      cudaMemcpyHostToDevice, m_cudaStreamLight) );
-          OPTIX_CHECK( m_api.optixLaunch(m_pipeline, m_cudaStreamLight,
-                                          reinterpret_cast<CUdeviceptr>(m_d_launchParameters),
-                                          sizeof(LaunchParameters),
-                                          &m_sbtLightPath,
-                                          m_resolution.x, m_resolution.y, 1) );
+          m_launchParameters.nrc.trainingIteration = m_nrcTrainingIteration;
+
+          // Photon stream: its own 1-D launch dimension, on the second stream, so
+          // the photon budget does not follow the window size. The
+          // cudaDeviceSynchronize() below makes both launches complete before
+          // the training step; true parallel execution would need CUDA events.
+          if (m_sbtLightPath.raygenRecord && m_bdrcPhotonCount > 0)
+          {
+            CUDA_CHECK( cudaMemcpyAsync(reinterpret_cast<void*>(m_d_launchParameters),
+                                        &m_launchParameters, sizeof(LaunchParameters),
+                                        cudaMemcpyHostToDevice, m_cudaStreamLight) );
+            OPTIX_CHECK( m_api.optixLaunch(m_pipeline, m_cudaStreamLight,
+                                            reinterpret_cast<CUdeviceptr>(m_d_launchParameters),
+                                            sizeof(LaunchParameters),
+                                            &m_sbtLightPath,
+                                            static_cast<unsigned int>(m_bdrcPhotonCount), 1, 1) );
+          }
+          else
+          {
+            // The gather launch below reads the same device copy.
+            CUDA_CHECK( cudaMemcpyAsync(reinterpret_cast<void*>(m_d_launchParameters),
+                                        &m_launchParameters, sizeof(LaunchParameters),
+                                        cudaMemcpyHostToDevice, m_cudaStreamLight) );
+          }
+
+          // Gather stream: its own launch dimension, so the gather count does not
+          // track the window size or the camera framing.
+          if (m_sbtGather.raygenRecord && m_bdrcGatherCount > 0)
+          {
+            OPTIX_CHECK( m_api.optixLaunch(m_pipeline, m_cudaStreamLight,
+                                            reinterpret_cast<CUdeviceptr>(m_d_launchParameters),
+                                            sizeof(LaunchParameters),
+                                            &m_sbtGather,
+                                            static_cast<unsigned int>(m_bdrcGatherCount), 1, 1) );
+          }
+
+          CUDA_CHECK( cudaDeviceSynchronize() );
+
+          // The schedule counts the step being taken (1-based): its warm-up factor
+          // is exactly 0 at 0, which would waste the first step.
+          bdrcTrainStep(m_bdrcSystem,
+                        m_cudaStream,
+                        m_nrcTrainingIteration + 1u,
+                        static_cast<unsigned int>(m_bdrcLrAnnealIters),
+                        m_bdrcFreezeTraining);
+
+          if (!m_bdrcFreezeTraining)
+          {
+            ++m_nrcTrainingIteration; // Optimizer steps — never reset on camera move.
+          }
         }
 
-        // Gather stream: its own launch dimension, so the gather count does not
-        // track the window size or the camera framing.
-        if (m_sbtGather.raygenRecord && m_bdrcGatherCount > 0)
-        {
-          OPTIX_CHECK( m_api.optixLaunch(m_pipeline, m_cudaStreamLight,
-                                          reinterpret_cast<CUdeviceptr>(m_d_launchParameters),
-                                          sizeof(LaunchParameters),
-                                          &m_sbtGather,
-                                          static_cast<unsigned int>(m_bdrcGatherCount), 1, 1) );
-        }
-
-        CUDA_CHECK( cudaDeviceSynchronize() );
-
-        bdrcDispatch(m_bdrcSystem,
-                     m_cudaStream,
-                     m_launchParameters.bufferAccum,
-                     m_resolution.x * m_resolution.y,
-                     nrcIteration,
-                     m_nrcTrainingIteration,
-                     static_cast<unsigned int>(m_bdrcLrAnnealIters),
-                     m_bdrcDebugMode,
-                     m_bdrcFreezeTraining);
+        bdrcRender(m_bdrcSystem,
+                   m_cudaStream,
+                   m_launchParameters.bufferAccum,
+                   m_resolution.x * m_resolution.y,
+                   nrcIteration,
+                   m_bdrcDebugMode);
 
         m_bdrcLastLoss    = bdrcGetLastLoss(m_bdrcSystem);
         m_bdrcPhotonLive  = bdrcGetPhotonLive(m_bdrcSystem);
         m_bdrcGatherLive  = bdrcGetGatherLive(m_bdrcSystem);
         m_bdrcLastDensity = bdrcGetLastDensity(m_bdrcSystem);
 
-        if (nrcIteration % 100u == 0u)
+#if !defined(NDEBUG)
+        // Debug builds only; the GUI shows the same values in every build.
+        // Every 100 optimizer steps. Keyed on the training counter, not the film
+        // iteration, which restarts on every camera move or animated frame and
+        // would print every frame while anything moves.
+        if (!m_bdrcFreezeTraining && m_nrcTrainingIteration / 100u != m_bdrcLastPrintedHundred)
         {
+          m_bdrcLastPrintedHundred = m_nrcTrainingIteration / 100u;
           printf("[bdrc] iter=%u loss=%.6g photonLive=%u/%u gatherLive=%u/%u p_r=%.6g "
                  "field(mean=%.4g max=%.4g nonzero=%u/%u)\n",
-                 nrcIteration, m_bdrcLastLoss,
-                 m_bdrcPhotonLive, static_cast<unsigned int>(m_resolution.x * m_resolution.y),
+                 m_nrcTrainingIteration, m_bdrcLastLoss,
+                 m_bdrcPhotonLive, static_cast<unsigned int>(m_bdrcPhotonCount),
                  m_bdrcGatherLive, static_cast<unsigned int>(m_bdrcGatherCount),
                  m_bdrcLastDensity,
                  bdrcGetFieldMean(m_bdrcSystem), bdrcGetFieldMax(m_bdrcSystem),
                  bdrcGetFieldNonZero(m_bdrcSystem), bdrcGetFieldCount(m_bdrcSystem));
           fflush(stdout);
         }
+#endif
 
         m_bdrcLossHistory[m_bdrcLossHistoryIdx] = m_bdrcLastLoss;
         m_bdrcLossHistoryIdx = (m_bdrcLossHistoryIdx + 1) % NRC_LOSS_HISTORY;
@@ -2411,14 +2730,66 @@ void Application::guiWindow()
     ImGui::Text("Samples: %d / frame", m_nrcLastTrainCount);
   }
 
+  if (m_launchParameters.bufferAccum != nullptr && ImGui::CollapsingHeader("Linear image (PFM)"))
+  {
+    ImGui::InputText("File", m_sppmSavePath, sizeof(m_sppmSavePath));
+    if (ImGui::Button("Save PFM"))
+      saveLinearPfm(m_sppmSavePath);
+    ImGui::SameLine();
+    ImGui::TextDisabled("lossless float32; never denoised");
+  }
+
+  if (m_nrc == 3 && m_sppmSystem != nullptr &&
+      ImGui::CollapsingHeader("SPPM reference", ImGuiTreeNodeFlags_DefaultOpen))
+  {
+    const SppmStats st   = sppmGetStats(m_sppmSystem);
+    const float     diag = m_sceneExtent.isValid() ? m_sceneExtent.getDiameter() : 1.0f;
+    const unsigned int numPix = static_cast<unsigned int>(m_resolution.x * m_resolution.y);
+
+    ImGui::Text("iterations: %u", st.iterations);
+    ImGui::Text("photons emitted: %.4g", st.photonsEmitted);
+    ImGui::Text("deposits last pass: %u (%.2f per path)", st.lastDeposits,
+                m_sppmConfig.photonsPerIter > 0u
+                  ? static_cast<float>(st.lastDeposits) / static_cast<float>(m_sppmConfig.photonsPerIter) : 0.0f);
+    ImGui::Text("visible points: %u / %u", st.lastActiveVps, numPix);
+    ImGui::Text("radius: [%.3g, %.3g]  (r0 = %.3g)", st.minRadius, st.maxRadius,
+                m_sppmConfig.initialRadius * diag);
+
+    // Every parameter below shapes the estimator, so changing one reallocates
+    // and restarts the reference rather than mixing two configurations.
+    bool dirty = false;
+    int  ppi   = static_cast<int>(m_sppmConfig.photonsPerIter);
+    dirty |= ImGui::SliderInt("Photons / iteration", &ppi, 1000, 4000000, "%d", ImGuiSliderFlags_Logarithmic);
+    m_sppmConfig.photonsPerIter = static_cast<uint32_t>(std::max(ppi, 0));
+    dirty |= ImGui::SliderFloat("Initial radius (x diagonal)", &m_sppmConfig.initialRadius,
+                                1.0e-5f, 0.05f, "%.5f", ImGuiSliderFlags_Logarithmic);
+    dirty |= ImGui::SliderFloat("Min radius (x diagonal)", &m_sppmConfig.minRadius,
+                                1.0e-7f, 1.0e-3f, "%.2e", ImGuiSliderFlags_Logarithmic);
+    dirty |= ImGui::SliderFloat("Alpha", &m_sppmConfig.alpha, 0.1f, 1.0f, "%.3f");
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("Fraction of each pass's photons kept. Radii shrink by sqrt((N + aM)/(N + M)).");
+    ImGui::Text("depths: eye %d, photon %d, RR after %d (shared: Path Length / Light Path Depth)",
+                m_launchParameters.pathLengths.y, m_launchParameters.lightPathMaxDepth,
+                m_launchParameters.pathLengths.x);
+    if (st.discarded > 0u)
+      ImGui::Text("iterations discarded on photon-store overflow: %u", st.discarded);
+    dirty |= ImGui::SliderFloat("Photon clamp", &m_sppmConfig.photonClamp, 1.0f, 1.0e6f, "%.0f",
+                                ImGuiSliderFlags_Logarithmic);
+    if (dirty)
+      m_isDirtyResolution = true;   // reallocates the SPPM buffers and restarts
+
+    if (ImGui::Button("Restart"))
+      m_launchParameters.iteration = 0u;
+  }
+
   if (m_nrc == 2 && ImGui::CollapsingHeader("Unified transport cache"))
   {
     ImGui::Text("photon lanes live: %u / %u", m_bdrcPhotonLive,
-                static_cast<unsigned int>(m_resolution.x * m_resolution.y));
+                static_cast<unsigned int>(m_bdrcPhotonCount));
     ImGui::Text("gather lanes live: %u / %u", m_bdrcGatherLive,
                 static_cast<unsigned int>(m_bdrcGatherCount));
     ImGui::Text("reference density p_r: %.6g", m_bdrcLastDensity);
-    ImGui::Text("training frame: %u", m_nrcTrainingIteration);
+    ImGui::Text((m_nrc == 2) ? "training step: %u" : "training frame: %u", m_nrcTrainingIteration);
 
     {
       float lossMax = *std::max_element(m_bdrcLossHistory, m_bdrcLossHistory + NRC_LOSS_HISTORY);
@@ -2434,6 +2805,29 @@ void Application::guiWindow()
     ImGui::Text("loss: %.6g", m_bdrcLastLoss);
 
     ImGui::Checkbox("Freeze training", &m_bdrcFreezeTraining);
+
+    if (m_bdrcSystem != nullptr)
+    {
+      float lr = bdrcGetLearningRate(m_bdrcSystem);
+      // Typed, applied on Enter: step 0 hides the +/- buttons, "%g" shows and
+      // accepts scientific notation (5e-3). Non-positive or non-finite input is
+      // ignored and the box reverts to the current rate on the next frame.
+      if (ImGui::InputFloat("Learning rate", &lr, 0.0f, 0.0f, "%g", ImGuiInputTextFlags_EnterReturnsTrue) &&
+          std::isfinite(lr) && lr > 0.0f)
+      {
+        bdrcSetLearningRate(m_bdrcSystem, lr);
+      }
+      if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Base Adam learning rate; type a value and press Enter (e.g. 5e-3).\n"
+                          "The warm-up/anneal schedule multiplies it every step; takes effect\n"
+                          "on the next step, optimizer state kept.");
+      ImGui::SameLine();
+      ImGui::TextDisabled("eff %.2e", lr * bdrcGetLrFactor(m_bdrcSystem));
+    }
+    ImGui::SliderInt("Train steps / frame", &m_bdrcStepsPerFrame, 1, 16);
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("Optimizer steps per rendered frame. Each step traces a fresh photon +\n"
+                        "gather batch, so training cost grows about linearly with this.");
 
     static const char* generatorItems[] = { "logistic", "brier", "lsif", "bregman" };
     int  gen      = static_cast<int>(m_bdrcDre.objective);
@@ -7700,7 +8094,15 @@ void Application::updateLaunchParameters()
     {
       const glm::vec3 mn = m_sceneExtent.getMin();
       const glm::vec3 mx = m_sceneExtent.getMax();
-      std::cout << "Scene AABB for NRC normalization: min(" << mn.x << ", " << mn.y << ", " << mn.z << ") max(" << mx.x << ", " << mx.y << ", " << mx.z << ")" << std::endl;
+      // Animation calls this every frame; report only a change. A changing box
+      // renormalizes every position the cache has learned, so it is worth seeing.
+      const float3 oldMin = m_launchParameters.nrc.aabbMin;
+      const float3 oldMax = m_launchParameters.nrc.aabbMax;
+      if (oldMin.x != mn.x || oldMin.y != mn.y || oldMin.z != mn.z ||
+          oldMax.x != mx.x || oldMax.y != mx.y || oldMax.z != mx.z)
+      {
+        std::cout << "Scene AABB for NRC normalization: min(" << mn.x << ", " << mn.y << ", " << mn.z << ") max(" << mx.x << ", " << mx.y << ", " << mx.z << ")" << std::endl;
+      }
       m_launchParameters.nrc.aabbMin = make_float3(mn.x, mn.y, mn.z);
       m_launchParameters.nrc.aabbMax = make_float3(mx.x, mx.y, mx.z);
     }
