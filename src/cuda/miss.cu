@@ -98,27 +98,29 @@ extern "C" __global__ void __miss__env_constant()
   // The environment light is always in the first element.
   float3 emission = theLaunchParameters.lightDefinitions[0].emission; // Constant emission.
 
-  if (theLaunchParameters.directLighting)
+  // The SPPM camera pass takes no NEE, so there is no light-sampling estimate
+  // to share with: the environment it reaches contributes at full weight.
+  if (theLaunchParameters.directLighting && !(thePrd->flags & FLAG_SPPM_EYE))
   {
     // If the last surface intersection was diffuse or glossy which was directly lit with multiple importance sampling,
     // then calculate implicit light emission with multiple importance sampling as well.
     const float weightMIS = (thePrd->typeEvent & (BSDF_EVENT_DIFFUSE | BSDF_EVENT_GLOSSY))
-                          ? balanceHeuristic(thePrd->pdf, 0.25f * M_1_PIf)
+                          // NEE picks this light with probability 1/numLights; see hit.cu.
+                          ? balanceHeuristic(thePrd->pdf, 0.25f * M_1_PIf / float(theLaunchParameters.numLights))
                           : 1.0f;
 
     emission *= weightMIS;
   }
   // Potential ambient occlusion is only applied for environment lights.
-  // Same rule as the emission block in hit.cu: a photon carries power, not
-  // radiance, and a gather segment collects the environment only on its first
-  // segment, as the MIS partner of the anchor's own light sample.
-  const bool bdrcCollectEnv =
-      !(thePrd->flags & FLAG_BDRC_PHOTON) &&
+  // Same rule as the emission block in hit.cu: a photon (BDRC or SPPM) carries
+  // power, not radiance, and a gather segment collects the environment only on
+  // its first segment, as the MIS partner of the anchor's own light sample.
+  const bool collectEnv =
+      !(thePrd->flags & (FLAG_BDRC_PHOTON | FLAG_SPPM_PHOTON)) &&
       (!(thePrd->flags & FLAG_BDRC_GATHER) || thePrd->bdrcSegment == 1);
-  if (!bdrcCollectEnv)
-    return;
 
-  thePrd->radiance += thePrd->throughput * emission * thePrd->occlusion;
+  if (collectEnv)
+    thePrd->radiance += thePrd->throughput * emission * thePrd->occlusion;
   thePrd->typeEvent = BSDF_EVENT_ABSORB;
 }
 
@@ -160,19 +162,18 @@ extern "C" __global__ void __miss__env_sphere()
       // and not the Gaussian smoothed one used to actually generate the CDFs.
       const float pdfLight = intensity(emission) * light.invIntegral;
       
-      emission *= balanceHeuristic(thePrd->pdf, pdfLight);
+      emission *= balanceHeuristic(thePrd->pdf, pdfLight / float(theLaunchParameters.numLights)); // light-selection pdf, see hit.cu
     }
   }
   // Potential ambient occlusion is only applied for environment lights.
-  // Same rule as the emission block in hit.cu: a photon carries power, not
-  // radiance, and a gather segment collects the environment only on its first
-  // segment, as the MIS partner of the anchor's own light sample.
-  const bool bdrcCollectEnv =
-      !(thePrd->flags & FLAG_BDRC_PHOTON) &&
+  // Same rule as the emission block in hit.cu: a photon (BDRC or SPPM) carries
+  // power, not radiance, and a gather segment collects the environment only on
+  // its first segment, as the MIS partner of the anchor's own light sample.
+  const bool collectEnv =
+      !(thePrd->flags & (FLAG_BDRC_PHOTON | FLAG_SPPM_PHOTON)) &&
       (!(thePrd->flags & FLAG_BDRC_GATHER) || thePrd->bdrcSegment == 1);
-  if (!bdrcCollectEnv)
-    return;
 
-  thePrd->radiance += thePrd->throughput * emission * light.emission * thePrd->occlusion;
+  if (collectEnv)
+    thePrd->radiance += thePrd->throughput * emission * light.emission * thePrd->occlusion;
   thePrd->typeEvent = BSDF_EVENT_ABSORB;
 }

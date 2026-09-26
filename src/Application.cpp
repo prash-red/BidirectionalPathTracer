@@ -4673,9 +4673,8 @@ void Application::initSurfaceReferenceTable()
       if (hostPrim.indexMaterial >= 0 &&
           static_cast<size_t>(hostPrim.indexMaterial) < m_materials.size())
       {
-        const MaterialData& mat = m_materials[hostPrim.indexMaterial];
-        if (mat.metallicFactor >= 0.99f || mat.transmissionFactor >= 0.99f)
-          continue;
+        if (!bdrcIsCacheReceiver(m_materials[hostPrim.indexMaterial]))
+          continue;   // the streams test the same predicate, see material_data.h
       }
 
       const unsigned int* indexData    = reinterpret_cast<const unsigned int*>(hostPrim.indices.h_ptr);
@@ -7453,8 +7452,13 @@ void Application::initLaunchParameters()
 
   m_launchParameters.resolution       = m_resolution; // Independent of the window client area.
   m_launchParameters.picking          = make_float2(-1.0f); // No picking ray.
-  m_launchParameters.pathLengths      = make_int2(2, 6);
-  m_launchParameters.lightPathMaxDepth = 6;
+  // Shared by every mode: PT/BDPT, the cache's camera, photon and gather walks,
+  // and the SPPM reference. 32 bounces with Russian roulette is effectively
+  // unbounded, matching the unified cache, whose recursion through U has no
+  // bounce limit at all. At 6 (the old default) SPPM and PT dropped the
+  // multi-bounce tail the cache keeps.
+  m_launchParameters.pathLengths      = make_int2(2, 32);
+  m_launchParameters.lightPathMaxDepth = 32;
   m_launchParameters.iteration        = 0u;              // Sub-frame number for the progressive accumulation of results.
   m_launchParameters.sceneEpsilon     = m_epsilonFactor * SCENE_EPSILON_SCALE;
   m_launchParameters.directLighting   = (m_useDirectLighting)   ? 1 : 0;
@@ -7473,6 +7477,18 @@ void Application::initLaunchParameters()
 
   m_launchParameters.sceneSphereCenter = make_float3(0.0f);
   m_launchParameters.sceneSphereRadius = 1.0f;
+
+  // Set the real bounding sphere here as well. updateLaunchParameters() does it
+  // too, but that runs only on drag-and-drop, a GUI scene change or animation
+  // playback -- so for a static scene loaded with -f the sphere used to stay a
+  // unit sphere at the origin all session. Environment light paths start on it
+  // (BDPT, the unified cache's photons, SPPM), so it must enclose the scene.
+  if (m_sceneExtent.isValid())
+  {
+    const glm::vec3 center = m_sceneExtent.getCenter();
+    m_launchParameters.sceneSphereCenter = make_float3(center.x, center.y, center.z);
+    m_launchParameters.sceneSphereRadius = m_sceneExtent.getDiameter() * 0.5f;
+  }
 
   if (m_sceneExtent.isValid() && m_nrc > 0)
   {

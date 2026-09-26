@@ -164,3 +164,25 @@ struct MaterialData
   // KHR_materials_unlit
   bool unlit = false;
 };
+
+// Unified transport cache (BDRC): is a surface with this material a cache
+// RECEIVER? The field only exists where the gather stream draws anchors, which
+// is also where the reference measure puts mass. The surface table
+// (Application::initSurfaceReferenceTable) and every stream that stops at a
+// receiver (camera, gather tail, photon deposit) must use this one test.
+//
+// They used to disagree: the table dropped near-pure glass and metal, while
+// the streams stopped wherever a DIFFUSE lobe happened to be sampled. Glass
+// with transmission 0.995 still has a 0.5% diffuse lobe, so photons deposited
+// on it and camera paths read it, but no anchor ever supplied reference mass
+// there. With positive samples and zero reference density the density-ratio
+// objective has no finite minimizer: U on the glass grew for as long as
+// training ran (field max 1 -> 650 over 3000 iterations on glass_caustic.glb),
+// the glass glowed white, and gather tails carried the excess to the floor.
+//
+// At a non-receiver a sampled diffuse event is a transport vertex like any
+// specular one: walks continue through it and the camera takes NEE there.
+__host__ __device__ __forceinline__ bool bdrcIsCacheReceiver(const MaterialData& material)
+{
+  return material.metallicFactor < 0.99f && material.transmissionFactor < 0.99f;
+}

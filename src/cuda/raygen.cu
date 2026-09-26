@@ -35,6 +35,7 @@
 #include "random.h"
 #include "shader_common.h"
 #include "vector_math.h"
+#include "transform.h"
 #include "cache/nrc_features.h"
 #include "cache/bdrc/unified_features.h"
 #include "surface_reference.h"
@@ -385,7 +386,7 @@ __forceinline__ __device__ float3 integrator(PerRayData& prd, const uint2 theLau
     // traverse a D S+ chain and never double-counts the photon stream's caustic
     // family.
     if (theLaunchParameters.nrc.enabled && theLaunchParameters.nrc.nrcType == BDRC &&
-        (prd.flags & FLAG_HIT) && (prd.typeEvent & BSDF_EVENT_DIFFUSE))
+        (prd.flags & FLAG_HIT) && (prd.typeEvent & BSDF_EVENT_DIFFUSE) && prd.bdrcReceiver)
     {
       const unsigned int px = theLaunchParameters.resolution.x * theLaunchIndex.y + theLaunchIndex.x;
       const NrcLaunchBuffers& nrc = theLaunchParameters.nrc;
@@ -450,7 +451,10 @@ __forceinline__ __device__ float3 integrator(PerRayData& prd, const uint2 theLau
     // Unbiased Russian Roulette path termination.
     if (theLaunchParameters.pathLengths.x <= depth) // Start termination after a minimum number of bounces.
     {
-      const float probability = fmaxf(prd.throughput);
+      // Clamped to 1: throughput can exceed 1 (e.g. refraction's radiance
+      // scaling), and dividing by a "probability" above 1 would shrink the
+      // path instead of keeping it unbiased.
+      const float probability = fminf(fmaxf(prd.throughput), 1.0f);
 
       if (probability < rng(prd.seed)) // Paths with lower probability to continue are terminated earlier.
       {
@@ -587,20 +591,47 @@ __forceinline__ __device__ bool sampleEmitterRay(PerRayData& prd, float3& origin
 
   if (light.typeLight == TYPE_LIGHT_ENV_SPHERE || light.typeLight == TYPE_LIGHT_ENV_CONST)
   {
-    // Environment light: sample a random point on the scene's bounding sphere and shoot inward.
-    // Sample a random direction outward, then the ray origin is on the sphere surface in that direction,
-    // and the ray direction points toward the sphere center (inward).
-    float3 outward;
-    unitSquareToSphere(rng(prd.seed), rng(prd.seed), outward, dirPdf);
+    // Environment light, as in PBRT's InfiniteLight::SampleLe and the sibling
+    // demo's emit(). Pick the direction the light comes FROM, w, uniformly on
+    // the sphere, then a point uniformly on the disc of radius R perpendicular
+    // to w on the w side of the scene; the photon travels along -w. The rays for
+    // one w are parallel and the disc spans the scene's whole cross-section, so
+    // the scene is lit evenly from every direction.
+    //
+    // The ray is perpendicular to its disc, so its power is
+    //   L(w) / (pdf_dir * pdf_disc) = L(w) * pi R^2 / pdf_dir
+    // (= L * pi R^2 * 4 pi for uniform directions), then / light-selection pmf.
+    //
+    // This used to aim every ray at the scene centre from a point on the bounding
+    // sphere and carry only L * numLights: the rays all crossed one point instead
+    // of covering the scene, and without pi R^2 * 4 pi the photons were far too
+    // dim. Every caller was affected -- the BDPT light path in mode 0, the unified
+    // cache's photon stream (environment caustics) and SPPM, where the
+    // environment reaches visible points through photons alone.
+    float3 w;
+    unitSquareToSphere(rng(prd.seed), rng(prd.seed), w, dirPdf);
 
-    // Origin on the bounding sphere surface, direction pointing inward toward the scene.
-    const float r = theLaunchParameters.sceneSphereRadius;
-    origin    = theLaunchParameters.sceneSphereCenter + outward * r;
-    direction = -outward; // Shoot toward scene center.
+    const float R     = theLaunchParameters.sceneSphereRadius;
+    const TBN   frame(w);
+    const float rDisc = R * sqrtf(rng(prd.seed));
+    const float phi   = 2.0f * M_PIf * rng(prd.seed);
+    origin    = theLaunchParameters.sceneSphereCenter + w * R
+              + frame.tangent   * (rDisc * cosf(phi))
+              + frame.bitangent * (rDisc * sinf(phi));
+    direction = -w;
 
-    // Throughput: emission * sphere_area * (numLights) (probability terms cancel with 1/4pi)
-    // emission is the average env radiance; scale by 4*pi*r^2 to get total power, then /selectionPdf.
-    prd.throughput = light.emission * float(numLights);
+    // Radiance arriving along -w is what a ray looking along w sees: the same
+    // lookup as the miss programs, so photons and eye paths see one environment.
+    float3 L = light.emission;
+    if (light.typeLight == TYPE_LIGHT_ENV_SPHERE)
+    {
+      const float3 Rl = transformVector(light.matrixInv, w);
+      const float  u  = (atan2f(-Rl.x, Rl.z) + M_PIf) * 0.5f * M_1_PIf;
+      const float  v  = acosf(-Rl.y) * M_1_PIf;
+      L *= make_float3(tex2D<float4>(light.textureEmission, u, v));
+    }
+
+    prd.throughput = L * (M_PIf * R * R / dirPdf) * float(numLights);
   }
   else if (light.typeLight == TYPE_LIGHT_MESH)
   {
@@ -634,19 +665,71 @@ __forceinline__ __device__ bool sampleEmitterRay(PerRayData& prd, float3& origin
     // Throughput: L_e / (p_pos * p_dir) / selectionPdf = L_e * area * pi * numLights
     prd.throughput = light.emission * (light.area * M_PIf * float(numLights));
   }
-  else if (light.typeLight >= TYPE_LIGHT_POINT) // Point or spot light.
+  else if (light.typeLight == TYPE_LIGHT_POINT)
   {
     // Light position is stored as the translation column of the light matrix.
     origin = make_float3(light.matrix[0].w, light.matrix[1].w, light.matrix[2].w);
 
-    // Sample a uniform direction on the sphere.
+    // Isotropic: uniform direction on the sphere.
     unitSquareToSphere(rng(prd.seed), rng(prd.seed), direction, dirPdf);
 
     // Initial throughput: emission * numLights / dirPdf
     // (1/selectionPdf = numLights, 1/dirPdf = 4*pi for uniform sphere).
     prd.throughput = light.emission * (float(numLights) / dirPdf);
   }
-  else // TYPE_LIGHT_DIRECTIONAL: no finite origin, skip.
+  else if (light.typeLight == TYPE_LIGHT_SPOT)
+  {
+    // A spot emits only inside its outer cone, with the same linear-in-cosine
+    // falloff NEE applies in __direct_callable__light_spot. This used to share
+    // the point light's uniform sphere at full intensity: half the photons went
+    // backwards out of the cone and every off-axis one was 1/falloff too bright
+    // (on cornell_caustic_glass_sphere.glb, a 90-degree spot, the walls read
+    // 1.5-2x the path tracer). Sample the cone uniformly and weight by falloff.
+    origin = make_float3(light.matrix[0].w, light.matrix[1].w, light.matrix[2].w);
+
+    const float3 axis     = normalize(-make_float3(light.matrixInv[2])); // glTF lights shine down -z
+    const float  cosOuter = fmaxf(fminf(light.cosOuter, 1.0f), -1.0f);
+    const float  cosT     = 1.0f - rng(prd.seed) * (1.0f - cosOuter);
+    const float  sinT     = sqrtf(fmaxf(0.0f, 1.0f - cosT * cosT));
+    const float  phi      = 2.0f * M_PIf * rng(prd.seed);
+    const TBN    frame(axis);
+    direction = frame.tangent   * (sinT * cosf(phi))
+              + frame.bitangent * (sinT * sinf(phi))
+              + axis * cosT;
+    dirPdf = 1.0f / fmaxf(2.0f * M_PIf * (1.0f - cosOuter), DENOMINATOR_EPSILON);
+
+    const float cosRange = fmaxf(DENOMINATOR_EPSILON, light.cosInner - light.cosOuter);
+    const float falloff  = fminf(fmaxf((cosT - light.cosOuter) / cosRange, 0.0f), 1.0f);
+
+    prd.throughput = light.emission * (falloff * float(numLights) / dirPdf);
+  }
+  else if (light.typeLight == TYPE_LIGHT_DIRECTIONAL)
+  {
+    // A parallel beam: the environment's disc construction with one fixed
+    // direction. Directional lights used to fall into the point-light branch
+    // (TYPE_LIGHT_DIRECTIONAL > TYPE_LIGHT_POINT) and were emitted isotropically
+    // from their matrix translation, which made the "skip" branch unreachable.
+    //
+    // The power reproduces what NEE delivers, emission * area per unit
+    // perpendicular area (__direct_callable__light_directional), so photons and
+    // eye paths agree. NOTE: that callable multiplies illuminance by the scene's
+    // disc area, so a directional light's brightness grows with scene size.
+    // That convention is the renderer's; it is matched here, not endorsed.
+    // Not validated against the path tracer: no test scene has one.
+    const float3 d     = -normalize(make_float3(light.matrixInv[2])); // direction of travel
+    const float  R     = theLaunchParameters.sceneSphereRadius;
+    const TBN    frame(d);
+    const float  rDisc = R * sqrtf(rng(prd.seed));
+    const float  phi   = 2.0f * M_PIf * rng(prd.seed);
+    origin    = theLaunchParameters.sceneSphereCenter - d * R
+              + frame.tangent   * (rDisc * cosf(phi))
+              + frame.bitangent * (rDisc * sinf(phi));
+    direction = d;
+    dirPdf    = 1.0f;
+
+    prd.throughput = light.emission * (light.area * M_PIf * R * R * float(numLights));
+  }
+  else
   {
     return false;
   }
@@ -680,6 +763,9 @@ __forceinline__ __device__ void lightPathIntegrator(PerRayData& prd, const uint2
     return;
   }
 
+  // Russian roulette is judged relative to the emitted power, see below.
+  const float emitted = fmaxf(prd.throughput);
+
   prd.pos = origin;
   prd.wi  = direction;
 
@@ -710,11 +796,20 @@ __forceinline__ __device__ void lightPathIntegrator(PerRayData& prd, const uint2
     }
 
     // Russian Roulette after minimum path length.
+    //
+    // A light path carries emitter-scale power (x numLights / pdf), far above
+    // 1. The survival probability must be the throughput RELATIVE to what was
+    // emitted, clamped to 1. The raw max component used to be taken as the
+    // probability: it never ended a path, and dividing by it (~90 on
+    // cornell_caustic_glass_sphere.glb) cut every connection past
+    // pathLengths.x to ~1%. Caustics connect at depth 2 and survived; the
+    // light they bounce onto other diffuse surfaces (L S+ D D+ E, which eye
+    // paths cannot reach through a delta light) was lost: walls 6% dark there.
     if (theLaunchParameters.pathLengths.x <= depth)
     {
-      const float probability = fmaxf(prd.throughput);
+      const float probability = fminf(fmaxf(prd.throughput) / emitted, 1.0f);
 
-      if (probability < rng(prd.seed))
+      if (!(probability > 0.0f) || probability < rng(prd.seed))
       {
         break;
       }
@@ -724,6 +819,24 @@ __forceinline__ __device__ void lightPathIntegrator(PerRayData& prd, const uint2
 
     ++depth;
   }
+}
+
+
+// Light-side visibility rule for the unified cache's two training walks, the
+// photon stream and the gather chain. Both estimate flux INCIDENT on a
+// receiver, so they must see the scene the way light does, which is the way
+// shadow rays do: unculled, with the back of a single-sided surface opaque.
+//
+// With back-face culling (as eye rays use), a walk passes straight through a
+// single-sided wall seen from behind. Light from outside a closed single-sided
+// room then leaked in through its walls, where a shadow ray from inside is
+// blocked. That is the reciprocity break the SPPM photon pass had (2.16x the
+// path tracer on cornell_box.glb). The back face must not reflect either: no
+// eye ray ever hits it, so light bounced off a wall's outer face would reach
+// receivers along paths no eye path has. So the walk ENDS there.
+__forceinline__ __device__ bool bdrcBlockedByBackFace(const PerRayData& prd)
+{
+  return prd.faceCulled && !prd.bdrcFrontFace;
 }
 
 
@@ -763,6 +876,9 @@ __forceinline__ __device__ void bdrcPhotonIntegrator(PerRayData& prd, const unsi
   if (!sampleEmitterRay(prd, origin, direction))
     return;
 
+  // Russian roulette is judged relative to the emitted power, see below.
+  const float emitted = fmaxf(prd.throughput);
+
   prd.pos = origin;
   prd.wi  = direction;
 
@@ -773,7 +889,11 @@ __forceinline__ __device__ void bdrcPhotonIntegrator(PerRayData& prd, const unsi
 
   while (depth < theLaunchParameters.lightPathMaxDepth)
   {
-    const float epsilon = (prd.flags & FLAG_HIT) ? theLaunchParameters.sceneEpsilon : 0.0f;
+    // t_min = sceneEpsilon on EVERY segment, the first included. A mesh-light
+    // photon starts exactly on its emitter triangle; at t_min = 0 it can re-hit
+    // that triangle at t ~ 0 and scatter off it instead of leaving (the SPPM
+    // photon pass lost over half of cornell_box.glb's panel light this way).
+    const float epsilon = theLaunchParameters.sceneEpsilon;
 
     prd.wo       = -prd.wi;
     prd.distance = RT_DEFAULT_MAX;
@@ -783,26 +903,46 @@ __forceinline__ __device__ void bdrcPhotonIntegrator(PerRayData& prd, const unsi
                prd.pos, prd.wi,
                epsilon, prd.distance, 0.0f,
                OptixVisibilityMask(0xFF),
-               OPTIX_RAY_FLAG_CULL_BACK_FACING_TRIANGLES,
+               // No back-face culling: see bdrcBlockedByBackFace. Same rule as
+               // the SPPM photon pass, which is what makes the two agree.
+               OPTIX_RAY_FLAG_NONE,
                TYPE_RAY_RADIANCE, NUM_RAY_TYPES, TYPE_RAY_RADIANCE,
                payload.x, payload.y);
 
-    if ((prd.typeEvent == BSDF_EVENT_ABSORB) || isNull(prd.throughput))
-      break;
     if (!(prd.flags & FLAG_HIT))
       break;
+    if (bdrcBlockedByBackFace(prd))
+      break;
 
-    if (prd.typeEvent & BSDF_EVENT_DIFFUSE)
+    // Only a receiver ends the walk (see bdrcIsCacheReceiver). A diffuse event
+    // on a non-receiver counts as S, like the gather chain and the camera do.
+    //
+    // The stop is decided by the diffuse lobe being SELECTED, which happens
+    // with probability p_d = bdrcDiffuseProb, and the deposit is power / p_d.
+    // The field holds the full incident flux at the receiver, and every reader
+    // applies the diffuse lobe's own weight on its side (the camera and the
+    // gather tail stop with that same selection probability). Depositing the
+    // raw power only on a diffuse selection recorded p_d * flux: caustics on
+    // any receiver with a glossy, sheen or coat layer came out low by the
+    // diffuse weight, most at grazing incidence where Fresnel is largest. The
+    // photon that selects another lobe continues as S and may deposit later,
+    // which is the L S+ family through this vertex's non-diffuse lobes.
+    //
+    // This test precedes the ABSORB check below: a diffuse selection whose
+    // sampled direction falls under the geometric normal ends the walk, but
+    // the flux had already arrived and still counts.
+    if (prd.bdrcDiffuseSelected && prd.bdrcReceiver)
     {
-      if (hasSpecular)
+      if (hasSpecular && prd.bdrcDiffuseProb > 0.0f)
       {
         // throughputPreBsdf is the power arriving at this vertex, before the
         // local BSDF response. That response is the query's job, not the
-        // field's.
+        // field's. The clamp applies after the 1/p_d weight.
         const float  c = theLaunchParameters.nrc.photonClamp;
-        const float3 power = make_float3(fminf(fmaxf(prd.throughputPreBsdf.x, 0.0f), c),
-                                         fminf(fmaxf(prd.throughputPreBsdf.y, 0.0f), c),
-                                         fminf(fmaxf(prd.throughputPreBsdf.z, 0.0f), c));
+        const float3 p = prd.throughputPreBsdf * (1.0f / prd.bdrcDiffuseProb);
+        const float3 power = make_float3(fminf(fmaxf(p.x, 0.0f), c),
+                                         fminf(fmaxf(p.y, 0.0f), c),
+                                         fminf(fmaxf(p.z, 0.0f), c));
 
         bdrcPackQuery5(nrc.recQuery, lane, prd.pos, prd.bdrcNg,
                        bdrcSideLabel(prd.bdrcFrontFace),
@@ -818,12 +958,18 @@ __forceinline__ __device__ void bdrcPhotonIntegrator(PerRayData& prd, const unsi
       break;
     }
 
+    if ((prd.typeEvent == BSDF_EVENT_ABSORB) || isNull(prd.throughput))
+      break;
+
     hasSpecular = true;
 
+    // Relative to the emitted power and clamped to 1, as in
+    // lightPathIntegrator: the raw max component of photon power is never a
+    // probability, and dividing by it shrank every deposit past pathLengths.x.
     if (theLaunchParameters.pathLengths.x <= depth)
     {
-      const float probability = fmaxf(prd.throughput.x, fmaxf(prd.throughput.y, prd.throughput.z));
-      if (probability < rng(prd.seed))
+      const float probability = fminf(fmaxf(prd.throughput) / emitted, 1.0f);
+      if (!(probability > 0.0f) || probability < rng(prd.seed))
         break;
       prd.throughput /= probability;
     }
@@ -964,7 +1110,9 @@ __forceinline__ __device__ void bdrcGatherIntegrator(PerRayData& prd, const unsi
     int depth = 0;
     while (depth < theLaunchParameters.pathLengths.y)
     {
-      const float epsilon = (prd.flags & FLAG_HIT) ? theLaunchParameters.sceneEpsilon : 0.0f;
+      // sceneEpsilon on every segment: with culling off (below), the first
+      // segment could otherwise re-hit the anchor's own triangle.
+      const float epsilon = theLaunchParameters.sceneEpsilon;
 
       prd.wo          = -prd.wi;
       prd.distance    = RT_DEFAULT_MAX;
@@ -975,14 +1123,20 @@ __forceinline__ __device__ void bdrcGatherIntegrator(PerRayData& prd, const unsi
                  prd.pos, prd.wi,
                  epsilon, prd.distance, 0.0f,
                  OptixVisibilityMask(0xFF),
-                 OPTIX_RAY_FLAG_CULL_BACK_FACING_TRIANGLES,
+                 // No culling: the gather measures the flux INCIDENT at the
+                 // anchor, the same quantity the photon stream deposits, so it
+                 // must see the scene the way light does. See
+                 // bdrcBlockedByBackFace.
+                 OPTIX_RAY_FLAG_NONE,
                  TYPE_RAY_RADIANCE, NUM_RAY_TYPES, TYPE_RAY_RADIANCE,
                  payload.x, payload.y);
 
       if (!(prd.flags & FLAG_HIT))
         break;   // the miss program added the environment iff this was segment 1
+      if (bdrcBlockedByBackFace(prd))
+        break;   // opaque from behind: nothing arrives through it
 
-      if (prd.typeEvent & BSDF_EVENT_DIFFUSE)
+      if ((prd.typeEvent & BSDF_EVENT_DIFFUSE) && prd.bdrcReceiver)
       {
         // The tail. Its value holds both its own direct light and everything
         // beyond it, so the segment stops here and reads the field instead of
@@ -1002,10 +1156,13 @@ __forceinline__ __device__ void bdrcGatherIntegrator(PerRayData& prd, const unsi
       if ((prd.typeEvent == BSDF_EVENT_ABSORB) || isNull(prd.throughput))
         break;
 
+      // The chain starts at throughput = pi (cosine-sampled hemisphere of a
+      // unit BSDF), so survival is judged relative to pi and clamped to 1;
+      // dividing by the raw max component darkened every long chain by ~pi.
       if (theLaunchParameters.pathLengths.x <= depth)
       {
-        const float probability = fmaxf(prd.throughput.x, fmaxf(prd.throughput.y, prd.throughput.z));
-        if (probability < rng(prd.seed))
+        const float probability = fminf(fmaxf(prd.throughput) * M_1_PIf, 1.0f);
+        if (!(probability > 0.0f) || probability < rng(prd.seed))
           break;
         prd.throughput /= probability;
       }
@@ -1196,3 +1353,259 @@ extern "C" __global__ void __raygen__path_tracer_surface()
   }
 }
 
+
+
+// ============================================================================
+// SPPM reference renderer
+//
+// Classic global-photon stochastic progressive photon mapping (Hachisuka and
+// Jensen 2009), ported from the sibling project's SPPMRenderer with
+// global_photon_transport = True. See SppmLaunchBuffers in launch_parameters.h
+// for why this variant and not the hybrid default.
+// ============================================================================
+
+// Camera pass. Traces from the camera through any vertex that does not sample
+// a diffuse lobe, and places the pixel's visible point at the first one that
+// does. Emission met along the way is collected at full weight (FLAG_SPPM_EYE
+// disables MIS): with no NEE on either pass, every other path reaches the pixel
+// through a photon gathered at the visible point.
+//
+// The visible point's factor is throughput / pi AFTER hit.cu sampled the
+// diffuse lobe. hit.cu picks a lobe with probability equal to its layer weight
+// and returns bsdf_over_pdf = tint without dividing that weight back out, so
+// the stochastic stop already carries the diffuse lobe's weight and
+// throughput / pi = T(cam -> vp) * tint / pi is exactly the renderer's own
+// diffuse BRDF. Nothing about the material is re-implemented here, which is
+// what makes this reference agree with the renderer's path tracer.
+__forceinline__ __device__ void sppmEyeIntegrator(PerRayData& prd, const unsigned int px)
+{
+  const SppmLaunchBuffers& s = theLaunchParameters.sppm;
+
+  s.vpActive[px] = 0u;
+
+  prd.radiance   = make_float3(0.0f);
+  prd.pdf        = 0.0f;
+  prd.throughput = make_float3(1.0f);
+  prd.occlusion  = 1.0f;
+  prd.sigma_t    = make_float3(0.0f);
+  prd.typeEvent  = BSDF_EVENT_ABSORB;
+  prd.flags      = 0;
+  prd.idxStack   = 0;
+  prd.stack[0].absorption_ior = make_float4(0.0f, 0.0f, 0.0f, 1.0f);
+
+  uint2 payload = splitPointer(&prd);
+
+  // Same limit as the cache's camera and gather walks (pathLengths.y).
+  for (int depth = 0; depth < theLaunchParameters.pathLengths.y; ++depth)
+  {
+    // Primary rays start at the camera and take no t_min offset.
+    const float epsilon = (prd.flags & FLAG_HIT) ? theLaunchParameters.sceneEpsilon : 0.0f;
+
+    prd.wo       = -prd.wi;
+    prd.distance = RT_DEFAULT_MAX;
+    prd.flags    = FLAG_SPPM_EYE;
+
+    optixTrace(theLaunchParameters.handle,
+               prd.pos, prd.wi,
+               epsilon, prd.distance, 0.0f,
+               OptixVisibilityMask(0xFF),
+               OPTIX_RAY_FLAG_CULL_BACK_FACING_TRIANGLES,
+               TYPE_RAY_RADIANCE, NUM_RAY_TYPES, TYPE_RAY_RADIANCE,
+               payload.x, payload.y);
+
+    if (!(prd.flags & FLAG_HIT))
+    {
+      // The miss program added the environment. Match the path tracer, which
+      // hides a directly-seen environment when showEnvironment is off.
+      if (depth == 0 && theLaunchParameters.showEnvironment == 0)
+        prd.radiance = make_float3(0.0f);
+      break;
+    }
+
+    if (prd.typeEvent & BSDF_EVENT_DIFFUSE)
+    {
+      s.vpPos[px]    = prd.pos;
+      s.vpNg[px]     = prd.bdrcNg;
+      s.vpFront[px]  = prd.bdrcFrontFace ? 1u : 0u;
+      s.vpFactor[px] = prd.throughput * M_1_PIf;
+      s.vpActive[px] = 1u;
+      break;
+    }
+
+    if ((prd.typeEvent == BSDF_EVENT_ABSORB) || isNull(prd.throughput))
+      break;
+  }
+
+  s.eyeRadiance[px] = prd.radiance;
+}
+
+
+extern "C" __global__ void __raygen__sppm_eye()
+{
+  const SppmLaunchBuffers& s = theLaunchParameters.sppm;
+  if (!s.enabled || 0.0f <= theLaunchParameters.picking.x)
+    return;
+
+  const uint2        idx = make_uint2(optixGetLaunchIndex());
+  const unsigned int px  = theLaunchParameters.resolution.x * idx.y + idx.x;
+
+  PerRayData prd;
+  // Salted apart from the photon pass so the two draws never correlate.
+  prd.seed = tea<4>(px, s.iteration + 0x5eed0000u);
+
+  // Stochastic SPPM: a fresh jittered sample every iteration, so the visible
+  // points move and the per-pixel statistics integrate over the pixel footprint.
+  const float2 fragment = make_float2(idx) + rng2(prd.seed);
+  const float2 ndc      = (fragment / make_float2(theLaunchParameters.resolution)) * 2.0f - 1.0f;
+
+  if (theLaunchParameters.cameraType) // perspective
+  {
+    prd.pos = theLaunchParameters.cameraP;
+    prd.wi  = normalize(theLaunchParameters.cameraU * ndc.x +
+                        theLaunchParameters.cameraV * ndc.y +
+                        theLaunchParameters.cameraW);
+  }
+  else // orthographic
+  {
+    prd.pos = theLaunchParameters.cameraP +
+              theLaunchParameters.cameraU * ndc.x +
+              theLaunchParameters.cameraV * ndc.y;
+    prd.wi  = theLaunchParameters.cameraW;
+  }
+
+  sppmEyeIntegrator(prd, px);
+}
+
+
+// Photon pass. Global photons: every light path deposits at EVERY surface with
+// a diffuse lobe it reaches, including the first (that is the direct light;
+// the camera pass takes none), then continues by sampling the BSDF.
+//
+// A deposit records the incident power before the local BSDF. It is gated on
+// the material HAVING a diffuse lobe, not on this sample picking it: the
+// deposit is the flux arriving at the surface, and the visible point applies
+// the diffuse lobe later with its own lobe choice.
+__forceinline__ __device__ void sppmPhotonIntegrator(PerRayData& prd)
+{
+  const SppmLaunchBuffers& s = theLaunchParameters.sppm;
+
+  prd.radiance  = make_float3(0.0f);
+  prd.pdf       = 0.0f;
+  prd.occlusion = 1.0f;
+  prd.sigma_t   = make_float3(0.0f);
+  prd.typeEvent = BSDF_EVENT_ABSORB;
+  prd.flags     = FLAG_SPPM_PHOTON;
+  prd.idxStack  = 0;
+  prd.stack[0].absorption_ior = make_float4(0.0f, 0.0f, 0.0f, 1.0f);
+
+  float3 origin;
+  float3 direction;
+  if (!sampleEmitterRay(prd, origin, direction))
+    return;   // contributes nothing, but still counts in the 1/N denominator
+
+  // sampleEmitterRay leaves the emitted power in throughput. Russian roulette
+  // is judged against it: the absolute value is emitter-scale flux, usually far
+  // above 1, so the raw max component would essentially never end a path.
+  const float emitted = fmaxf(prd.throughput);
+  if (!(emitted > 0.0f))
+    return;
+
+  prd.pos = origin;
+  prd.wi  = direction;
+
+  uint2 payload = splitPointer(&prd);
+
+  // Same limit as the cache's photon stream and the BDPT light tracer.
+  for (int depth = 0; depth < theLaunchParameters.lightPathMaxDepth; ++depth)
+  {
+    // The t_min offset applies to the FIRST segment too. A mesh-light photon
+    // starts exactly on its emitter triangle; with t_min = 0 and culling off
+    // (see below) it re-hits that triangle at t ~ 0, hit.cu takes it as a back
+    // face, flips the normal to the ray side and bounces the photon upward --
+    // into the ceiling, losing it. On cornell_box.glb that removed over half
+    // the panel's light. Eye paths keep t_min = 0 for primary rays: they start
+    // at the camera, not on a surface.
+    const float epsilon = theLaunchParameters.sceneEpsilon;
+
+    prd.wo       = -prd.wi;
+    prd.distance = RT_DEFAULT_MAX;
+    prd.flags    = FLAG_SPPM_PHOTON;
+
+    optixTrace(theLaunchParameters.handle,
+               prd.pos, prd.wi,
+               epsilon, prd.distance, 0.0f,
+               OptixVisibilityMask(0xFF),
+               // NO back-face culling, unlike eye paths. Culling breaks
+               // reciprocity: a photon reaching a single-sided wall from
+               // outside hits its back face and passes into the room, while a
+               // path tracer's shadow ray (which does not cull) from inside
+               // toward the same sky is blocked by the front face. Unculled,
+               // the photon stops on the outer face, and the gather's
+               // frontFace test keeps that deposit away from interior visible
+               // points. Measured on cornell_box.glb (all single-sided): with
+               // culling SPPM read 2.16x the path tracer, the back wall 5.3x.
+               OPTIX_RAY_FLAG_NONE,
+               TYPE_RAY_RADIANCE, NUM_RAY_TYPES, TYPE_RAY_RADIANCE,
+               payload.x, payload.y);
+
+    if (!(prd.flags & FLAG_HIT))
+      break;
+
+    // A culled surface seen from behind is an opaque ABSORBER for photons. It
+    // must block -- shadow rays do not cull, so the path tracer cannot see
+    // the sky through a wall from inside. It must not reflect either -- eye
+    // rays do cull, so no eye path ever receives light bounced off a wall's
+    // outer face. Letting such photons bounce put light reflected off the
+    // outside of cornell_box.glb in through its open front: +6% overall there.
+    if (prd.faceCulled && !prd.bdrcFrontFace)
+      break;
+
+    if (prd.hasDiffuseLobe)
+    {
+      const unsigned int slot = atomicAdd(s.photonCount, 1u);
+      if (slot < s.photonCapacity)
+      {
+        const float  c = s.photonClamp;
+        const float3 p = prd.throughputPreBsdf;
+        s.phPos[slot]   = prd.pos;
+        s.phNg[slot]    = prd.bdrcNg;
+        s.phFront[slot] = prd.bdrcFrontFace ? 1u : 0u;
+        s.phPower[slot] = make_float3(fminf(fmaxf(p.x, 0.0f), c),
+                                      fminf(fmaxf(p.y, 0.0f), c),
+                                      fminf(fmaxf(p.z, 0.0f), c));
+      }
+    }
+
+    if ((prd.typeEvent == BSDF_EVENT_ABSORB) || isNull(prd.throughput))
+      break;
+
+    // Russian roulette: the same rule as the cache's photon stream (after
+    // pathLengths.x bounces, survival = throughput relative to the emitted
+    // power, clamped to 1). The depth limit bounds the loop, so no cap below 1
+    // is needed for termination.
+    if (theLaunchParameters.pathLengths.x <= depth)
+    {
+      const float q = fminf(fmaxf(prd.throughput) / emitted, 1.0f);
+      if (!(q > 0.0f) || rng(prd.seed) >= q)
+        break;
+      prd.throughput /= q;
+    }
+  }
+}
+
+
+extern "C" __global__ void __raygen__sppm_photon()
+{
+  const SppmLaunchBuffers& s = theLaunchParameters.sppm;
+  if (!s.enabled || 0.0f <= theLaunchParameters.picking.x)
+    return;
+
+  const unsigned int lane = optixGetLaunchIndex().x;
+  if (lane >= s.photonsPerIter)
+    return;
+
+  PerRayData prd;
+  prd.seed = tea<4>(lane, s.iteration + 0x9407e000u);
+
+  sppmPhotonIntegrator(prd);
+}

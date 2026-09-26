@@ -1411,6 +1411,16 @@ __forceinline__ __device__ void chRadiance()
 
   PerRayData* thePrd = mergePointer(optixGetPayload_0(), optixGetPayload_1());
 
+  // Cleared first: the picking and unlit paths below return early, and a stale
+  // value would let an SPPM photon deposit on a surface that cannot scatter.
+  thePrd->hasDiffuseLobe = false;
+
+  // Known from the material alone, so set before any early return.
+  thePrd->bdrcReceiver = bdrcIsCacheReceiver(material);
+  thePrd->bdrcDiffuseSelected = false;
+  thePrd->bdrcDiffuseProb     = 0.0f;
+  thePrd->faceCulled = !material.doubleSided && (material.flags & FLAG_KHR_MATERIALS_VOLUME) == 0;
+
   thePrd->flags |= FLAG_HIT; // Required to distinguish surface hits from random walk miss.
 
   thePrd->distance = optixGetRayTmax(); // Return the current path segment distance
@@ -1561,10 +1571,23 @@ __forceinline__ __device__ void chRadiance()
   const bool bdrcCollectEmission =
       !bdrcPhotonPath && (!bdrcGatherPath || thePrd->bdrcSegment == 1);
 
-  if (bdrcCollectEmission)
+  // SPPM: a photon carries power and collects no emission. The SPPM camera pass
+  // takes no NEE, so there is no light-sampling estimate for MIS to share
+  // with: an emitter it hits contributes at FULL weight, and the MIS branch
+  // below (which assumes NEE covered the rest) must not apply.
+  const bool sppmEyePath    = (thePrd->flags & FLAG_SPPM_EYE)    != 0;
+  const bool sppmPhotonPath = (thePrd->flags & FLAG_SPPM_PHOTON) != 0;
+
+  // A culled material's back face is invisible to eye rays, so it emits nothing.
+  // Only unculled walks (BDRC photon and gather, SPPM photon) can reach one,
+  // and the gather collects emission, so without this test it would pick up
+  // light from the back of a single-sided emitter that no eye path ever sees.
+  const bool emittingFace = isFrontFace || !thePrd->faceCulled;
+
+  if (bdrcCollectEmission && !sppmPhotonPath && emittingFace)
   {
     // Basic Implementation of area mesh lights
-    if (thePrd->pdf > 0.0f
+    if (!sppmEyePath && thePrd->pdf > 0.0f
         && hitGroupData->lightDefinitionIndex >= 0
         && theLaunchParameters.directLighting
         && 0 < theLaunchParameters.numLights)
@@ -1577,7 +1600,13 @@ __forceinline__ __device__ void chRadiance()
       if (cosL > 0.0f)
       {
         const float lightPdf = (dist * dist) / (cosL * meshLight.area);
-        const float weight   = balanceHeuristic(thePrd->pdf, lightPdf);
+        // The light-sampling side of this MIS pair is NEE below, which weights
+        // with lightSample.pdf / numLights: picking one light of numLights is
+        // part of its density. Both sides must use the same density or the
+        // weights do not sum to 1 -- with an environment plus one mesh light
+        // this lost ~10% of every light's contribution (found by the SPPM
+        // reference on cornell_box.glb; exact with one light, as -m 0 is).
+        const float weight   = balanceHeuristic(thePrd->pdf, lightPdf / float(theLaunchParameters.numLights));
         thePrd->radiance += throughput * state.emission * weight;
       }
     }
@@ -1667,6 +1696,11 @@ __forceinline__ __device__ void chRadiance()
       break; // Sample and evaluate this lobe!
     }
   }
+
+  // LOBE_DIFFUSE_REFLECTION is index 0, the remainder of the loop above, so it
+  // is selected with probability exactly weightLobe[LOBE_DIFFUSE_REFLECTION].
+  thePrd->bdrcDiffuseSelected = (lobe == LOBE_DIFFUSE_REFLECTION);
+  thePrd->bdrcDiffuseProb     = weightLobe[LOBE_DIFFUSE_REFLECTION];
 
   state.xi = rng2(thePrd->seed);
   state.k1 = thePrd->wo;         // == -optixGetWorldRayDirection()
@@ -1803,7 +1837,22 @@ __forceinline__ __device__ void chRadiance()
               // state.bsdf_over_pdf == albedo for the Lambertian lobe (f*cos/pdf = tint, cosines cancel).
               // The actual BRDF is f = albedo/pi, so divide by pi to recover f from bsdf_over_pdf.
               // Multiply by cos_theta for the geometry term toward the camera direction.
-              const float3 contribution = throughput * (state.bsdf_over_pdf / M_PIf) * cos_theta / (dist_to_cam * dist_to_cam);
+              //
+              // Pinhole importance: W_e = 1 / (A_image * cos^4(theta_cam)), with
+              // A_image = 4 |U||V| / |W|^2 the image-plane area at unit distance.
+              // One light path per pixel is launched, so the per-pixel film
+              // measure (numPixels / A_image) and the 1/numPixels path average
+              // cancel and only W_e remains. This factor used to be missing: every
+              // light-traced caustic was scaled by A_image * cos^4, about 0.6 at
+              // this renderer's default field of view (SPPM read the
+              // cornell_caustic_glass_sphere caustic 1.55x brighter than BDPT).
+              const float lenW       = sqrtf(W2);
+              const float cosCam     = -dW / (dist_to_cam * lenW);
+              const float cosCam2    = cosCam * cosCam;
+              const float areaImage  = 4.0f * length(U) * length(V) / W2;
+              const float importance = 1.0f / (areaImage * cosCam2 * cosCam2);
+
+              const float3 contribution = throughput * (state.bsdf_over_pdf / M_PIf) * (cos_theta * importance) / (dist_to_cam * dist_to_cam);
 
               const unsigned int pixel_idx = static_cast<unsigned int>(theLaunchParameters.resolution.x * iy + ix);
 
@@ -1878,8 +1927,17 @@ __forceinline__ __device__ void chRadiance()
   {
     return;
   }
+  // SPPM: every path reaches a visible point through a photon, so light
+  // sampling on either pass would count direct light a second time.
+  if (sppmEyePath || sppmPhotonPath)
+  {
+    return;
+  }
+  // The camera stops at a diffuse event on a RECEIVER and reads U there, which
+  // already holds the direct light. A diffuse event on a non-receiver is an
+  // ordinary path vertex, so it keeps its NEE.
   if (theLaunchParameters.nrc.enabled && theLaunchParameters.nrc.nrcType == BDRC &&
-      (state.typeEvent & BSDF_EVENT_DIFFUSE))
+      (state.typeEvent & BSDF_EVENT_DIFFUSE) && thePrd->bdrcReceiver)
   {
     return;
   }

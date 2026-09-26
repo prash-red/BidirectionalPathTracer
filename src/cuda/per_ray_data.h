@@ -187,6 +187,32 @@ struct PerRayData
   // 1-based segment index along a gather continuation. Only segment 1 may
   // collect emission; see FLAG_BDRC_GATHER.
   int    bdrcSegment;
+
+  // True when the hit material has a diffuse lobe at all, independent of which
+  // lobe this sample picked. A photon deposits by this test, not by the
+  // sampled lobe: a deposit records the incident flux at a surface, and a
+  // visible point later applies the diffuse lobe to it. Gating deposits on the
+  // sampled lobe would undercount them by that lobe's selection weight.
+  // Reset at the top of every closest-hit so an early return never leaves it stale.
+  bool   hasDiffuseLobe;
+
+  // BDRC: the hit material is a cache receiver (bdrcIsCacheReceiver). A walk
+  // stops and queries/deposits only where a DIFFUSE event is sampled on a
+  // receiver; elsewhere a diffuse event is a transport vertex.
+  bool   bdrcReceiver;
+
+  // BDRC photon deposit: whether hit.cu SELECTED the diffuse lobe at this
+  // vertex (before sampling a direction, so an absorbed sample still counts),
+  // and the probability with which it did. A photon that stops at a receiver
+  // deposits power / bdrcDiffuseProb; see bdrcPhotonIntegrator.
+  bool   bdrcDiffuseSelected;
+  float  bdrcDiffuseProb;
+
+  // True when the hit material is back-face culled for radiance rays: not
+  // double-sided and not a volume (the same rule initSBT uses to set the GAS
+  // culling flags). From behind, such a surface does not exist for an eye ray
+  // but does block a shadow ray; an unculled photon has to reproduce both.
+  bool   faceCulled;
 };
 
 

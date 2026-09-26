@@ -377,7 +377,17 @@ diffuse vertex `D`, and records one query there. The pixel reads
 continuation: the path simply ends, so it can never traverse a `D S+` chain.
 
 **Photon** keeps the ungated `L S+ D` grammar — one deposit per path, no shadow
-ray, no dependence on the camera. It stores raw clamped power.
+ray, no dependence on the camera. It stops where `hit.cu` *selects* the diffuse
+lobe on a receiver (probability `p_d = bdrcDiffuseProb`) and deposits clamped
+`power / p_d`, so the field holds the full incident flux; readers apply `p_d`
+through their own stochastic stop.
+
+**Visibility (photon and gather walks).** Both measure flux *incident* on a
+receiver, so they see the scene the way light and shadow rays do: no back-face
+culling, `t_min = sceneEpsilon` on every segment, and a walk ends on the back
+face of a single-sided surface (`bdrcBlockedByBackFace`). The camera keeps the
+eye convention (culling), as SPPM's eye pass does. Emission is collected only
+from faces the eye can see.
 
 **Gather** draws an anchor from the global area-uniform surface CDF table,
 picks a side with probability 1/2, estimates direct light there with a **unit
@@ -456,7 +466,15 @@ There is no two-phase warmup: the single fit runs from frame 0.
    `useEmaWeights = true`.
 7. **The stored quantity is incident flux per area.** The receiver BSDF is
    applied at the query.
-8. **The cache lives on diffuse lobes only.**
+8. **The cache lives on diffuse lobes only, on receivers only.** A receiver is
+   `bdrcIsCacheReceiver()` (`material_data.h`: metallic < 0.99 and transmission
+   < 0.99). The surface table, the camera stop, the gather tail and the photon
+   deposit must all use it. A diffuse event sampled on a non-receiver (e.g. the
+   0.5% diffuse lobe of transmission-0.995 glass) is a transport vertex: walks
+   continue and the camera takes NEE there. If a stream stops where the table
+   puts no anchors, that point gets positives with zero reference mass, the
+   objective has no finite minimizer, and U grows without bound for as long as
+   training runs.
 9. **Training is camera-independent.** Moving the viewing camera changes rays
    and film accumulation only.
 
@@ -506,6 +524,93 @@ conditioning regimes. At `q = 1e-1` all four land on `5q`. At the realistic
 reference term is heavy-tailed when `u/q` spans orders of magnitude, which is a
 property of the parameterization, not a defect, and is why the GUI defaults to
 logistic.
+
+## SPPM Reference (`-nrc 3`, `cuda/sppm/sppm_host.h/.cu`)
+
+Classic **global-photon** stochastic progressive photon mapping (Hachisuka &
+Jensen 2009), ported from the sibling project's `SPPMRenderer` with
+`global_photon_transport = True`. It is the ground truth for the unified cache.
+
+**Why global photons, not the sibling project's default.** That project's
+default SPPM is a hybrid built to mirror its old three-cache design (a path
+traced eye pass, caustic-only photons, and a "virtual photon emitter"). It
+shares that design's path decomposition, so it can share its bugs. Global SPPM
+shares nothing with the cache: no NEE anywhere, and all light reaches a pixel
+through photons at its visible point. Validated against the path tracer on
+`cornell_box.glb` (see below).
+
+### Per iteration
+
+```
+__raygen__sppm_eye     per pixel: camera -> through non-diffuse vertices -> first
+                       vertex where hit.cu samples a DIFFUSE lobe = visible point.
+                       Emission on the prefix at full weight (no NEE, so no MIS).
+__raygen__sppm_photon  photonsPerIter paths; deposit at EVERY surface whose material
+                       has a diffuse lobe (incl. the first hit = direct light),
+                       then BSDF-sample on. RR on throughput relative to emitted power.
+sppmEndIteration       hash grid over deposits -> gather at each visible point ->
+                       progressive update -> reconstruct into bufferAccum
+```
+
+### The two conventions that make it agree with the path tracer
+
+- **Visible-point factor = `throughput / pi` after the diffuse sample.** `hit.cu`
+  selects a lobe with probability equal to its layer weight and returns
+  `bsdf_over_pdf = tint` without dividing the weight back out, so the
+  stochastic stop already carries the diffuse lobe's weight. No BSDF is
+  re-implemented; the reference uses the renderer's own.
+- **Deposits gate on the material HAVING a diffuse lobe** (`hasDiffuseLobe =
+  metallic < 1 && transmission < 1`), not on the sampled lobe. A deposit is the
+  incident flux at a surface; gating on the sampled lobe would undercount by its
+  selection weight.
+
+### Gather and update
+
+A photon counts toward a visible point when it is inside the radius, its surface
+normal agrees (`dot(ng_photon, ng_vp) > 0`, so no light leaks around corners), and it
+arrived on the same face (`frontFace` match, for two-sided sheets). The grid is a
+linked-list spatial hash with cell size = the largest radius; each photon is
+accepted only under its **own** cell, since two of the 27 neighbour cells can share a
+bucket. The update is exactly the reference project's `SPPMDensityCache.update`:
+
+```
+ratio = (N + a M)/(N + M)       tau <- (tau + flux) * ratio
+r <- max(r * sqrt(ratio), r_min) N <- N + a M
+pixel = eye_acc / iterations + tau / (pi r^2 N_emitted)
+```
+
+`N_emitted` counts every launched photon path, including ones that deposit nothing.
+
+### Defaults (`SppmConfig`, the sibling project's `density-reference-sppm-v2`)
+
+500k photons/iteration, `r0 = 0.001 x` scene diagonal, `r_min = 1e-5 x` diagonal,
+`alpha = 0.67`, photon clamp 1e4. All are in the GUI; changing one reallocates
+and restarts.
+
+**Depths are shared, not SPPM's own.** The eye pass stops at `pathLengths.y`, the
+photon pass at `lightPathMaxDepth`, and photon Russian roulette (survival =
+throughput / emitted, clamped to 1) starts after `pathLengths.x`: the same limits
+and rule as the cache's camera, photon and gather walks. Defaults are `(2, 32)` and
+32, effectively unbounded, because the cache's recursion through `U` has no bounce
+limit; at the old 6/7 the reference dropped the multi-bounce tail the cache keeps.
+The photon store is sized for 8 deposits per photon and regrows on overflow; an
+overflowing iteration is discarded, never truncated (truncation drops exactly the
+longest-bouncing photons). The state also resets
+whenever the renderer restarts accumulation (camera, scene, resolution).
+
+### Producing and comparing references
+
+```bash
+./GLTF_renderer -f scene.glb -nrc 3 -save-after 1000 sppm.pfm   # reference
+./GLTF_renderer -f scene.glb -nrc 2 -save-after 3000 cache.pfm  # unified cache
+```
+
+PFM is lossless float32 and never denoised. In mode 0 the file includes the BDPT
+light path exactly when the display blends it.
+
+**Limitation:** directional lights have no finite origin, so `sampleEmitterRay`
+cannot emit photons from them; their light is missing from the reference (the
+unified cache's photon stream has the same limit).
 
 ## Shader Configuration (`cuda/config.h`)
 
