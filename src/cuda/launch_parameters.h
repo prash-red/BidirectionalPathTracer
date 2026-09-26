@@ -152,6 +152,46 @@ struct NrcLaunchBuffers
   int nrcDebugMode;  // 0=normal, 1=cache-only, 2=mask, 3=indirect (matches NrcDebugMode enum).
 };
 
+// Stochastic progressive photon mapping (SPPM) reference renderer.
+//
+// Classic global-photon SPPM (Hachisuka & Jensen 2009), ported from the
+// sibling project's SPPMRenderer in its global_photon_transport mode: every
+// light path deposits a photon at every surface with a diffuse lobe, and each
+// pixel's visible point sits at the first vertex where the camera path samples
+// a diffuse lobe. There is no next-event estimation anywhere, so direct light
+// reaches visible points only through photons, and the estimator is
+// independent of the unified cache's path decomposition. That independence is
+// the point: a reference that shares the cache's decomposition can share its
+// double-counting bugs.
+//
+// All device pointers; nullptr when SPPM is off.
+struct SppmLaunchBuffers
+{
+  int           enabled;          // 1 when the SPPM reference mode is active
+
+  // ---- Per-pixel visible points, rewritten every iteration ----
+  float3*       vpPos;            // [numPixels] world position
+  float3*       vpNg;             // [numPixels] raw geometric normal
+  unsigned int* vpFront;          // [numPixels] 1 if the camera path arrived on the front face
+  float3*       vpFactor;         // [numPixels] T(cam -> vp) * tint / pi  (the diffuse lobe's weight)
+  unsigned int* vpActive;         // [numPixels] 1 if this pixel found a visible point this iteration
+  float3*       eyeRadiance;      // [numPixels] emission collected along the camera prefix, this iteration
+
+  // ---- Photon deposits, appended every iteration ----
+  float3*       phPos;            // [photonCapacity]
+  float3*       phNg;             // [photonCapacity] raw geometric normal at the deposit
+  unsigned int* phFront;          // [photonCapacity] 1 if the photon arrived on the front face
+  float3*       phPower;          // [photonCapacity] incident power, before the receiver BSDF
+  unsigned int* photonCount;      // [1] atomic append counter
+  unsigned int  photonCapacity;
+
+  unsigned int  photonsPerIter;   // photon paths launched per iteration (the 1/N denominator)
+  unsigned int  iteration;        // SPPM iteration, seeds both passes
+  // Depths come from LaunchParameters::pathLengths / lightPathMaxDepth, shared
+  // with every render mode (see SppmConfig).
+  float         photonClamp;      // upper bound on a single deposit's power
+};
+
 struct LaunchParameters
 {
   // 8 byte alignment
@@ -202,6 +242,8 @@ struct LaunchParameters
   float3 cameraW;
 
   NrcLaunchBuffers nrc; // Neural Radiance Cache buffers and configuration.
+
+  SppmLaunchBuffers sppm; // SPPM reference renderer buffers and configuration.
 };
 
 #endif // LAUNCH_PARAMETERS_H

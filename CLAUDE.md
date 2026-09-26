@@ -6,7 +6,8 @@
 
 1. **Pure path tracing** — progressive Monte Carlo with next event estimation (NEE/MIS)
 2. **NRC** (Neural Radiance Cache) — unidirectional path tracing accelerated by a neural cache for indirect illumination (Mueller et al. 2021)
-3. **BDRC** (Bidirectional Radiance Cache) — bidirectional path tracing with three neural caches for caustic-aware rendering
+3. **BDRC** (unified transport cache, `-nrc 2`) — one neural field of incident flux, supervised by a photon stream and a gather stream
+4. **SPPM reference** (`-nrc 3`) — global-photon stochastic progressive photon mapping, the ground truth the cache is scored against
 
 Built on NVIDIA OptiX SDK (7.7.0+) and CUDA, with tiny-cuda-nn for the neural network caches. Copyright NVIDIA Corporation 2025.
 

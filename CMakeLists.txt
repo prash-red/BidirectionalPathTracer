@@ -350,6 +350,8 @@ set(SOURCES_CUDA
         src/cuda/cache/nrc/nrc_host.cu
         src/cuda/cache/nrc/nrc_host.h
         src/cuda/cache/bdrc/bdrc_host.cu
+        src/cuda/sppm/sppm_host.cu
+        src/cuda/sppm/sppm_host.h
         src/cuda/cache/bdrc/bdrc_host.h
 )
 

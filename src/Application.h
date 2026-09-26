@@ -118,6 +118,7 @@
 // The full NrcSystem definition stays in NrcHost.cu to avoid pulling in tcnn headers.
 #include "cuda/cache/nrc/nrc_host.h"
 #include "cuda/cache/bdrc/bdrc_host.h"
+#include "cuda/sppm/sppm_host.h"
 
 #define APP_EXIT_SUCCESS          0
 
@@ -206,6 +207,11 @@ enum ProgramGroupId
   // BDRC gather stream raygen program. Launched at its own lane count, not at
   // the render resolution.
   PGID_GATHER_RAYGENERATION,
+
+  // SPPM reference renderer: camera pass (one visible point per pixel) and
+  // global photon pass (its own lane count).
+  PGID_SPPM_EYE_RAYGENERATION,
+  PGID_SPPM_PHOTON_RAYGENERATION,
 
   // Number of all hardcoded program group entries.
   NUM_PROGRAM_GROUP_IDS
@@ -624,6 +630,8 @@ private:
   OptixShaderBindingTable m_sbt   = {}; // SBT for the eye path tracer.
   OptixShaderBindingTable m_sbtLightPath = {}; // SBT for the light path tracer (shares miss/hit/callable records with m_sbt).
   OptixShaderBindingTable m_sbtGather    = {}; // SBT for the BDRC gather raygen (shares miss/hit/callable records with m_sbt).
+  OptixShaderBindingTable m_sbtSppmEye    = {}; // SBT for the SPPM camera pass
+  OptixShaderBindingTable m_sbtSppmPhoton = {}; // SBT for the SPPM photon pass
 
   LaunchParameters  m_launchParameters   = {};
   LaunchParameters* m_d_launchParameters = nullptr;

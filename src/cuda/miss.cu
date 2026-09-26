@@ -149,7 +149,8 @@ extern "C" __global__ void __miss__env_sphere()
 
   float3 emission = make_float3(tex2D<float4>(light.textureEmission, u, v));
 
-  if (theLaunchParameters.directLighting)
+  // No MIS on the SPPM camera pass: see __miss__env_constant.
+  if (theLaunchParameters.directLighting && !(thePrd->flags & FLAG_SPPM_EYE))
   {
     // If the last surface intersection was a diffuse event which was directly lit with multiple importance sampling,
     // then calculate implicit light emission with multiple importance sampling as well.

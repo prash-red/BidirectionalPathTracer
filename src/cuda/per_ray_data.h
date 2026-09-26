@@ -79,6 +79,13 @@ enum BsdfEventType
 // C(x); collecting them here too would put the same transport in both streams
 // and destroy the disjointness the sum rests on.
 #define FLAG_BDRC_GATHER   0x00000010
+// SPPM reference camera pass. Emission along the prefix is collected at FULL
+// weight and next-event estimation is off: there is no light-sampling partner
+// for MIS to share with, because every other path reaches the pixel through a
+// photon at the visible point.
+#define FLAG_SPPM_EYE      0x00000020
+// SPPM reference photon pass. Carries power, not radiance: no emission, no NEE.
+#define FLAG_SPPM_PHOTON   0x00000040
 // Set if the material stack is not empty.
 // This is implicit with the idxStack value.
 //#define FLAG_VOLUME                 0x00000010 

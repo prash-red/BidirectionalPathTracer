@@ -245,6 +245,8 @@ Application::Application(GLFWwindow* window,
   m_missID    = options.getMiss();
   m_pathEnv   = options.getEnvironment();
   m_nrc = options.getNrc();
+  m_saveAfterFrames = options.getSaveAfterFrames();
+  m_saveAfterPath   = options.getSaveAfterPath();
 
   m_iterations.resize(MAX_LAUNCHES); // The size of this vector must always be greater or equal to m_launches. Just size it once to the maximum.
   
@@ -337,6 +339,7 @@ Application::Application(GLFWwindow* window,
   initDenoiser();
   if (m_nrc == 1) initNRC();
   if (m_nrc == 2) initBDRC();
+  if (m_nrc == 3) initSPPM();
 
   try
   {
@@ -1436,6 +1439,15 @@ void Application::updateBuffers()
     b.referenceDensity = 0.5f * m_surfaceRefInvTotalArea;
     b.referenceOrigin  = m_bdrcReferenceOrigin;
   }
+
+  if (m_nrc == 3 && m_sppmSystem)
+  {
+    // Radii are fractions of the scene diagonal, as in the reference project.
+    const float diagonal = m_sceneExtent.isValid() ? m_sceneExtent.getDiameter() : 1.0f;
+    sppmAllocBuffers(m_sppmSystem, numPixels, m_sppmConfig, diagonal);
+    sppmFillLaunchBuffers(m_sppmSystem, m_launchParameters.sppm);
+    m_launchParameters.sppm.enabled = 1;
+  }
 }
 
 
@@ -1592,7 +1604,13 @@ bool Application::render()
       m_iterationLightPath = 0;
     }
 
-    if (m_benchmarkMode == SAMPLES_PER_SECOND)
+    if (m_nrc == 3)
+    {
+      // SPPM reference: its own camera and photon passes replace the eye path.
+      renderSppm(iteration);
+      iteration += static_cast<unsigned int>(m_launches);
+    }
+    else if (m_benchmarkMode == SAMPLES_PER_SECOND)
     {
       CUDA_CHECK( cudaDeviceSynchronize() );
       utils::Timer tLaunches;
@@ -1816,6 +1834,22 @@ bool Application::render()
     }
 
     repaint = true; // Indicate that there is a new image.
+
+    // Batch output: once N iterations have ACCUMULATED since the last restart,
+    // write the linear image and close. Counting accumulated iterations, not
+    // frames, means a restart mid-run (a window event, a camera nudge) delays
+    // the save instead of writing an image with only a few samples in it.
+    // m_launchParameters.iteration is that count in every mode; SPPM resets
+    // its statistics on the same signal.
+    ++m_frameCounter;
+    if (m_saveAfterFrames > 0 && !m_saveAfterDone &&
+        m_launchParameters.iteration >= static_cast<unsigned int>(m_saveAfterFrames))
+    {
+      m_saveAfterDone = true;
+      if (!m_saveAfterPath.empty())
+        saveLinearPfm(m_saveAfterPath);
+      glfwSetWindowShouldClose(m_window, GLFW_TRUE);
+    }
   }
 
   switch (m_interop)
@@ -3347,6 +3381,15 @@ void Application::guiWindow()
 void Application::guiEventHandler()
 {
   const ImGuiIO& io = ImGui::GetIO();
+
+  // A scripted -save-after render is a reference image: a stray mouse move or
+  // key over the window would orbit the camera and restart accumulation from
+  // another viewpoint, silently producing a different image than the one it is
+  // compared against. Ignore camera input until the file is written.
+  if (m_saveAfterFrames > 0 && !m_saveAfterDone)
+  {
+    return;
+  }
 
   if (ImGui::IsKeyPressed(ImGuiKey_Space, false)) // SPACE key toggles the GUI window display.
   {
@@ -5839,6 +5882,16 @@ void Application::cleanup()
     CUDA_CHECK( cudaFree(reinterpret_cast<void*>(m_sbtGather.raygenRecord)) );
     m_sbtGather.raygenRecord = 0;
   }
+  if (m_sbtSppmEye.raygenRecord)
+  {
+    CUDA_CHECK( cudaFree(reinterpret_cast<void*>(m_sbtSppmEye.raygenRecord)) );
+    m_sbtSppmEye.raygenRecord = 0;
+  }
+  if (m_sbtSppmPhoton.raygenRecord)
+  {
+    CUDA_CHECK( cudaFree(reinterpret_cast<void*>(m_sbtSppmPhoton.raygenRecord)) );
+    m_sbtSppmPhoton.raygenRecord = 0;
+  }
 
   if (m_sbtLightPath.raygenRecord)
   {
@@ -5882,6 +5935,11 @@ void Application::cleanup()
   {
     bdrcDestroy(m_bdrcSystem);
     m_bdrcSystem = nullptr;
+  }
+  if (m_sppmSystem)
+  {
+    sppmDestroy(m_sppmSystem);
+    m_sppmSystem = nullptr;
   }
 
   // BDPT: Free the light path accumulation buffer, GPU blend output, and host mirror.
@@ -6462,6 +6520,18 @@ void Application::initPipeline()
   pgd->raygen.module            = m_modules[MODULE_ID_RAYGENERATION];
   pgd->raygen.entryFunctionName = "__raygen__bdrc_gather";
 
+  pgd = &programGroupDescriptions[PGID_SPPM_EYE_RAYGENERATION];
+  pgd->kind  = OPTIX_PROGRAM_GROUP_KIND_RAYGEN;
+  pgd->flags = OPTIX_PROGRAM_GROUP_FLAGS_NONE;
+  pgd->raygen.module            = m_modules[MODULE_ID_RAYGENERATION];
+  pgd->raygen.entryFunctionName = "__raygen__sppm_eye";
+
+  pgd = &programGroupDescriptions[PGID_SPPM_PHOTON_RAYGENERATION];
+  pgd->kind  = OPTIX_PROGRAM_GROUP_KIND_RAYGEN;
+  pgd->flags = OPTIX_PROGRAM_GROUP_FLAGS_NONE;
+  pgd->raygen.module            = m_modules[MODULE_ID_RAYGENERATION];
+  pgd->raygen.entryFunctionName = "__raygen__sppm_photon";
+
   pgd = &programGroupDescriptions[PGID_EXCEPTION];
   pgd->kind  = OPTIX_PROGRAM_GROUP_KIND_EXCEPTION;
   pgd->flags = OPTIX_PROGRAM_GROUP_FLAGS_NONE;
@@ -6657,6 +6727,16 @@ void Application::initSBT()
     OPTIX_CHECK( m_api.optixSbtRecordPackHeader(m_programGroups[PGID_GATHER_RAYGENERATION], &rg_gather_sbt) );
 
     CUDA_CHECK( cudaMemcpy(reinterpret_cast<void*>(m_sbtGather.raygenRecord), &rg_gather_sbt, sizeof(dev::EmptyRecord), cudaMemcpyHostToDevice) );
+
+    CUDA_CHECK( cudaMalloc(reinterpret_cast<void**>(&m_sbtSppmEye.raygenRecord), sizeof(dev::EmptyRecord)) );
+    dev::EmptyRecord rg_sppm_eye_sbt;
+    OPTIX_CHECK( m_api.optixSbtRecordPackHeader(m_programGroups[PGID_SPPM_EYE_RAYGENERATION], &rg_sppm_eye_sbt) );
+    CUDA_CHECK( cudaMemcpy(reinterpret_cast<void*>(m_sbtSppmEye.raygenRecord), &rg_sppm_eye_sbt, sizeof(dev::EmptyRecord), cudaMemcpyHostToDevice) );
+
+    CUDA_CHECK( cudaMalloc(reinterpret_cast<void**>(&m_sbtSppmPhoton.raygenRecord), sizeof(dev::EmptyRecord)) );
+    dev::EmptyRecord rg_sppm_photon_sbt;
+    OPTIX_CHECK( m_api.optixSbtRecordPackHeader(m_programGroups[PGID_SPPM_PHOTON_RAYGENERATION], &rg_sppm_photon_sbt) );
+    CUDA_CHECK( cudaMemcpy(reinterpret_cast<void*>(m_sbtSppmPhoton.raygenRecord), &rg_sppm_photon_sbt, sizeof(dev::EmptyRecord), cudaMemcpyHostToDevice) );
 
     // The light path SBT reuses the miss, hitgroup, and callable records from m_sbt.
     // These are assigned after m_sbt is fully constructed (see end of initSBT).
@@ -6857,22 +6937,40 @@ void Application::initSBT()
   // (Miss, hitgroup, and callable programs are the same; only the raygen differs.)
   m_sbtLightPath.missRecordBase            = m_sbt.missRecordBase;
   m_sbtGather.missRecordBase            = m_sbt.missRecordBase;
+  m_sbtSppmEye.missRecordBase            = m_sbt.missRecordBase;
+  m_sbtSppmPhoton.missRecordBase            = m_sbt.missRecordBase;
   m_sbtLightPath.missRecordStrideInBytes   = m_sbt.missRecordStrideInBytes;
   m_sbtGather.missRecordStrideInBytes   = m_sbt.missRecordStrideInBytes;
+  m_sbtSppmEye.missRecordStrideInBytes   = m_sbt.missRecordStrideInBytes;
+  m_sbtSppmPhoton.missRecordStrideInBytes   = m_sbt.missRecordStrideInBytes;
   m_sbtLightPath.missRecordCount           = m_sbt.missRecordCount;
   m_sbtGather.missRecordCount           = m_sbt.missRecordCount;
+  m_sbtSppmEye.missRecordCount           = m_sbt.missRecordCount;
+  m_sbtSppmPhoton.missRecordCount           = m_sbt.missRecordCount;
   m_sbtLightPath.hitgroupRecordBase        = m_sbt.hitgroupRecordBase;
   m_sbtGather.hitgroupRecordBase        = m_sbt.hitgroupRecordBase;
+  m_sbtSppmEye.hitgroupRecordBase        = m_sbt.hitgroupRecordBase;
+  m_sbtSppmPhoton.hitgroupRecordBase        = m_sbt.hitgroupRecordBase;
   m_sbtLightPath.hitgroupRecordStrideInBytes = m_sbt.hitgroupRecordStrideInBytes;
   m_sbtGather.hitgroupRecordStrideInBytes = m_sbt.hitgroupRecordStrideInBytes;
+  m_sbtSppmEye.hitgroupRecordStrideInBytes = m_sbt.hitgroupRecordStrideInBytes;
+  m_sbtSppmPhoton.hitgroupRecordStrideInBytes = m_sbt.hitgroupRecordStrideInBytes;
   m_sbtLightPath.hitgroupRecordCount       = m_sbt.hitgroupRecordCount;
   m_sbtGather.hitgroupRecordCount       = m_sbt.hitgroupRecordCount;
+  m_sbtSppmEye.hitgroupRecordCount       = m_sbt.hitgroupRecordCount;
+  m_sbtSppmPhoton.hitgroupRecordCount       = m_sbt.hitgroupRecordCount;
   m_sbtLightPath.callablesRecordBase       = m_sbt.callablesRecordBase;
   m_sbtGather.callablesRecordBase       = m_sbt.callablesRecordBase;
+  m_sbtSppmEye.callablesRecordBase       = m_sbt.callablesRecordBase;
+  m_sbtSppmPhoton.callablesRecordBase       = m_sbt.callablesRecordBase;
   m_sbtLightPath.callablesRecordStrideInBytes = m_sbt.callablesRecordStrideInBytes;
   m_sbtGather.callablesRecordStrideInBytes = m_sbt.callablesRecordStrideInBytes;
+  m_sbtSppmEye.callablesRecordStrideInBytes = m_sbt.callablesRecordStrideInBytes;
+  m_sbtSppmPhoton.callablesRecordStrideInBytes = m_sbt.callablesRecordStrideInBytes;
   m_sbtLightPath.callablesRecordCount      = m_sbt.callablesRecordCount;
   m_sbtGather.callablesRecordCount      = m_sbt.callablesRecordCount;
+  m_sbtSppmEye.callablesRecordCount      = m_sbt.callablesRecordCount;
+  m_sbtSppmPhoton.callablesRecordCount      = m_sbt.callablesRecordCount;
 }
 
 
@@ -6996,10 +7094,16 @@ void Application::updateSBT()
   // Keep the BDPT SBT's hitgroup pointers in sync.
   m_sbtLightPath.hitgroupRecordBase            = m_sbt.hitgroupRecordBase;
   m_sbtGather.hitgroupRecordBase            = m_sbt.hitgroupRecordBase;
+  m_sbtSppmEye.hitgroupRecordBase            = m_sbt.hitgroupRecordBase;
+  m_sbtSppmPhoton.hitgroupRecordBase            = m_sbt.hitgroupRecordBase;
   m_sbtLightPath.hitgroupRecordStrideInBytes   = m_sbt.hitgroupRecordStrideInBytes;
   m_sbtGather.hitgroupRecordStrideInBytes   = m_sbt.hitgroupRecordStrideInBytes;
+  m_sbtSppmEye.hitgroupRecordStrideInBytes   = m_sbt.hitgroupRecordStrideInBytes;
+  m_sbtSppmPhoton.hitgroupRecordStrideInBytes   = m_sbt.hitgroupRecordStrideInBytes;
   m_sbtLightPath.hitgroupRecordCount           = m_sbt.hitgroupRecordCount;
   m_sbtGather.hitgroupRecordCount           = m_sbt.hitgroupRecordCount;
+  m_sbtSppmEye.hitgroupRecordCount           = m_sbt.hitgroupRecordCount;
+  m_sbtSppmPhoton.hitgroupRecordCount           = m_sbt.hitgroupRecordCount;
 }
 
 

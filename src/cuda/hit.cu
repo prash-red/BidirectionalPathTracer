@@ -1478,6 +1478,12 @@ __forceinline__ __device__ void chRadiance()
   thePrd->bdrcNg        = state.Ng;
   thePrd->bdrcFrontFace = isFrontFace;
 
+  // Material-level: the lobe split below gives the diffuse lobe a weight of
+  // (1-coat)(1-sheen)(1-metallic)(1-F)(1-transmission). Coat, sheen and Fresnel
+  // only reach 1 at grazing incidence, so whether a diffuse lobe EXISTS is
+  // decided by metallic and transmission alone, independent of this ray's angle.
+  thePrd->hasDiffuseLobe = (state.metallic < 1.0f) && (state.transmission < 1.0f);
+
   // Flip the normals to the side the ray hit.
   if (!isFrontFace)
   {

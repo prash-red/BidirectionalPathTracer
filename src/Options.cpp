@@ -157,7 +157,7 @@ bool Options::parseCommandLine(int argc, char *argv[])
         return false;
       }
       m_nrc = atoi(argv[++i]);
-      if (m_nrc < 0 || m_nrc > 2) {
+      if (m_nrc < 0 || m_nrc > 3) {
         std::cerr << "ERROR: Option '" << arg << "'\n";
         printUsage(argv[0]);
         return false;
