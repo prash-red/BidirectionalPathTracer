@@ -746,7 +746,7 @@ private:
   CUstream     m_cudaStreamLight = nullptr;  // Second stream for parallel light-path launch
   uint32_t     m_nrcTrainingIteration = 0u;  // Total training frames — never reset on camera move
   int          m_bdrcDebugMode = 0;          // 0=normal, 1=cache contribution, 2=raw field
-  bool         m_bdrcFreezeTraining = true; // there is no warmup: the single fit runs from frame 0
+  bool         m_bdrcFreezeTraining = true; // starts frozen: untick "Freeze training" in the GUI to fit (no warmup phase)
 
   // Gather lanes per frame. Its own launch dimension, deliberately independent
   // of the render resolution so the gather stream does not move when the window

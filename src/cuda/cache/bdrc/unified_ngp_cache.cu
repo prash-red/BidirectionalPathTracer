@@ -29,20 +29,17 @@ ngp_config makeUnifiedConfig()
     cfg.inputDim  = UNIFIED_INPUT_DIM;
     cfg.labelDims = UNIFIED_LABEL_DIMS;
 
-    // Hash grid: 12 levels x 2 features from 16 to 1384 at the demo's validated
-    // per-level scale of 1.5. The finest cell is 2.9 mm across a 4 m scene.
+    // Hash grid: 8 levels x 2 features from 16 to ~273 at a per-level scale of
+    // 1.5, in a 2^20 table. The finest cell is ~14.6 mm across a 4 m scene.
     //
-    // The demo's 8 levels (16..274) left the finest cell at 14.7 mm, too coarse
-    // for a sharp caustic: its peak levelled off near 62 on
-    // cornell_caustic_glass_sphere.glb, while this grid reached 74 by frame
-    // 2400 and was still rising, with the same field mean. The original 2^20
-    // table was only ~23% occupied at its finest level, so the old grid was
-    // limited by resolution, not by hash capacity.
-    //
-    // The table grows to 2^22 with the extra levels to keep the finest level's
-    // surface occupancy near 1.5x; at 2^20, 12 levels would reach ~6x and the
-    // extra resolution would go to hash collisions. Cost measured on an
-    // RTX 4050 Laptop: peak GPU memory 858 -> 1858 MiB, ~40% lower frame rate.
+    // A 12-level grid (16..1384, finest cell 2.9 mm) in a 2^22 table was also
+    // tried: it resolved a sharper caustic peak on
+    // cornell_caustic_glass_sphere.glb (74 vs ~62 at frame 2400, same field
+    // mean), but cost peak GPU memory 858 -> 1858 MiB and ~40% of the frame
+    // rate on an RTX 4050 Laptop. At 8 levels the 2^20 table is only ~23%
+    // occupied at the finest level, so this grid is limited by resolution, not
+    // by hash capacity; more levels need a larger table (12 levels in 2^20
+    // would reach ~6x occupancy and lose the extra resolution to collisions).
     //
     // Changing any of these changes the parameter count, so previously saved
     // weights (bdrc_field.bin) no longer load.

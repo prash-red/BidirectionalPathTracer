@@ -189,7 +189,7 @@ float        m_bdrcPhotonClamp   = 10000.0f;
 DreConfig    m_bdrcDre;                    // generator, alpha, beta, power
 float3       m_bdrcReferenceOrigin = {};   // stamped once; never follows the camera
 int          m_bdrcDebugMode = 0;    // 0=normal, 1=cache contribution, 2=raw field
-bool         m_bdrcFreezeTraining = false; // no warmup: the fit runs from frame 0
+bool         m_bdrcFreezeTraining = true;  // starts frozen; untick "Freeze training" to fit
 uint32_t     m_nrcTrainingIteration = 0;   // NRC: training frames; BDRC: optimizer steps. Never reset
 int          m_bdrcStepsPerFrame = 1;      // optimizer steps per frame, each on a fresh batch
 ```
@@ -337,10 +337,10 @@ Source of truth for the design: `docs/superpowers/specs/2026-09-22-unified-singl
 | Property | Value |
 |---|---|
 | Input | 5 dims: `[0..2]` world position normalized into the scene AABB (hash grid), `[3]` `sign_cam`, `[4]` arrival side (both Identity) |
-| Encoding | tcnn `Composite`/`Concatenation`: nested `HashGrid` (12 levels x 2 features, 16..1384 at per-level scale 1.5, log2 hashmap 22; finest cell ~2.9 mm on a 4 m scene) + nested `Identity` for the two labels |
+| Encoding | tcnn `Composite`/`Concatenation`: nested `HashGrid` (8 levels x 2 features, 16..~273 at per-level scale 1.5, log2 hashmap 20; finest cell ~14.6 mm on a 4 m scene) + nested `Identity` for the two labels |
 | MLP | FullyFusedMLP, 2 x 64, LeakyReLU hidden, **no output activation** |
 | Output | 3 channels; softplus is applied by `unified_ngp_cache::query()` and differentiated analytically by the loss kernel |
-| Optimizer | Adam, lr 5e-3, gradClip 0.05, gradScaler on with growth, weightClip 1.0 |
+| Optimizer | Adam, lr 5e-2 (base; the GUI "Learning rate" box overrides it at run time), gradClip 0.05, gradScaler on with growth, weightClip 1.0 |
 | EMA | decay 0.99, start 100 |
 
 `tcnn` must not apply softplus itself: the loss differentiates through it, and a
@@ -457,7 +457,8 @@ frame's noise K times. The LR schedule also counts steps. The GUI's "Learning
 rate" slider sets the base rate the schedule multiplies (`bdrcSetLearningRate`),
 effective from the next step with the Adam state kept.
 
-There is no two-phase warmup: the single fit runs from frame 0.
+There is no two-phase warmup: the single fit runs from its first step. Training
+starts frozen (`m_bdrcFreezeTraining = true`); untick "Freeze training" to fit.
 
 ### Numerical contracts
 
