@@ -354,6 +354,51 @@ Application::Application(GLFWwindow* window,
   }
   
   initRenderer(true); // First time initialization.
+
+  // -animate: play every glTF animation, as if all were ticked and Play pressed.
+  if (options.getAnimate())
+  {
+    if (m_animations.empty())
+    {
+      std::cerr << "WARNING: -animate: the asset has no animations.\n";
+    }
+    else
+    {
+      enableAllAnimations();
+      m_isTimeBased = true;
+      m_isPlaying   = true;
+      m_isAnimationClockPending = true;
+      std::cout << "[animate] " << m_animations.size() << " animation(s), loop [" << m_timeStart << ", " << m_timeEnd << "] s\n";
+    }
+  }
+
+  // Camera path from the command line. Replay wins over recording: a replayed
+  // flight would only record itself.
+  m_cameraPlayDelay = options.getPlayDelay();
+  m_cameraPlayLoop  = options.getPlayLoop();
+  m_cameraMotionSeconds = options.getMotionSeconds();
+  m_cameraOrbitDegrees  = options.getOrbitDegrees();
+  m_cameraCircleRadius  = options.getCircleRadius();
+  if (options.getMotion() != 0)
+  {
+    cameraPlayProcedural(options.getMotion() == 1 ? CAMERA_MOTION_ORBIT : CAMERA_MOTION_CIRCLE, !m_cameraPlayLoop);
+  }
+  else if (!options.getPlayCameraPath().empty())
+  {
+    if (!options.getRecordCameraPath().empty())
+    {
+      std::cerr << "WARNING: -play-camera overrides -record-camera; not recording.\n";
+    }
+    if (!cameraPlayStart(options.getPlayCameraPath(), !m_cameraPlayLoop))
+    {
+      std::cerr << "ERROR: cannot replay camera path " << options.getPlayCameraPath() << '\n';
+    }
+  }
+  else if (!options.getRecordCameraPath().empty())
+  {
+    snprintf(m_cameraPathFile, sizeof(m_cameraPathFile), "%s", options.getRecordCameraPath().c_str());
+    cameraRecordStart();
+  }
 }
 
 
@@ -1491,6 +1536,14 @@ void Application::updateRenderGraph()
 bool Application::render()
 {
   bool repaint = false;
+
+  // Animation time starts on the first rendered frame, the same frame the
+  // camera-path clock starts, so a wave and a replayed flight stay in step.
+  if (m_isAnimationClockPending)
+  {
+    m_timeBase = std::chrono::steady_clock::now();
+    m_isAnimationClockPending = false;
+  }
 
   updateRenderGraph(); // Handle all changes which affect the OptiX render graph.
 
@@ -2684,22 +2737,31 @@ void Application::guiWindow()
   {
     if (ImGui::CollapsingHeader("Animations"))
     {
-      // The animation GUI widgets are disabled while there is no animation enabled.
+      // Play/Stop is a one-click toggle: with nothing ticked, Play enables every
+      // animation first. Play resumes from the stopped time rather than
+      // restarting, and Stop leaves the scene in its current pose, which then
+      // accumulates like any static scene.
+      const std::string labelPlay = (m_isPlaying) ? std::string("Stop") : std::string("Play");
+      if (ImGui::Button(labelPlay.c_str()))
+      {
+        if (!m_isPlaying && !m_isAnimated)
+        {
+          enableAllAnimations();
+        }
+        m_isPlaying = !m_isPlaying;
+
+        if (m_isPlaying && m_isTimeBased)
+        {
+          resumeAnimationClock();
+        }
+      }
+      ImGui::SameLine();
+
+      // The remaining animation GUI widgets are disabled while there is no animation enabled.
       if (!m_isAnimated)
       {
         ImGui::BeginDisabled();
       }
-      const std::string labelPlay = (m_isPlaying) ? std::string("Stop") : std::string("Play");
-      if (ImGui::Button(labelPlay.c_str()))
-      {
-        m_isPlaying= !m_isPlaying;
-
-        if (m_isPlaying && m_isTimeBased)
-        {
-          m_timeBase = std::chrono::steady_clock::now();
-        }
-      }
-      ImGui::SameLine();
 
       if (ImGui::Checkbox("Time-based", &m_isTimeBased))
       {
@@ -5161,6 +5223,38 @@ void Application::initAnimations()
   m_frameMaximum = std::max(0, static_cast<int>(ceilf(m_timeMaximum * m_framesPerSecond)));
   m_frameStart = m_frameMinimum;
   m_frameEnd   = m_frameMaximum;
+}
+
+
+void Application::enableAllAnimations()
+{
+  m_timeMinimum =  FLT_MAX;
+  m_timeMaximum = -FLT_MAX;
+  for (dev::Animation& animation : m_animations)
+  {
+    animation.isEnabled = true;
+    m_timeMinimum = std::min(m_timeMinimum, animation.timeMin);
+    m_timeMaximum = std::max(m_timeMaximum, animation.timeMax);
+  }
+  m_timeStart    = m_timeMinimum;
+  m_timeEnd      = m_timeMaximum;
+  m_timeCurrent  = m_timeStart;
+  m_frameMinimum = std::max(0, static_cast<int>(floorf(m_timeMinimum * m_framesPerSecond)));
+  m_frameMaximum = std::max(0, static_cast<int>(ceilf(m_timeMaximum * m_framesPerSecond)));
+  m_frameStart   = m_frameMinimum;
+  m_frameEnd     = m_frameMaximum;
+  m_frameCurrent = m_frameStart;
+  m_isAnimated   = !m_animations.empty();
+}
+
+
+void Application::resumeAnimationClock()
+{
+  // updateAnimations() maps (now - m_timeBase) * m_timeScale into [m_timeStart, m_timeEnd);
+  // back-date the base so the first played frame lands on the time shown now.
+  const float elapsed = std::max(0.0f, m_timeCurrent - m_timeStart) / std::max(m_timeScale, 1e-6f);
+  m_timeBase = std::chrono::steady_clock::now() -
+               std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<float>(elapsed));
 }
 
 

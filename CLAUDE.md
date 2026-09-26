@@ -729,6 +729,56 @@ The unified field's own configuration is in `makeUnifiedConfig()`
 --miss    (-m) <0|1|2>   Miss shader: 0=null, 1=constant, 2=spherical HDR env
 --env     (-e) <path>    HDR environment map for miss mode 2
 --sphere-radius <float>  Sphere radius fraction for point clouds (default 0.005)
+-nrc      <0|1|2|3>      Render mode: 0 = path tracing (+ BDPT light path), 1 = NRC,
+                         2 = unified transport cache, 3 = SPPM reference
+-save-after <n> <file>   Once n iterations have accumulated since the last restart, write the
+                         linear image to <file> (PFM) and exit.
+                         Works in every mode, so references and cache renders compare directly.
+-record-camera <file>    Record the camera pose every frame from launch; written on R / exit
+-play-camera <file>      Replay a camera path by wall-clock time, then exit
+-play-delay <seconds>    Hold the first pose this long before the path starts (default 0)
+-play-orbit <s> <deg>    Generated path: orbit the look-at point by <deg> over <s> seconds
+-play-circle <s> <r>     Generated path: one circle in the view plane centred on the start, radius r x look-at
+                         distance, camera still aimed at the look-at point
+-play-loop               Repeat the path instead of exiting
+-animate                 Enable and play all glTF animations from the first rendered frame, on
+                         the camera path's wall clock
+```
+
+### Camera paths for side-by-side recordings (`CameraPath.h/.cpp`)
+
+`R` (or the GUI "Camera Path" pane) starts/stops recording; the file is plain
+text, one pose (`time position lookat up fovY`) per rendered frame, plus the
+recording resolution. It stores camera **state against wall-clock time**, never
+mouse events: the trackball applies mouse deltas once per frame, so replayed
+events would fly a different path at another frame rate. Replay interpolates
+the pose at the current time, so every mode sees the same camera at the same
+second and screen recordings line up. A pose equal to the current camera is
+not applied (setting it would mark the camera dirty and restart accumulation),
+so the `-play-delay` hold and pauses in a recording converge. Camera input is
+ignored during replay. `-play-orbit` / `-play-circle` (or the GUI buttons)
+generate a path from the current pose (`CameraPath::makeOrbit` / `makeCircle`),
+starting exactly there, so they replay identically in every mode from the same
+start camera. SPPM restarts on every moving frame and only converges
+on held poses.
+
+```bash
+./GLTF_renderer -f scene.glb -record-camera fly.cam                        # fly, press R
+./GLTF_renderer -f scene.glb -nrc 0 -play-camera fly.cam -play-delay 5     # record screen
+./GLTF_renderer -f scene.glb -nrc 2 -play-camera fly.cam -play-delay 5
+```
+
+**Animated water (`tools/make_water_wave.py`).** Bakes a travelling sine wave
+`h = a sin(k s - w t)` into a mesh as two morph targets (`a sin(ks)`, `a cos(ks)`,
+offsets along world up, normals tilted by `-(n.up) grad h`) plus a looping
+weights animation `(cos wt, -sin wt)`; the existing morph pipeline plays it.
+`data/water_caustic_wave.glb` is `data/water_caustic.glb` with the defaults
+(a = 0.02, wavelength 0.5, period 2 s, along +x). Moving geometry restarts
+accumulation every frame in every mode.
+
+```bash
+tools/make_water_wave.py data/water_caustic.glb data/water_caustic_wave.glb --amplitude 0.03
+./GLTF_renderer -f data/water_caustic_wave.glb -nrc 2 -animate -play-circle 8 0.05
 ```
 
 ---

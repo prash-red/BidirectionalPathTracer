@@ -50,6 +50,14 @@ Options::Options()
   , m_miss(2)
   , m_punctual(true)
   , m_nrc(0)
+  , m_saveAfterFrames(0)
+  , m_playDelay(0.0f)
+  , m_playLoop(false)
+  , m_animate(false)
+  , m_motion(0)
+  , m_motionSeconds(10.0f)
+  , m_orbitDegrees(360.0f)
+  , m_circleRadius(0.1f)
   , m_sphereRadiusFraction(0.005f)
 {
 }
@@ -148,6 +156,73 @@ bool Options::parseCommandLine(int argc, char *argv[])
         return false;
       }
       m_punctual = (atoi(argv[++i]) != 0);
+    }
+    else if (arg == "-save-after")
+    {
+      if (i + 2 >= argc)
+      {
+        std::cerr << "ERROR: Option '" << arg << "' requires <frames> <file.pfm>.\n";
+        printUsage(argv[0]);
+        return false;
+      }
+      m_saveAfterFrames = atoi(argv[++i]);
+      m_saveAfterPath   = argv[++i];
+      if (m_saveAfterFrames <= 0)
+      {
+        std::cerr << "ERROR: Option '" << arg << "' needs a positive frame count.\n";
+        printUsage(argv[0]);
+        return false;
+      }
+    }
+    else if (arg == "-record-camera" || arg == "-play-camera" || arg == "-play-delay")
+    {
+      if (i == argc - 1)
+      {
+        std::cerr << "ERROR: Option '" << arg << "' requires additional argument.\n";
+        printUsage(argv[0]);
+        return false;
+      }
+      if (arg == "-record-camera")
+        m_recordCameraPath = argv[++i];
+      else if (arg == "-play-camera")
+        m_playCameraPath = argv[++i];
+      else
+        m_playDelay = std::max(0.0f, static_cast<float>(atof(argv[++i])));
+    }
+    else if (arg == "-play-orbit" || arg == "-play-circle")
+    {
+      if (i + 2 >= argc)
+      {
+        std::cerr << "ERROR: Option '" << arg << "' requires <seconds> <" << (arg == "-play-orbit" ? "degrees" : "radius") << ">.\n";
+        printUsage(argv[0]);
+        return false;
+      }
+      m_motionSeconds = static_cast<float>(atof(argv[++i]));
+      const float value = static_cast<float>(atof(argv[++i]));
+      if (m_motionSeconds <= 0.0f || (arg == "-play-circle" && value <= 0.0f))
+      {
+        std::cerr << "ERROR: Option '" << arg << "' needs a positive duration" << (arg == "-play-circle" ? " and radius" : "") << ".\n";
+        printUsage(argv[0]);
+        return false;
+      }
+      if (arg == "-play-orbit")
+      {
+        m_motion       = 1;
+        m_orbitDegrees = value;
+      }
+      else
+      {
+        m_motion       = 2;
+        m_circleRadius = value;
+      }
+    }
+    else if (arg == "-play-loop")
+    {
+      m_playLoop = true;
+    }
+    else if (arg == "-animate")
+    {
+      m_animate = true;
     }
     else if (arg == "-nrc")
     {
@@ -317,6 +392,61 @@ bool Options::getPunctual() const
   return m_punctual;
 }
 
+int Options::getSaveAfterFrames() const
+{
+  return m_saveAfterFrames;
+}
+
+std::string Options::getSaveAfterPath() const
+{
+  return m_saveAfterPath;
+}
+
+std::string Options::getRecordCameraPath() const
+{
+  return m_recordCameraPath;
+}
+
+std::string Options::getPlayCameraPath() const
+{
+  return m_playCameraPath;
+}
+
+float Options::getPlayDelay() const
+{
+  return m_playDelay;
+}
+
+bool Options::getPlayLoop() const
+{
+  return m_playLoop;
+}
+
+bool Options::getAnimate() const
+{
+  return m_animate;
+}
+
+int Options::getMotion() const
+{
+  return m_motion;
+}
+
+float Options::getMotionSeconds() const
+{
+  return m_motionSeconds;
+}
+
+float Options::getOrbitDegrees() const
+{
+  return m_orbitDegrees;
+}
+
+float Options::getCircleRadius() const
+{
+  return m_circleRadius;
+}
+
 int Options::getNrc() const
 {
   return m_nrc;
@@ -343,7 +473,21 @@ void Options::printUsage(std::string const& argv0)
     "  -l | --launches <int>  Number of launches per render call, range [1, 1000] (1)\n"
     "  -i | --interop <int>   OpenGL interop: 0 = off, 1 = pbo, 2 = array copy, 3 = surface write. (0)\n"
     "  -p | --punctual <int>  Select KHR_lights_punctual support: 0 = off. (1)\n"
-    "  -nrc                   Enable Radiance Caching: 0 = off, 1 = nrc, 2 = bdrc. (0)\n"
+    "  -nrc                   Render mode: 0 = path tracing, 1 = nrc, 2 = bdrc (unified cache),\n"
+    "                         3 = SPPM reference. (0)\n"
+    "  -save-after <n> <file> Once n iterations have accumulated (since the last restart),\n"
+    "                         write the linear image to <file> (PFM) and exit.\n"
+    "  -record-camera <file>  Record the camera pose every frame from launch; written to <file>\n"
+    "                         when recording stops (R key) or on exit.\n"
+    "  -play-camera <file>    Replay a recorded camera path by wall-clock time, then exit.\n"
+    "  -play-delay <seconds>  Hold the first pose this long before the path starts. (0)\n"
+    "  -play-orbit <s> <deg>  Orbit the look-at point by <deg> degrees over <s> seconds,\n"
+    "                         starting from the initial camera.\n"
+    "  -play-circle <s> <r>   Move the camera once around a circle in its view plane over <s>\n"
+    "                         seconds, radius <r> x distance to the look-at point, still aimed at it.\n"
+    "  -play-loop             Repeat the camera path instead of exiting at its end.\n"
+    "  -animate               Enable and play all glTF animations from the first rendered frame,\n"
+    "                         on the same wall clock as the camera path.\n"
     "  -m | --miss <0|1|2>    Select the miss shader: 0 = null, 1 = white, 2 = environment. (2))\n"
     "  -e | --env <filename>  Filename of a spherical HDR texture. (empty)\n"
     "  -r | --radius <fraction>  Fraction of the scene diameter. (0.005)\n"

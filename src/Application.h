@@ -376,6 +376,28 @@ private:
 
   void initNRC();
   void initBDRC();
+  void initSPPM();
+  void renderSppm(unsigned int iteration);
+
+  // Write the linear image exactly as displayed (eye buffer plus the scaled
+  // BDPT light-path buffer) as a lossless 32-bit PFM. The .hdr screenshot is
+  // RGBE, about 1% precision: too coarse to score a cache against a reference.
+  bool saveLinearPfm(const std::string& path);
+
+  // Camera path recording and wall-clock replay (CameraPath.h).
+  void enableAllAnimations();   // Ticks every animation and resets the timeline to their union.
+  void resumeAnimationClock();  // Sets m_timeBase so real-time playback continues from m_timeCurrent.
+
+  void cameraRecordStart();
+  void cameraRecordStop();
+  bool cameraPlayStart(const std::string& path, bool exitAtEnd);
+  enum CameraMotion { CAMERA_MOTION_ORBIT, CAMERA_MOTION_CIRCLE };
+  void cameraPlayProcedural(CameraMotion motion, bool exitAtEnd); // From the current pose.
+  void cameraPlayBegin(const std::string& source, bool exitAtEnd);
+  void cameraPlayStop();
+  void updateCameraPath();       // Before updateCamera(): applies the replayed pose.
+  void recordCameraPose();       // After updateCamera(): appends the rendered pose.
+  float cameraPathSeconds() const;
 
   void updateDenoiserBuffers();
 
@@ -552,6 +574,7 @@ private:
   // Animation GUI handling.
   bool  m_isAnimated  = false; // True if at least one animation is enabled. (Enables the animation timeline GUI widgets.)
   bool  m_isPlaying   = false; // Tracks the Play/Stop button state. Clicking Play initializes m_timeBase.
+  bool  m_isAnimationClockPending = false; // -animate: set m_timeBase on the first rendered frame.
   float m_timeMinimum = 0.0f;  // The minimum of all AnimationSampler timeMin values.
   float m_timeMaximum = 1.0f;  // The maximum of all AnimationSampler timeMax values.
 

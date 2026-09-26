@@ -54,6 +54,17 @@ public:
   int                   getInterop() const;
   bool                  getPunctual() const;
   int                   getNrc() const;
+  int                   getSaveAfterFrames() const;
+  std::string           getSaveAfterPath() const;
+  std::string           getRecordCameraPath() const;
+  std::string           getPlayCameraPath() const;
+  float                 getPlayDelay() const;
+  bool                  getPlayLoop() const;
+  bool                  getAnimate() const;
+  int                   getMotion() const;        // 0 = none, 1 = orbit, 2 = circle.
+  float                 getMotionSeconds() const;
+  float                 getOrbitDegrees() const;
+  float                 getCircleRadius() const;
   int                   getMiss() const;
   std::string           getEnvironment() const;
   // Radius of all the spheres (for glTF points) as fraction of the scene diameter.
@@ -75,6 +86,17 @@ private:
   int                   m_interop;
   bool                  m_punctual;
   int                   m_nrc;
+  int                   m_saveAfterFrames;
+  std::string           m_saveAfterPath;
+  std::string           m_recordCameraPath; // -record-camera: start recording at launch, write on exit.
+  std::string           m_playCameraPath;   // -play-camera: replay this path from launch.
+  float                 m_playDelay;        // -play-delay: seconds to hold the first pose.
+  bool                  m_playLoop;         // -play-loop: repeat instead of exiting at the end.
+  bool                  m_animate;          // -animate: enable and play all glTF animations from the first frame.
+  int                   m_motion;           // -play-orbit / -play-circle: 1 / 2, 0 = none.
+  float                 m_motionSeconds;
+  float                 m_orbitDegrees;
+  float                 m_circleRadius;
   int                   m_miss;
   std::string           m_environment;
   float                 m_sphereRadiusFraction;
